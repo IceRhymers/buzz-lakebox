@@ -9,13 +9,16 @@ LDFLAGS := -X $(MODULE)/internal/version.Version=$(VERSION)
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build test vet lint check clean
+.PHONY: help build install test vet lint check clean
 
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z_-]+:.*##/ {printf "  %-8s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 build: ## Build the provider binary into the repo root
 	$(GO) build -ldflags '$(LDFLAGS)' -o $(BINARY) $(CMD)
+
+install: ## Install the provider binary into GOBIN (or $(go env GOPATH)/bin)
+	$(GO) install -ldflags '$(LDFLAGS)' $(CMD)
 
 test: ## Run all tests with the race detector (matches CI)
 	$(GO) test ./... -race
