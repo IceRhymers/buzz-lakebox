@@ -67,10 +67,14 @@ func TestRenderEnv_GoldenFields(t *testing.T) {
 		`export BUZZ_ACP_MODEL='databricks-claude-opus-4-8'`,
 		`export BUZZ_ACP_RESPOND_TO='owner-only'`,
 		`export BUZZ_ACP_RESPOND_TO_ALLOWLIST='npub1a,npub1b'`,
-		`export BUZZ_ACP_TURN_TIMEOUT_SECONDS='120'`,
-		`export BUZZ_ACP_IDLE_TIMEOUT_SECONDS='900'`,
-		`export BUZZ_ACP_MAX_TURN_DURATION_SECONDS='7200'`,
+		`export BUZZ_ACP_IDLE_TIMEOUT='900'`,
+		`export BUZZ_ACP_MAX_TURN_DURATION='7200'`,
 		`export NOSTR_PRIVATE_KEY='nsec1abc'`,
+		`export BUZZ_ACP_MCP_COMMAND='buzz-dev-mcp'`,
+		`export MCP_HOOK_SERVERS='*'`,
+		`export BUZZ_ACP_RELAY_OBSERVER='true'`,
+		`export BUZZ_ACP_DEDUP='queue'`,
+		`export BUZZ_ACP_MULTIPLE_EVENT_HANDLING='steer'`,
 		`export BUZZ_AGENT_PROVIDER='databricks_v2'`,
 		`export DATABRICKS_MODEL='databricks-claude-opus-4-8'`,
 		`export DATABRICKS_HOST='https://example.databricks.com'`,
@@ -82,10 +86,35 @@ func TestRenderEnv_GoldenFields(t *testing.T) {
 		}
 	}
 
+	// The deprecated / nonexistent buzz-acp names must never reappear:
+	// *_SECONDS variants are ignored by buzz-acp, and BUZZ_ACP_TURN_TIMEOUT
+	// is deprecated upstream (the desktop deliberately never sets it).
+	for _, banned := range []string{
+		"BUZZ_ACP_TURN_TIMEOUT",
+		"BUZZ_ACP_IDLE_TIMEOUT_SECONDS",
+		"BUZZ_ACP_MAX_TURN_DURATION_SECONDS",
+	} {
+		if strings.Contains(env, banned) {
+			t.Fatalf("env must not contain %q; full env:\n%s", banned, env)
+		}
+	}
+
 	// env_vars must be emitted after (and thus win over) the fixed
 	// BUZZ_AGENT_PROVIDER/DATABRICKS_MODEL block.
 	if strings.Index(env, "DATABRICKS_MODEL") > strings.Index(env, "DATABRICKS_HOST") {
 		t.Fatal("env_vars must be rendered after the fixed inference defaults")
+	}
+}
+
+// TestRenderEnv_ZeroTimeouts_Omitted mirrors the desktop: idle/max-turn
+// are emitted only when explicitly set, so zero values fall through to
+// buzz-acp's own defaults (900s idle / 7200s max turn) instead of
+// exporting a `0` whose semantics upstream owns.
+func TestRenderEnv_ZeroTimeouts_Omitted(t *testing.T) {
+	agent := payload.Agent{AgentCommand: "buzz-agent"}
+	env := RenderEnv(agent)
+	if strings.Contains(env, "BUZZ_ACP_IDLE_TIMEOUT") || strings.Contains(env, "BUZZ_ACP_MAX_TURN_DURATION") {
+		t.Fatalf("zero timeouts must be omitted entirely, got:\n%s", env)
 	}
 }
 

@@ -93,11 +93,43 @@ func RenderEnv(agent payload.Agent) string {
 	if len(agent.RespondToAllowlist) > 0 {
 		emit("BUZZ_ACP_RESPOND_TO_ALLOWLIST", strings.Join(agent.RespondToAllowlist, ","))
 	}
-	emit("BUZZ_ACP_TURN_TIMEOUT_SECONDS", strconv.Itoa(agent.TurnTimeoutSeconds))
-	emit("BUZZ_ACP_IDLE_TIMEOUT_SECONDS", strconv.Itoa(agent.IdleTimeoutSeconds))
-	emit("BUZZ_ACP_MAX_TURN_DURATION_SECONDS", strconv.Itoa(agent.MaxTurnDurationSecs))
+	// Timeout env names must match buzz-acp's real contract:
+	// BUZZ_ACP_IDLE_TIMEOUT / BUZZ_ACP_MAX_TURN_DURATION — the previous
+	// *_SECONDS-suffixed names exist nowhere in buzz-acp and were
+	// silently ignored (live-verified via the startup config line, which
+	// showed the 900s/7200s defaults despite our exports). Mirror the
+	// desktop (block/buzz runtime.rs:1847-1858): emit only when
+	// explicitly set, and never emit the upstream-deprecated
+	// BUZZ_ACP_TURN_TIMEOUT at all.
+	if agent.IdleTimeoutSeconds > 0 {
+		emit("BUZZ_ACP_IDLE_TIMEOUT", strconv.Itoa(agent.IdleTimeoutSeconds))
+	}
+	if agent.MaxTurnDurationSecs > 0 {
+		emit("BUZZ_ACP_MAX_TURN_DURATION", strconv.Itoa(agent.MaxTurnDurationSecs))
+	}
 	// Same nsec, consumed by git-credential-nostr (docs/PLAN.md §4.4 step 7).
 	emit("NOSTR_PRIVATE_KEY", agent.PrivateKeyNsec)
+
+	// Tool wiring. Without BUZZ_ACP_MCP_COMMAND, session/new carries
+	// mcpServers:[] and buzz-agent has NO tools — the model then emits
+	// its bash tool call as plain text and ends the turn, so the agent
+	// can never run `buzz messages send`: deployed agents look alive but
+	// are permanently silent (live-bitten). buzz-dev-mcp ships in the
+	// same .deb the installer unpacks and resolves via launch.sh's PATH
+	// prepend. Desktop parity: block/buzz runtime.rs:1723-1739 +
+	// discovery.rs buzz-agent entry (mcp_command "buzz-dev-mcp",
+	// mcp_hooks true → MCP_HOOK_SERVERS "*").
+	emit("BUZZ_ACP_MCP_COMMAND", "buzz-dev-mcp")
+	emit("MCP_HOOK_SERVERS", "*")
+	// Observer frames are the desktop's ONLY health signal for a
+	// provider-deployed agent (block/buzz runtime.rs:1934).
+	emit("BUZZ_ACP_RELAY_OBSERVER", "true")
+	// Explicit parity with the desktop's mention-handling knobs
+	// (block/buzz runtime.rs:1861-1862); these currently match
+	// buzz-acp's defaults, pinned here so an upstream default change
+	// can't silently diverge sandbox agents from desktop ones.
+	emit("BUZZ_ACP_DEDUP", "queue")
+	emit("BUZZ_ACP_MULTIPLE_EVENT_HANDLING", "steer")
 
 	// Inference auth for buzz-agent (docs/M05_PROBE_RESULTS.md §2,
 	// docs/CONTRACT.md §7): BUZZ_AGENT_PROVIDER defaults to
