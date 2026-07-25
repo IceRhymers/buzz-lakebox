@@ -121,6 +121,53 @@ esac
 	return path
 }
 
+// TestResolveDefaultBin_PathWins: when plain PATH lookup succeeds, the
+// bare default name is kept (no fallback probing, no absolutization).
+func TestResolveDefaultBin_PathWins(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricks(t, dir)
+	t.Setenv("PATH", dir)
+
+	if got := resolveDefaultBin([]string{t.TempDir()}); got != defaultBin {
+		t.Fatalf("resolveDefaultBin = %q, want bare %q when PATH resolves", got, defaultBin)
+	}
+}
+
+// TestResolveDefaultBin_FallbackDir: with a launchd-style PATH that lacks
+// the CLI, the first executable hit among the fallback dirs is returned as
+// an absolute path — the GUI-launched-desktop preflight fix.
+func TestResolveDefaultBin_FallbackDir(t *testing.T) {
+	empty := t.TempDir()
+	t.Setenv("PATH", empty)
+
+	fallback := t.TempDir()
+	want := writeFakeDatabricks(t, fallback)
+
+	if got := resolveDefaultBin([]string{t.TempDir(), fallback}); got != want {
+		t.Fatalf("resolveDefaultBin = %q, want fallback hit %q", got, want)
+	}
+}
+
+// TestResolveDefaultBin_NothingResolves: the bare default name is kept so
+// downstream errors preserve the familiar not-found-in-$PATH shape.
+func TestResolveDefaultBin_NothingResolves(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+
+	if got := resolveDefaultBin([]string{t.TempDir()}); got != defaultBin {
+		t.Fatalf("resolveDefaultBin = %q, want bare %q when nothing resolves", got, defaultBin)
+	}
+}
+
+// TestBinName_ExplicitOverrideSkipsFallback: a non-default Bin (the test
+// shim pattern) is used verbatim, never fallback-resolved.
+func TestBinName_ExplicitOverrideSkipsFallback(t *testing.T) {
+	shim := filepath.Join(t.TempDir(), "databricks")
+	cli := &CLI{Bin: shim}
+	if got := cli.binName(); got != shim {
+		t.Fatalf("binName = %q, want explicit override %q", got, shim)
+	}
+}
+
 func TestCLI_Version_AgainstFakeShim(t *testing.T) {
 	dir := t.TempDir()
 	writeFakeDatabricks(t, dir)

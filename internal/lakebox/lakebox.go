@@ -9,7 +9,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -30,8 +32,12 @@ const defaultBin = "databricks"
 // installation (PLAN.md §7).
 type CLI struct {
 	// Bin is the binary name or path invoked for every command. Empty
-	// means "databricks" resolved via PATH.
+	// means "databricks" resolved via PATH (with well-known-dir fallback,
+	// see resolveBin).
 	Bin string
+
+	resolveOnce sync.Once
+	resolvedBin string
 
 	versionOnce sync.Once
 	versionVal  string
@@ -44,10 +50,58 @@ func New() *CLI {
 }
 
 func (c *CLI) binName() string {
-	if c.Bin == "" {
+	// An explicit override (tests point Bin at a fake PATH shim) always
+	// wins; only the default name goes through fallback resolution.
+	if c.Bin != "" && c.Bin != defaultBin {
+		return c.Bin
+	}
+	return c.resolveBin()
+}
+
+// resolveBin resolves the default binary once per CLI value: plain PATH
+// lookup first, then the well-known install dirs. A GUI-launched Buzz
+// Desktop inherits launchd's minimal PATH on macOS
+// (/usr/bin:/bin:/usr/sbin:/sbin), which contains no common databricks
+// CLI install location — so a provider spawned from the Dock-launched
+// desktop fails preflight with "executable file not found in $PATH"
+// even on a machine where the CLI works fine in every shell. This
+// mirrors how buzz itself augments discovery of buzz-backend-* binaries
+// beyond the inherited PATH (block/buzz
+// desktop/src-tauri/src/managed_agents/backend.rs).
+func (c *CLI) resolveBin() string {
+	c.resolveOnce.Do(func() {
+		c.resolvedBin = resolveDefaultBin(fallbackDirs())
+	})
+	return c.resolvedBin
+}
+
+// fallbackDirs returns the well-known databricks CLI install locations
+// probed when PATH resolution fails: Homebrew (Apple Silicon), the
+// curl-installer / Homebrew-on-Intel prefix, and the per-user bin dirs.
+func fallbackDirs() []string {
+	dirs := []string{"/opt/homebrew/bin", "/usr/local/bin"}
+	if home, err := os.UserHomeDir(); err == nil {
+		dirs = append(dirs, filepath.Join(home, ".local", "bin"), filepath.Join(home, "bin"))
+	}
+	return dirs
+}
+
+// resolveDefaultBin returns the bare default name when PATH resolves it,
+// the first executable hit among the fallback dirs otherwise, and the
+// bare default name again when nothing resolves — so downstream errors
+// keep the familiar `"databricks": executable file not found in $PATH`
+// shape.
+func resolveDefaultBin(fallback []string) string {
+	if _, err := exec.LookPath(defaultBin); err == nil {
 		return defaultBin
 	}
-	return c.Bin
+	for _, dir := range fallback {
+		candidate := filepath.Join(dir, defaultBin)
+		if p, err := exec.LookPath(candidate); err == nil {
+			return p
+		}
+	}
+	return defaultBin
 }
 
 // LookPath resolves the configured binary on PATH, returning its absolute

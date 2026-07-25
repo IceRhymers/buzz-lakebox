@@ -21,12 +21,18 @@ build: ## Build the provider binary into the repo root
 install: ## Install into GOBIN; PROFILE=<name> bakes in a default Databricks profile
 	$(GO) install -ldflags '$(LDFLAGS)' $(CMD)
 
-SYMLINK_DIR ?= /usr/local/bin
+# ~/.local/bin, NOT /usr/local/bin: a GUI-launched Buzz Desktop inherits
+# launchd's minimal PATH and augments provider discovery with only its own
+# app bundle dir and ~/.local/bin (block/buzz
+# desktop/src-tauri/src/managed_agents/backend.rs) — /usr/local/bin is
+# never scanned in the GUI-launched case.
+SYMLINK_DIR ?= $(HOME)/.local/bin
 
-symlink: ## Symlink the installed binary into SYMLINK_DIR (default /usr/local/bin) so GUI-launched Buzz Desktop finds it
+symlink: ## Symlink the installed binary into SYMLINK_DIR (default ~/.local/bin) so GUI-launched Buzz Desktop finds it
 	@gobin="$$($(GO) env GOBIN)"; [ -n "$$gobin" ] || gobin="$$($(GO) env GOPATH)/bin"; \
 	src="$$gobin/$(BINARY)"; dest="$(SYMLINK_DIR)/$(BINARY)"; \
 	[ -x "$$src" ] || { echo "$$src not found; run 'make install' first"; exit 1; }; \
+	mkdir -p "$(SYMLINK_DIR)"; \
 	if [ -e "$$dest" ] || [ -L "$$dest" ]; then \
 		echo "$$dest already exists; leaving it in place"; \
 	else \

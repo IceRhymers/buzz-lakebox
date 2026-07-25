@@ -70,13 +70,13 @@ Auth: the operator's existing `~/.databrickscfg` profile, selected via `provider
 
    Add that line to your shell profile (`~/.zshrc`, `~/.bashrc`, …) to make it permanent.
 
-   Note that a GUI-launched Buzz Desktop (Dock/Finder) does not see your shell's `PATH`. To cover that case, symlink the binary into `/usr/local/bin`:
+   Note that a GUI-launched Buzz Desktop (Dock/Finder) does not see your shell's `PATH` — it inherits launchd's minimal `PATH` and augments its provider search with only its own app bundle directory and `~/.local/bin` (it never scans `/usr/local/bin`). To cover that case, symlink the binary into `~/.local/bin`:
 
    ```sh
-   make symlink               # no-op if the link already exists
+   make symlink               # links into ~/.local/bin; no-op if the link already exists
    ```
 
-   Pass `SYMLINK_DIR=<dir>` to link somewhere else (e.g. `~/.local/bin`, which Buzz also scans).
+   Pass `SYMLINK_DIR=<dir>` to link somewhere else. No sudo is needed for the default location.
 
 4. **Verify the install**
 
