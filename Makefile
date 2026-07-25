@@ -2,10 +2,11 @@
 
 GO      ?= go
 VERSION ?= dev
+PROFILE ?= DEFAULT
 BINARY  := buzz-backend-databricks
 CMD     := ./cmd/$(BINARY)
 MODULE  := github.com/IceRhymers/buzz-lakebox
-LDFLAGS := -X $(MODULE)/internal/version.Version=$(VERSION)
+LDFLAGS := -X $(MODULE)/internal/version.Version=$(VERSION) -X $(MODULE)/internal/version.DefaultProfile=$(PROFILE)
 
 .DEFAULT_GOAL := help
 
@@ -17,7 +18,7 @@ help: ## Show available targets
 build: ## Build the provider binary into the repo root
 	$(GO) build -ldflags '$(LDFLAGS)' -o $(BINARY) $(CMD)
 
-install: ## Install the provider binary into GOBIN (or $(go env GOPATH)/bin)
+install: ## Install into GOBIN; PROFILE=<name> bakes in a default Databricks profile
 	$(GO) install -ldflags '$(LDFLAGS)' $(CMD)
 
 test: ## Run all tests with the race detector (matches CI)

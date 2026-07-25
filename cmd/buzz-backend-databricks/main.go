@@ -63,7 +63,7 @@ func newRootCmd() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: false,
 	}
-	root.PersistentFlags().StringVar(&profile, "profile", "DEFAULT", "Databricks CLI profile to use")
+	root.PersistentFlags().StringVar(&profile, "profile", version.DefaultProfile, "Databricks CLI profile to use")
 
 	root.AddCommand(newVersionCmd())
 	root.AddCommand(newDoctorCmd(&profile))

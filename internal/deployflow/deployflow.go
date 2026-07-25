@@ -21,15 +21,13 @@ import (
 	"github.com/IceRhymers/buzz-lakebox/internal/payload"
 	"github.com/IceRhymers/buzz-lakebox/internal/redact"
 	"github.com/IceRhymers/buzz-lakebox/internal/sshx"
+	"github.com/IceRhymers/buzz-lakebox/internal/version"
 )
 
 const (
 	// deployTimeout bounds the whole flow well inside buzz's 600s
 	// invocation budget (docs/CONTRACT.md §1).
 	deployTimeout = 550 * time.Second
-
-	// defaultProfile is used when provider_config.profile is empty.
-	defaultProfile = "DEFAULT"
 
 	// defaultWaitRunningTimeout bounds how long we wait for a
 	// created/started sandbox to reach Running (docs/M05_PROBE_RESULTS.md:
@@ -142,7 +140,7 @@ func (d *Deployer) deploy(req *payload.DeployRequest) (string, error) {
 
 	profile := req.ProviderConfig.Profile
 	if profile == "" {
-		profile = defaultProfile
+		profile = version.DefaultProfile
 	}
 
 	// Step 2: preflight. CachedVersion (not Version) so the fetch shares

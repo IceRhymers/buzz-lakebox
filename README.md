@@ -54,6 +54,12 @@ Auth: the operator's existing `~/.databrickscfg` profile, selected via `provider
    make install VERSION=v0.1.0
    ```
 
+   To bake in a default Databricks CLI profile other than `DEFAULT`, pass `PROFILE` (see [Choosing a Databricks profile](#choosing-a-databricks-profile)):
+
+   ```sh
+   make install PROFILE=fevm-west
+   ```
+
 3. **Ensure the install directory is on your `PATH`**
 
    Buzz Desktop discovers providers by scanning `PATH` for `buzz-backend-<id>` executables, so this step is required — not just convenient:
@@ -72,6 +78,31 @@ Auth: the operator's existing `~/.databrickscfg` profile, selected via `provider
    ```
 
 To build into the repo root instead of installing (e.g. for local iteration), use `make build`, and run `make check` to execute the same vet + lint + test gauntlet as CI. See `make help` for all targets.
+
+### Choosing a Databricks profile
+
+The provider authenticates with a profile from `~/.databrickscfg` (create one with `databricks auth login -p <name> --host https://<workspace-url>`). There are three ways to select it, from most to least specific:
+
+1. **Per-deploy, in the payload** — `provider_config.profile` in the JSON Buzz Desktop sends on stdin (or in the file given to `deploy --payload-file`). This always wins when set:
+
+   ```json
+   {"agent": {...}, "provider_config": {"profile": "fevm-west"}}
+   ```
+
+2. **Per-invocation, on the CLI** — the `--profile` flag, honored by all subcommands (`doctor`, `deploy`, ...). Used when the payload leaves the profile empty. Note that Buzz Desktop invokes the provider without arguments, so this only applies to manual CLI use:
+
+   ```sh
+   buzz-backend-databricks --profile fevm-west doctor
+   ```
+
+3. **Baked in at install time** — `make install PROFILE=fevm-west` stamps the fallback default (normally `DEFAULT`) into the binary via ldflags. This is the way to point Buzz Desktop at a specific profile when its payload doesn't set one, since no flags reach provider mode.
+
+Whichever way you choose, verify it resolves before deploying:
+
+```sh
+buzz-backend-databricks doctor            # uses the baked-in default
+buzz-backend-databricks --profile fevm-west doctor
+```
 
 ## Design inputs
 
