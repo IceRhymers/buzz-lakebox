@@ -129,7 +129,7 @@ ln -sf "$SRC" "$BIN_DIR/%s"
 // InitializeFrame is the ACP `initialize` JSON-RPC request piped into
 // buzz-agent for runtime verification (docs/M05_PROBE_RESULTS.md §6: no
 // `--version`; config validation runs before arg parsing).
-const InitializeFrame = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"0.1.0","clientInfo":{"name":"buzz-backend-databricks","version":"dev"}}}`
+const InitializeFrame = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"0.1.0","clientInfo":{"name":"buzz-backend-databricks-lakebox","version":"dev"}}}`
 
 // AgentInfoMarker is the substring expected in buzz-agent's response to
 // InitializeFrame on success (docs/M05_PROBE_RESULTS.md §6: "expect the

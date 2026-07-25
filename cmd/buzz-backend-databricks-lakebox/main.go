@@ -1,4 +1,4 @@
-// Command buzz-backend-databricks is a Buzz agent provider for Databricks
+// Command buzz-backend-databricks-lakebox is a Buzz agent provider for Databricks
 // Lakebox sandboxes (PLAN.md). With no arguments it runs in provider mode:
 // read one JSON request from stdin, dispatch on "op", write one JSON
 // response to stdout, and always exit 0 for handled cases
@@ -58,7 +58,7 @@ func newRootCmd() *cobra.Command {
 	var profile string
 
 	root := &cobra.Command{
-		Use:           "buzz-backend-databricks",
+		Use:           "buzz-backend-databricks-lakebox",
 		Short:         "Deploys Buzz agents into Databricks Lakebox sandboxes",
 		SilenceUsage:  true,
 		SilenceErrors: false,

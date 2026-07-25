@@ -4,10 +4,10 @@ A [Buzz](https://github.com/block/buzz) agent-backend provider that runs agent s
 
 ## How it works
 
-Buzz Desktop discovers `buzz-backend-<id>` executables on `PATH` (`BackendKind::Provider`) and hands them a one-shot JSON payload over stdin. This repo builds **`buzz-backend-databricks`**: on `deploy` it provisions a Databricks Sandbox, installs the Buzz harness into the sandbox's persistent `$HOME`, ships the agent's identity/env over SSH stdin, and launches `buzz-acp` as a detached background process. The agent then talks to the Buzz relay outbound-only over WSS — no inbound connectivity to the sandbox is required for sessions.
+Buzz Desktop discovers `buzz-backend-<id>` executables on `PATH` (`BackendKind::Provider`) and hands them a one-shot JSON payload over stdin. This repo builds **`buzz-backend-databricks-lakebox`**: on `deploy` it provisions a Databricks Sandbox, installs the Buzz harness into the sandbox's persistent `$HOME`, ships the agent's identity/env over SSH stdin, and launches `buzz-acp` as a detached background process. The agent then talks to the Buzz relay outbound-only over WSS — no inbound connectivity to the sandbox is required for sessions.
 
 ```
-Buzz Desktop ──stdin JSON {op:"deploy",...}──> buzz-backend-databricks
+Buzz Desktop ──stdin JSON {op:"deploy",...}──> buzz-backend-databricks-lakebox
                                                   │  /api/2.0/lakebox/* (create/config)
                                                   │  ssh (install binaries, ship env)
                                                   ▼
@@ -48,7 +48,7 @@ Auth: the operator's existing `~/.databrickscfg` profile, selected via `provider
    make install
    ```
 
-   This runs `go install` with the version stamped in, placing `buzz-backend-databricks` into `$GOBIN` (or `$(go env GOPATH)/bin` if `GOBIN` is unset). To stamp a specific version string, pass `VERSION`:
+   This runs `go install` with the version stamped in, placing `buzz-backend-databricks-lakebox` into `$GOBIN` (or `$(go env GOPATH)/bin` if `GOBIN` is unset). To stamp a specific version string, pass `VERSION`:
 
    ```sh
    make install VERSION=v0.1.0
@@ -70,11 +70,19 @@ Auth: the operator's existing `~/.databrickscfg` profile, selected via `provider
 
    Add that line to your shell profile (`~/.zshrc`, `~/.bashrc`, …) to make it permanent.
 
+   Note that a GUI-launched Buzz Desktop (Dock/Finder) does not see your shell's `PATH`. To cover that case, symlink the binary into `/usr/local/bin`:
+
+   ```sh
+   make symlink               # no-op if the link already exists
+   ```
+
+   Pass `SYMLINK_DIR=<dir>` to link somewhere else (e.g. `~/.local/bin`, which Buzz also scans).
+
 4. **Verify the install**
 
    ```sh
-   buzz-backend-databricks version   # prints the stamped version
-   buzz-backend-databricks doctor    # checks the runtime environment
+   buzz-backend-databricks-lakebox version   # prints the stamped version
+   buzz-backend-databricks-lakebox doctor    # checks the runtime environment
    ```
 
 To build into the repo root instead of installing (e.g. for local iteration), use `make build`, and run `make check` to execute the same vet + lint + test gauntlet as CI. See `make help` for all targets.
@@ -92,7 +100,7 @@ The provider authenticates with a profile from `~/.databrickscfg` (create one wi
 2. **Per-invocation, on the CLI** — the `--profile` flag, honored by all subcommands (`doctor`, `deploy`, ...). Used when the payload leaves the profile empty. Note that Buzz Desktop invokes the provider without arguments, so this only applies to manual CLI use:
 
    ```sh
-   buzz-backend-databricks --profile fevm-west doctor
+   buzz-backend-databricks-lakebox --profile fevm-west doctor
    ```
 
 3. **Baked in at install time** — `make install PROFILE=fevm-west` stamps the fallback default (normally `DEFAULT`) into the binary via ldflags. This is the way to point Buzz Desktop at a specific profile when its payload doesn't set one, since no flags reach provider mode.
@@ -100,8 +108,8 @@ The provider authenticates with a profile from `~/.databrickscfg` (create one wi
 Whichever way you choose, verify it resolves before deploying:
 
 ```sh
-buzz-backend-databricks doctor            # uses the baked-in default
-buzz-backend-databricks --profile fevm-west doctor
+buzz-backend-databricks-lakebox doctor            # uses the baked-in default
+buzz-backend-databricks-lakebox --profile fevm-west doctor
 ```
 
 ## Design inputs

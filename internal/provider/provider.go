@@ -16,9 +16,11 @@ import (
 )
 
 const (
-	// Name is this provider's id-qualified binary name, echoed in info
-	// responses (docs/CONTRACT.md §4).
-	Name = "buzz-backend-databricks"
+	// Name is the display name echoed in info responses — cosmetic only,
+	// never identity (docs/CONTRACT.md §4). Identity is the binary name's
+	// <id> suffix: buzz-backend-databricks-lakebox → databricks-lakebox,
+	// distinct from Buzz's own built-in databricks provider.
+	Name = "Databricks Lakebox"
 
 	// Description is the human-readable info-response description
 	// (docs/CONTRACT.md §4).
@@ -122,7 +124,7 @@ func route(data []byte, deploy DeployFunc) any {
 // {"ok":false,"error":...} deploy response shape (docs/CONTRACT.md §4)
 // using the same typed response structs the provider-mode stdin path
 // emits — one rendering for the frozen wire shape, shared by both the
-// provider-mode handleDeploy path and cmd/buzz-backend-databricks's
+// provider-mode handleDeploy path and cmd/buzz-backend-databricks-lakebox's
 // operator `deploy --payload-file` command (which used to hand-roll an
 // equivalent map literal of its own).
 func MarshalDeployResult(agentID string, deployErr error) []byte {

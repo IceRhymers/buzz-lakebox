@@ -46,7 +46,7 @@ func derefOrDefault(s *string, def string) string {
 // PATStub is the comment-only ~/.databrickscfg content that neutralizes
 // the baked creator-identity PAT (docs/PLAN.md §4.4 step 4 / §5): no
 // profiles, no credentials.
-const PATStub = `# Databricks CLI config managed by buzz-backend-databricks.
+const PATStub = `# Databricks CLI config managed by buzz-backend-databricks-lakebox.
 #
 # The baked creator-identity PAT has been intentionally removed by this
 # provider (docs/PLAN.md §4.4 step 4, §5): the sandbox's in-image

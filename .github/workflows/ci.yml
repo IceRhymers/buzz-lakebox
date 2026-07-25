@@ -58,7 +58,7 @@ jobs:
           CGO_ENABLED: "0"
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-        run: go build -o /tmp/buzz-backend-databricks ./cmd/buzz-backend-databricks
+        run: go build -o /tmp/buzz-backend-databricks-lakebox ./cmd/buzz-backend-databricks-lakebox
 
   goreleaser:
     runs-on: ubuntu-latest

@@ -75,7 +75,7 @@ Validated by the desktop before it reaches us (`validate_provider_config`, backe
 Passed through to the frontend **unvalidated** (agent_providers.rs returns `invoke_provider`'s value directly). Convention (must not set `ok:false`):
 
 ```json
-{"ok":true,"name":"buzz-backend-databricks","version":"<semver>","description":"...","protocol":"v1","ops":["info","deploy"]}
+{"ok":true,"name":"Databricks Lakebox","version":"<semver>","description":"...","protocol":"v1","ops":["info","deploy"]}
 ```
 
 ### `deploy` success (backend.rs:373-376)
@@ -104,7 +104,7 @@ backend.rs:189-193, 253-297: the desktop redacts `agent.env_vars` values (≥4 c
 
 ## 6. Discovery
 
-backend.rs:427-543: binaries named `buzz-backend-<id>` with the executable bit, discovered on `PATH` + the desktop exe's own dir + `~/.local/bin`; id must match `[a-z0-9][a-z0-9_-]*`. Our id: `databricks` → binary `buzz-backend-databricks`.
+backend.rs:427-543: binaries named `buzz-backend-<id>` with the executable bit, discovered on `PATH` + the desktop exe's own dir + `~/.local/bin`; id must match `[a-z0-9][a-z0-9_-]*`. Our id: `databricks-lakebox` → binary `buzz-backend-databricks-lakebox` (buzz ships its own built-in `databricks` provider, so the plain id would collide).
 
 ## 7. Engineering constants settled here
 

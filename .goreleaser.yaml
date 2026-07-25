@@ -1,15 +1,15 @@
 version: 2
 
-project_name: buzz-backend-databricks
+project_name: buzz-backend-databricks-lakebox
 
 before:
   hooks:
     - go mod tidy
 
 builds:
-  - id: buzz-backend-databricks
-    main: ./cmd/buzz-backend-databricks
-    binary: buzz-backend-databricks
+  - id: buzz-backend-databricks-lakebox
+    main: ./cmd/buzz-backend-databricks-lakebox
+    binary: buzz-backend-databricks-lakebox
     env:
       - CGO_ENABLED=0
     goos:

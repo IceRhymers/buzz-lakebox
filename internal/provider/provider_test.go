@@ -44,7 +44,7 @@ func TestInfo_FrozenShape(t *testing.T) {
 
 	want := map[string]any{
 		"ok":          true,
-		"name":        "buzz-backend-databricks",
+		"name":        "Databricks Lakebox",
 		"version":     version.Version,
 		"description": "Deploys Buzz agents into Databricks Lakebox sandboxes",
 		"protocol":    "v1",
