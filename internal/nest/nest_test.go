@@ -177,6 +177,13 @@ func TestRenderLaunchScript_GoldenInvariants(t *testing.T) {
 	if !strings.Contains(script, `. "$HOME/.buzz-backend/env"`) {
 		t.Fatal("launch.sh must source the env file")
 	}
+	pathExport := `export PATH="$HOME/.buzz-backend/bin:$PATH"`
+	if !strings.Contains(script, pathExport) {
+		t.Fatal("launch.sh must prepend the installed bin dir to PATH — buzz-acp spawns the agent command by bare name")
+	}
+	if strings.Index(script, pathExport) < strings.Index(script, `. "$HOME/.buzz-backend/env"`) {
+		t.Fatal("PATH export must come after sourcing the env file so the env file cannot clobber it")
+	}
 }
 
 func TestRenderLaunchScript_KeepWorkspacePAT_OmitsStub(t *testing.T) {

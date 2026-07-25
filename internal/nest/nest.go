@@ -154,6 +154,14 @@ func RenderLaunchScript(keepWorkspacePAT bool) string {
 	b.WriteString("# shellcheck disable=SC1090\n")
 	b.WriteString(`. "$HOME/.buzz-backend/env"` + "\n\n")
 
+	b.WriteString("# Installed Buzz binaries must be on PATH: buzz-acp spawns the agent\n")
+	b.WriteString("# command (BUZZ_ACP_AGENT_COMMAND=\"buzz-agent\") by bare name, and the\n")
+	b.WriteString("# agent itself shells out to `buzz` and git-credential-nostr — none of\n")
+	b.WriteString("# which the sandbox's default PATH can see (live-bitten: every worker\n")
+	b.WriteString("# died at spawn with \"No such file or directory\"; only buzz-acp itself\n")
+	b.WriteString("# survived because this script launches it by absolute path).\n")
+	b.WriteString(`export PATH="$HOME/.buzz-backend/bin:$PATH"` + "\n\n")
+
 	b.WriteString(`mkdir -p "$HOME/.buzz" "$HOME/.buzz/REPOS" "$HOME/.buzz/OUTBOX" "$HOME/.buzz-backend"` + "\n")
 	b.WriteString(`cd "$HOME/.buzz"` + "\n\n")
 
