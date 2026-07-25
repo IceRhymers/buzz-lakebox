@@ -25,6 +25,54 @@ Buzz Desktop ──stdin JSON {op:"deploy",...}──> buzz-backend-databricks
 
 Auth: the operator's existing `~/.databrickscfg` profile, selected via `provider_config.profile`. The Databricks Sandbox preview is region-gated (verified in us-west-2).
 
+## Install from source
+
+### Prerequisites
+
+- [Go](https://go.dev/dl/) 1.22 or newer
+- `git` and `make`
+- A configured `~/.databrickscfg` profile with access to the Databricks Sandbox preview (needed at runtime, not build time)
+
+### Steps
+
+1. **Clone the repository**
+
+   ```sh
+   git clone https://github.com/IceRhymers/buzz-lakebox.git
+   cd buzz-lakebox
+   ```
+
+2. **Build and install the binary**
+
+   ```sh
+   make install
+   ```
+
+   This runs `go install` with the version stamped in, placing `buzz-backend-databricks` into `$GOBIN` (or `$(go env GOPATH)/bin` if `GOBIN` is unset). To stamp a specific version string, pass `VERSION`:
+
+   ```sh
+   make install VERSION=v0.1.0
+   ```
+
+3. **Ensure the install directory is on your `PATH`**
+
+   Buzz Desktop discovers providers by scanning `PATH` for `buzz-backend-<id>` executables, so this step is required — not just convenient:
+
+   ```sh
+   export PATH="$(go env GOPATH)/bin:$PATH"
+   ```
+
+   Add that line to your shell profile (`~/.zshrc`, `~/.bashrc`, …) to make it permanent.
+
+4. **Verify the install**
+
+   ```sh
+   buzz-backend-databricks version   # prints the stamped version
+   buzz-backend-databricks doctor    # checks the runtime environment
+   ```
+
+To build into the repo root instead of installing (e.g. for local iteration), use `make build`, and run `make check` to execute the same vet + lint + test gauntlet as CI. See `make help` for all targets.
+
 ## Design inputs
 
 Full research (buzz architecture, omnigent's Lakebox integration patterns, live probe evidence with commands and timings) lives in [`docs/`](docs/):
