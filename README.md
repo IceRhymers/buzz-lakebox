@@ -21,7 +21,7 @@ Buzz Desktop ──stdin JSON {op:"deploy",...}──> buzz-backend-databricks-l
 |---|---|
 | `deploy` | Create (or reuse via `backend_agent_id`) a sandbox → set autostop policy → install pinned Buzz binaries into `$HOME` → write deploy-payload env (0600, via SSH stdin — never argv) → `setsid nohup buzz-acp` → return `{ok: true, agent_id: "<sandbox-id>"}` |
 | `info` | Provider name/version/description |
-| stop/status/logs/undeploy | Not in Buzz's provider protocol yet ("v2") — exposed as CLI subcommands of this binary in the interim |
+| stop/status/logs/undeploy | Not in Buzz's provider protocol yet ("v2"). The binary registers matching subcommands but they are **M2 stubs** — operate deployed agents with the raw `databricks sandbox` CLI for now (see [Operating a deployed agent](#operating-a-deployed-agent)) |
 
 Auth: the operator's existing `~/.databrickscfg` profile, selected via `provider_config.profile`. The Databricks Sandbox preview is region-gated (verified in us-west-2).
 
@@ -31,6 +31,7 @@ Auth: the operator's existing `~/.databrickscfg` profile, selected via `provider
 
 - [Go](https://go.dev/dl/) 1.22 or newer
 - `git` and `make`
+- The [`databricks` CLI](https://docs.databricks.com/dev-tools/cli/) **1.8.0 or newer** (the version that ships the `sandbox` command group). The provider shells out to it for everything, and resolves it from `PATH` plus the usual install dirs (`/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`, `~/bin`) so a Dock-launched Buzz Desktop finds it too.
 - A configured `~/.databrickscfg` profile with access to the Databricks Sandbox preview (needed at runtime, not build time)
 
 ### Steps
@@ -112,6 +113,55 @@ buzz-backend-databricks-lakebox doctor            # uses the baked-in default
 buzz-backend-databricks-lakebox --profile fevm-west doctor
 ```
 
+### Register your sandbox SSH key
+
+Deploys run every in-sandbox step over `databricks sandbox ssh`, which needs your machine's sandbox key registered with the **target** workspace:
+
+```sh
+databricks sandbox register -p <profile>
+```
+
+⚠️ **One key, one workspace.** The sandbox gateway is shared per region and binds a key to a single workspace identity. If the key is already registered elsewhere, registering (and deploying) fails with `this SSH key is already registered to another user`. Free it first on the workspace that owns it:
+
+```sh
+databricks sandbox ssh-key list -p <other-profile>
+databricks sandbox ssh-key delete <key-hash> -p <other-profile>
+databricks sandbox register -p <target-profile>
+```
+
+Moving the key breaks sandbox SSH on the previous workspace until you register back. Preflight verifies actual registration (not just the register command's exit code) and fails with this remedy in the message.
+
+## Setting up an agent in Buzz Desktop
+
+With the binary symlinked into `~/.local/bin`, **restart Buzz Desktop** (it snapshots its provider scan at launch), then create the agent:
+
+1. **Create agent** → fill in name and instructions.
+2. **AI configuration** → *Customize for this agent*:
+   - **Agent harness**: Buzz Agent
+   - **LLM provider**: **Databricks v2** from the list — *not* "Custom provider…" (buzz-agent only understands the built-in provider ids, and v2 routes Claude/GPT models through the workspace AI Gateway)
+   - **Model**: pick from the discovered list or enter a custom gateway model id (e.g. `databricks-claude-opus-5`)
+3. **Environment variables** (Advanced):
+   - `DATABRICKS_HOST` — the workspace URL serving the model
+   - `DATABRICKS_TOKEN` — **required for sandbox deploys.** buzz-agent's default Databricks auth is a browser OAuth (PKCE) flow, which cannot happen inside a headless sandbox; without a token the agent deploys fine and then fails its first LLM call. Least-privilege option: a service-principal token with CAN QUERY on the gateway endpoints.
+4. **Run on** → select `databricks-lakebox`. (The section only appears when at least one `buzz-backend-*` binary is discoverable; if it's missing, re-check the symlink and restart the desktop.)
+5. **Create agent** — the deploy takes a couple of minutes on the first run (it downloads and installs the Buzz `.deb` into the sandbox), and is an idempotent update-in-place on redeploys.
+
+Talk to the agent by **@mentioning it in a channel it's a member of** (`respond_to` defaults to owner-only, so mention it as the owner). The desktop's status indicators for remote agents come from relay observer frames, which the rendered env enables (`BUZZ_ACP_RELAY_OBSERVER=true`).
+
+## Operating a deployed agent
+
+The provider's lifecycle subcommands are M2 stubs; until then, operate through the `databricks` CLI (the sandbox id is the `agent_id` returned by deploy, also visible in `databricks sandbox list`):
+
+```sh
+databricks sandbox list -p <profile>                     # find the sandbox; AUTOSTOP should read "never"
+databricks sandbox ssh <id> -p <profile> -- 'tail -50 $HOME/.buzz-backend/acp.log'   # agent health/log
+databricks sandbox stop <id> -p <profile>                # stop compute (agent dies; $HOME persists)
+databricks sandbox start <id> -p <profile>               # restart compute…
+databricks sandbox ssh <id> -p <profile> -- 'sh $HOME/.buzz-backend/launch.sh'       # …then relaunch the agent (nothing relaunches it automatically)
+```
+
+Healthy log lines to look for: `agent_pool_ready agents=N`, `connected to relay`, `subscribed to channel …`, `presence set to online`. You can also stop a remote agent from chat with a `!shutdown` owner mention. Deploys default the sandbox to `--no-autostop` (relay traffic doesn't count as sandbox activity, so any idle timeout would kill healthy agents); pass `provider_config.idle_timeout` to opt back in, accepting manual `start`-based recovery.
+
 ## Design inputs
 
 Full research (buzz architecture, omnigent's Lakebox integration patterns, live probe evidence with commands and timings) lives in [`docs/`](docs/):
@@ -130,4 +180,4 @@ Full research (buzz architecture, omnigent's Lakebox integration patterns, live 
 
 ## Status
 
-Design/scaffold phase. No working provider binary yet.
+**M1 — working end-to-end** (live-verified 2026-07-25): deploy from Buzz Desktop → Databricks Sandbox provisioned → harness installed → agent online on the relay → owner mention answered via the workspace AI Gateway. Lifecycle ops (`status`/`logs`/`stop`/`start`/`undeploy`) remain M2 stubs; operate via the `databricks sandbox` CLI in the interim.
