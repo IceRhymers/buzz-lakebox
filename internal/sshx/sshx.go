@@ -15,6 +15,9 @@ import (
 	"io"
 	"os/exec"
 	"strings"
+	"sync"
+
+	"github.com/IceRhymers/buzz-lakebox/internal/lakebox"
 )
 
 // defaultBin is the binary name resolved via PATH when Client.Bin is unset.
@@ -26,8 +29,12 @@ const defaultBin = "databricks"
 // (PLAN.md §7).
 type Client struct {
 	// Bin is the binary name or path invoked for every command. Empty
-	// means "databricks" resolved via PATH.
+	// means "databricks" resolved via PATH (with well-known-dir
+	// fallback, see lakebox.DefaultBinPath).
 	Bin string
+
+	resolveOnce sync.Once
+	resolvedBin string
 }
 
 // New returns a Client that invokes the real "databricks" binary on PATH.
@@ -36,10 +43,18 @@ func New() *Client {
 }
 
 func (c *Client) binName() string {
-	if c.Bin == "" {
-		return defaultBin
+	// An explicit override (tests point Bin at a fake PATH shim) always
+	// wins; the default name goes through the same PATH-then-fallback
+	// resolution as internal/lakebox.CLI, so a Dock-launched Buzz
+	// Desktop (launchd's minimal PATH) can run SSH steps too — not just
+	// preflight.
+	if c.Bin != "" && c.Bin != defaultBin {
+		return c.Bin
 	}
-	return c.Bin
+	c.resolveOnce.Do(func() {
+		c.resolvedBin = lakebox.DefaultBinPath()
+	})
+	return c.resolvedBin
 }
 
 // Run executes cmd inside sandbox id via

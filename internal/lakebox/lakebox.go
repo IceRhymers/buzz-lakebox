@@ -75,6 +75,17 @@ func (c *CLI) resolveBin() string {
 	return c.resolvedBin
 }
 
+// DefaultBinPath resolves the "databricks" binary the way CLI resolves
+// its default Bin: plain PATH lookup first, then the well-known install
+// dirs. Exported for internal/sshx, whose exec wrapper must survive the
+// same launchd-minimal-PATH environment (a Dock-launched Buzz Desktop);
+// keeping one resolver prevents the two wrappers from drifting — the
+// failure mode where preflight passes but the first SSH step dies with
+// "databricks": executable file not found in $PATH.
+func DefaultBinPath() string {
+	return resolveDefaultBin(fallbackDirs())
+}
+
 // fallbackDirs returns the well-known databricks CLI install locations
 // probed when PATH resolution fails: Homebrew (Apple Silicon), the
 // curl-installer / Homebrew-on-Intel prefix, and the per-user bin dirs.

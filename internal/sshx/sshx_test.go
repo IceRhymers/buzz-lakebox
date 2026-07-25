@@ -37,6 +37,19 @@ exit "${FAKE_EXIT:-0}"
 	return path
 }
 
+// TestBinName_ExplicitOverrideSkipsFallback: a non-default Bin (the test
+// shim pattern) is used verbatim, never fallback-resolved. The
+// PATH-then-fallback resolution itself is covered hermetically in
+// internal/lakebox (TestResolveDefaultBin_*); sshx shares that resolver
+// via lakebox.DefaultBinPath.
+func TestBinName_ExplicitOverrideSkipsFallback(t *testing.T) {
+	shim := filepath.Join(t.TempDir(), "databricks")
+	c := &Client{Bin: shim}
+	if got := c.binName(); got != shim {
+		t.Fatalf("binName = %q, want explicit override %q", got, shim)
+	}
+}
+
 func TestRun_NoStdin(t *testing.T) {
 	dir := t.TempDir()
 	writeFakeDatabricks(t, dir)
