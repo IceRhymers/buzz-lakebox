@@ -129,7 +129,16 @@ ln -sf "$SRC" "$BIN_DIR/%s"
 // InitializeFrame is the ACP `initialize` JSON-RPC request piped into
 // buzz-agent for runtime verification (docs/M05_PROBE_RESULTS.md §6: no
 // `--version`; config validation runs before arg parsing).
-const InitializeFrame = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"0.1.0","clientInfo":{"name":"buzz-backend-databricks-lakebox","version":"dev"}}}`
+//
+// protocolVersion is an INTEGER, not the "0.1.0"-style string this
+// frame originally carried: buzz-agent deserializes it as u32 and
+// rejects strings outright with `initialize: invalid type: string
+// "0.1.0", expected u32` (live-bitten during a real deploy;
+// block/buzz crates/buzz-agent README + wire.rs). 1 is the lowest
+// version every shipped buzz-agent accepts — the agent negotiates
+// upward/downward itself, and this frame only needs a liveness answer,
+// so pin the most compatible request, not the newest.
+const InitializeFrame = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}`
 
 // AgentInfoMarker is the substring expected in buzz-agent's response to
 // InitializeFrame on success (docs/M05_PROBE_RESULTS.md §6: "expect the
