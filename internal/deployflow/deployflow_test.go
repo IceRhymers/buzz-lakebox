@@ -519,13 +519,16 @@ func TestDeploy_InstallFails_FreshCreate_TearsDownAndDeletes(t *testing.T) {
 	if !strings.Contains(err.Error(), "sandbox-fresh-fail") {
 		t.Fatalf("error should embed the sandbox id, got: %v", err)
 	}
-	// NOTE: this error originates from sshx (install-exec), not lakebox,
-	// so it carries no CLI version stamp under the BUG 9 fix:
-	// deployflow.wrap no longer stamps a version on any error (lakebox's
-	// own wrapErr is now the SINGLE stamper, and only lakebox-originated
-	// errors get one) — this avoided a duplicated "(databricks cli X)"
-	// on lakebox-originated errors and a second `databricks version`
-	// subprocess spawn just for the (now-removed) annotation here.
+	// deployflow.wrap is the single stamping boundary for BOTH the
+	// sandbox id and CLI version (docs/PLAN.md §4.3), so even this
+	// sshx-originated (non-lakebox) install failure carries the version
+	// fetched at preflight — and exactly once.
+	if !strings.Contains(err.Error(), "databricks cli 1.8.0") {
+		t.Fatalf("error should embed the CLI version, got: %v", err)
+	}
+	if strings.Count(err.Error(), "databricks cli") != 1 {
+		t.Fatalf("error should carry exactly one CLI version stamp, got: %v", err)
+	}
 	if strings.Contains(err.Error(), "MARKER-SHOULD-NOT-LEAK-1234") {
 		t.Fatalf("error leaked a planted marker secret: %v", err)
 	}
@@ -550,11 +553,8 @@ func TestDeploy_LaunchVerifyFails_TerminalError_ReusedSandbox_KillsNoDelete(t *t
 	if err == nil {
 		t.Fatal("expected launch verification to fail on the terminal-error line")
 	}
-	// This error also originates from sshx (verify-check), not lakebox,
-	// so — per the BUG 9 fix note above — it carries no CLI version
-	// stamp; only the sandbox id is asserted here.
-	if !strings.Contains(err.Error(), "sandbox-reused-fail") {
-		t.Fatalf("error should embed the sandbox id, got: %v", err)
+	if !strings.Contains(err.Error(), "sandbox-reused-fail") || !strings.Contains(err.Error(), "1.9.0") {
+		t.Fatalf("error should embed sandbox id + cli version, got: %v", err)
 	}
 	if !strings.Contains(err.Error(), "relay") {
 		t.Fatalf("error should carry the documented relay-membership guidance, got: %v", err)
@@ -699,5 +699,58 @@ func TestDeploy_RejectsUnsupportedRuntimeBeforeAnyCLICall(t *testing.T) {
 	}
 	if len(h.events()) != 0 {
 		t.Fatalf("expected no CLI/ssh calls before validation, got %v", callSequence(h.events()))
+	}
+}
+
+// --- parsePgrepCheck (verify-check output parsing) ---------------------------
+
+func TestParsePgrepCheck_MarkerAfterPreamble(t *testing.T) {
+	// A stdout preamble (e.g. a shell profile banner) before the marker
+	// line must not break parsing: the FIRST marker line in order wins,
+	// and only what follows it is the log.
+	out := "some shell profile banner\nBUZZ_PGREP_RC=0\nagent_pool_ready agents=1\n"
+	rc, log, err := parsePgrepCheck(out)
+	if err != nil {
+		t.Fatalf("parsePgrepCheck error: %v", err)
+	}
+	if rc != 0 {
+		t.Fatalf("rc = %d, want 0", rc)
+	}
+	if !strings.Contains(log, "agent_pool_ready") {
+		t.Fatalf("log should contain the content after the marker, got %q", log)
+	}
+	if strings.Contains(log, "banner") {
+		t.Fatalf("preamble before the marker must not leak into the log, got %q", log)
+	}
+}
+
+func TestParsePgrepCheck_FirstMarkerWins_CollisionSafe(t *testing.T) {
+	// The echo always precedes the log tail, so the first marker in order
+	// is authoritative; marker-shaped text INSIDE the log content must be
+	// treated as log, not re-parsed.
+	out := "BUZZ_PGREP_RC=1\nlog line quoting BUZZ_PGREP_RC=0 as content\n"
+	rc, log, err := parsePgrepCheck(out)
+	if err != nil {
+		t.Fatalf("parsePgrepCheck error: %v", err)
+	}
+	if rc != 1 {
+		t.Fatalf("rc = %d, want 1 (first marker line must win)", rc)
+	}
+	if !strings.Contains(log, "BUZZ_PGREP_RC=0") {
+		t.Fatalf("marker-shaped log content should be preserved as log, got %q", log)
+	}
+}
+
+func TestParsePgrepCheck_MissingMarker_DistinctError(t *testing.T) {
+	// No marker anywhere → a distinct parse error, NOT a fabricated rc=1:
+	// an inconclusive check must not masquerade as a confirmed-dead agent
+	// (rc=1 routes to the process-dead message; the parse error routes to
+	// its own "could not parse verification output" diagnosis upstream).
+	_, _, err := parsePgrepCheck("just some log lines\nno marker here\n")
+	if err == nil {
+		t.Fatal("expected a distinct error when no BUZZ_PGREP_RC marker line exists")
+	}
+	if !strings.Contains(err.Error(), "BUZZ_PGREP_RC") {
+		t.Fatalf("error should name the missing marker, got: %v", err)
 	}
 }

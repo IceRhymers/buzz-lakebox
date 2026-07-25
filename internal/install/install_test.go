@@ -89,7 +89,10 @@ func TestBuildInstallScript_ChecksumVerification(t *testing.T) {
 }
 
 func TestBuildVerifyCommand_CombinedScript(t *testing.T) {
-	cmd := BuildVerifyCommand(`$HOME/.buzz-backend/.env.verify`, 10)
+	cmd, err := BuildVerifyCommand(`$HOME/.buzz-backend/.env.verify`, 10)
+	if err != nil {
+		t.Fatalf("BuildVerifyCommand error for the canonical trusted path: %v", err)
+	}
 	if !strings.Contains(cmd, InitializeFrame) {
 		t.Fatal("verify command should pipe the ACP initialize frame")
 	}
@@ -114,5 +117,30 @@ func TestBuildVerifyCommand_CombinedScript(t *testing.T) {
 	}
 	if !strings.Contains(cmd, "buzz-agent") {
 		t.Fatal("verify command should invoke buzz-agent")
+	}
+}
+
+// TestBuildVerifyCommand_RejectsHostilePaths pins the round-2 defensive
+// guard: envFile is interpolated unescaped inside a double-quoted shell
+// assignment (required so "$HOME" expands), so any character that could
+// carry shell syntax through that context — a closing double quote, a
+// backtick, $( ) command substitution, backslash, whitespace — must be
+// rejected outright. BuildVerifyCommand accepts trusted static literals
+// only.
+func TestBuildVerifyCommand_RejectsHostilePaths(t *testing.T) {
+	hostile := []string{
+		`$HOME/x"; rm -rf /; echo "`,         // embedded double quote breaks out of the assignment
+		"$HOME/`touch /tmp/pwned`",           // backtick command substitution
+		`$HOME/$(touch /tmp/pwned)`,          // $() command substitution
+		`$HOME/.buzz-backend/.env verify`,    // whitespace
+		`$HOME\.buzz-backend\.env.verify`,    // backslash
+		`$HOME/.buzz-backend/.env.verify'x`,  // single quote
+		"$HOME/.buzz-backend/.env\nrm -rf /", // newline
+		"",                                   // empty
+	}
+	for _, path := range hostile {
+		if cmd, err := BuildVerifyCommand(path, 10); err == nil {
+			t.Fatalf("BuildVerifyCommand(%q) should have been rejected, got script: %q", path, cmd)
+		}
 	}
 }

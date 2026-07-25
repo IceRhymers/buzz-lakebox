@@ -8,6 +8,7 @@ package install
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/IceRhymers/buzz-lakebox/internal/shellquote"
@@ -151,7 +152,17 @@ const AgentInfoMarker = "agentInfo"
 // the deploy-breaking bug this function now fixes: the file was written
 // with $HOME expanded but previously sourced/removed with $HOME literal,
 // so sourcing always failed and the trap never removed the real file).
-func BuildVerifyCommand(envFile string, timeoutSeconds int) string {
+//
+// Because envFile is interpolated inside double quotes unescaped, it is
+// defensively validated against verifyEnvFileCharset: any character
+// outside [A-Za-z0-9_$/.-] (double quote, backtick, $( ), backslash,
+// whitespace, ...) is rejected with an error, so a future caller
+// mistake can never smuggle shell syntax through this trusted-literal
+// path.
+func BuildVerifyCommand(envFile string, timeoutSeconds int) (string, error) {
+	if !verifyEnvFileCharset.MatchString(envFile) {
+		return "", fmt.Errorf("verify env file path %q contains characters outside the allowed set [A-Za-z0-9_$/.-]; BuildVerifyCommand accepts trusted static literals only", envFile)
+	}
 	return fmt.Sprintf(`set -eu
 umask 077
 ENVF="%s"
@@ -163,5 +174,11 @@ set -a
 . "$ENVF"
 set +a
 printf '%%s\n' %s | timeout %d "$HOME/.buzz-backend/bin/buzz-agent"
-`, envFile, shellquote.Single(InitializeFrame), timeoutSeconds)
+`, envFile, shellquote.Single(InitializeFrame), timeoutSeconds), nil
 }
+
+// verifyEnvFileCharset is the allowlist for BuildVerifyCommand's envFile
+// parameter: path characters plus '$' (for the required "$HOME" prefix),
+// and nothing that carries meaning inside a double-quoted shell string
+// beyond parameter expansion the caller explicitly wants.
+var verifyEnvFileCharset = regexp.MustCompile(`^[A-Za-z0-9_$/.\-]+$`)

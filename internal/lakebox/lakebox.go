@@ -169,11 +169,13 @@ const StatusRunning = "Running"
 // CachedVersion returns the CLI version string, fetching and caching it on
 // first call (M1 deliverable 1: "every method records the CLI version
 // string for error context; fetch once, cache on the struct"). Exported
-// so callers other than wrapErr (e.g. internal/deployflow's preflight
-// check) share the same sync.Once cache rather than each spawning their
-// own `databricks version` subprocess (BUG 9 fix: deployflow used to call
-// Version(ctx) directly, bypassing this cache entirely, causing a
-// redundant subprocess spawn on top of whatever wrapErr later spawned).
+// so internal/deployflow's preflight check shares the same sync.Once
+// cache rather than spawning its own `databricks version` subprocess
+// (BUG 9 fix). The docs/PLAN.md §4.3 CLI-version error annotation is
+// stamped at a SINGLE boundary — internal/deployflow.wrap, using the
+// version this method returned at preflight — NOT here in lakebox
+// (review round 2: lakebox-level stamping left every non-lakebox error,
+// e.g. sshx install/verify failures, without a version).
 func (c *CLI) CachedVersion(ctx context.Context) (string, error) {
 	c.versionOnce.Do(func() {
 		c.versionVal, c.versionErr = c.Version(ctx)
@@ -181,25 +183,12 @@ func (c *CLI) CachedVersion(ctx context.Context) (string, error) {
 	return c.versionVal, c.versionErr
 }
 
-// cachedVersion returns the cached CLI version string, degrading to
-// "unknown" rather than masking the original error a caller is trying to
-// report.
-func (c *CLI) cachedVersion(ctx context.Context) string {
-	v, err := c.CachedVersion(ctx)
-	if err != nil || v == "" {
-		return "unknown"
-	}
-	return v
-}
-
-// wrapErr annotates err with the recorded CLI version for diagnosability
-// (docs/PLAN.md §3.1, §4.3: "every error message embeds ... the recorded
-// CLI version"). This is the SINGLE stamper of CLI version onto error
-// text (BUG 9 fix): callers (e.g. internal/deployflow.wrap) must not
-// stamp their own version annotation on top of this one, to avoid
-// duplicated "(databricks cli X)" text.
-func (c *CLI) wrapErr(ctx context.Context, err error, action string) error {
-	return fmt.Errorf("%s: %w (databricks cli %s)", action, err, c.cachedVersion(ctx))
+// wrapErr annotates err with the failing action for diagnosability. It
+// deliberately does NOT stamp the CLI version: that annotation is owned
+// by the single boundary internal/deployflow.wrap (see CachedVersion's
+// doc comment), so stamping here too would duplicate it.
+func (c *CLI) wrapErr(err error, action string) error {
+	return fmt.Errorf("%s: %w", action, err)
 }
 
 func (c *CLI) runCombined(ctx context.Context, args ...string) (string, error) {
@@ -240,7 +229,7 @@ func looksLikeUnsupportedFlag(output string) bool {
 func (c *CLI) SandboxRegister(ctx context.Context, profile string) error {
 	out, err := c.runCombined(ctx, "sandbox", "register", "-p", profile)
 	if err != nil && !strings.Contains(strings.ToLower(out), "already registered") {
-		return c.wrapErr(ctx, fmt.Errorf("sandbox register -p %s: %w (output: %s)", profile, err, strings.TrimSpace(out)), "sandbox register")
+		return c.wrapErr(fmt.Errorf("sandbox register -p %s: %w (output: %s)", profile, err, strings.TrimSpace(out)), "sandbox register")
 	}
 	return nil
 }
@@ -251,11 +240,11 @@ func (c *CLI) SandboxRegister(ctx context.Context, profile string) error {
 func (c *CLI) SandboxCreate(ctx context.Context, profile, name string) (Sandbox, error) {
 	stdout, stderr, err := c.runSplit(ctx, "sandbox", "create", name, "--json", "-p", profile)
 	if err != nil {
-		return Sandbox{}, c.wrapErr(ctx, fmt.Errorf("sandbox create %s -p %s: %w (stdout: %s, stderr: %s)", name, profile, err, strings.TrimSpace(stdout), strings.TrimSpace(stderr)), "sandbox create")
+		return Sandbox{}, c.wrapErr(fmt.Errorf("sandbox create %s -p %s: %w (stdout: %s, stderr: %s)", name, profile, err, strings.TrimSpace(stdout), strings.TrimSpace(stderr)), "sandbox create")
 	}
 	var sb Sandbox
 	if jerr := json.Unmarshal([]byte(stdout), &sb); jerr != nil {
-		return Sandbox{}, c.wrapErr(ctx, fmt.Errorf("parse sandbox create --json output: %w (stdout: %s, stderr: %s)", jerr, strings.TrimSpace(stdout), strings.TrimSpace(stderr)), "sandbox create")
+		return Sandbox{}, c.wrapErr(fmt.Errorf("parse sandbox create --json output: %w (stdout: %s, stderr: %s)", jerr, strings.TrimSpace(stdout), strings.TrimSpace(stderr)), "sandbox create")
 	}
 	return sb, nil
 }
@@ -274,19 +263,19 @@ func (c *CLI) SandboxList(ctx context.Context, profile string) ([]Sandbox, strin
 		if looksLikeUnsupportedFlag(stdout + stderr) {
 			tableOut, tableErr, tErr := c.runSplit(ctx, "sandbox", "list", "-p", profile)
 			if tErr != nil {
-				return nil, tableOut, c.wrapErr(ctx, fmt.Errorf("sandbox list -p %s: %w (stdout: %s, stderr: %s)", profile, tErr, strings.TrimSpace(tableOut), strings.TrimSpace(tableErr)), "sandbox list")
+				return nil, tableOut, c.wrapErr(fmt.Errorf("sandbox list -p %s: %w (stdout: %s, stderr: %s)", profile, tErr, strings.TrimSpace(tableOut), strings.TrimSpace(tableErr)), "sandbox list")
 			}
 			sbs, pErr := parseSandboxTable(tableOut)
 			if pErr != nil {
-				return nil, tableOut, c.wrapErr(ctx, pErr, "sandbox list: parse table output")
+				return nil, tableOut, c.wrapErr(pErr, "sandbox list: parse table output")
 			}
 			return sbs, tableOut, nil
 		}
-		return nil, stdout, c.wrapErr(ctx, fmt.Errorf("sandbox list --json -p %s: %w (stdout: %s, stderr: %s)", profile, err, strings.TrimSpace(stdout), strings.TrimSpace(stderr)), "sandbox list")
+		return nil, stdout, c.wrapErr(fmt.Errorf("sandbox list --json -p %s: %w (stdout: %s, stderr: %s)", profile, err, strings.TrimSpace(stdout), strings.TrimSpace(stderr)), "sandbox list")
 	}
 	sbs, pErr := parseSandboxArray(stdout)
 	if pErr != nil {
-		return nil, stdout, c.wrapErr(ctx, pErr, "sandbox list: parse json output")
+		return nil, stdout, c.wrapErr(pErr, "sandbox list: parse json output")
 	}
 	return sbs, stdout, nil
 }
@@ -326,11 +315,11 @@ func parseSandboxTable(out string) ([]Sandbox, error) {
 func (c *CLI) SandboxStatus(ctx context.Context, profile, id string) (Sandbox, error) {
 	stdout, stderr, err := c.runSplit(ctx, "sandbox", "status", id, "--json", "-p", profile)
 	if err != nil {
-		return Sandbox{}, c.wrapErr(ctx, fmt.Errorf("sandbox status %s -p %s: %w (stdout: %s, stderr: %s)", id, profile, err, strings.TrimSpace(stdout), strings.TrimSpace(stderr)), "sandbox status")
+		return Sandbox{}, c.wrapErr(fmt.Errorf("sandbox status %s -p %s: %w (stdout: %s, stderr: %s)", id, profile, err, strings.TrimSpace(stdout), strings.TrimSpace(stderr)), "sandbox status")
 	}
 	var sb Sandbox
 	if jerr := json.Unmarshal([]byte(stdout), &sb); jerr != nil {
-		return Sandbox{}, c.wrapErr(ctx, fmt.Errorf("parse sandbox status --json output: %w (stdout: %s, stderr: %s)", jerr, strings.TrimSpace(stdout), strings.TrimSpace(stderr)), "sandbox status")
+		return Sandbox{}, c.wrapErr(fmt.Errorf("parse sandbox status --json output: %w (stdout: %s, stderr: %s)", jerr, strings.TrimSpace(stdout), strings.TrimSpace(stderr)), "sandbox status")
 	}
 	return sb, nil
 }
@@ -341,7 +330,7 @@ func (c *CLI) SandboxStatus(ctx context.Context, profile, id string) (Sandbox, e
 func (c *CLI) SandboxStart(ctx context.Context, profile, id string) error {
 	out, err := c.runCombined(ctx, "sandbox", "start", id, "-p", profile)
 	if err != nil {
-		return c.wrapErr(ctx, fmt.Errorf("sandbox start %s -p %s: %w (output: %s)", id, profile, err, strings.TrimSpace(out)), "sandbox start")
+		return c.wrapErr(fmt.Errorf("sandbox start %s -p %s: %w (output: %s)", id, profile, err, strings.TrimSpace(out)), "sandbox start")
 	}
 	return nil
 }
@@ -366,7 +355,7 @@ func (c *CLI) WaitRunning(ctx context.Context, profile, id string, timeout, poll
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return c.wrapErr(ctx, fmt.Errorf("sandbox %s did not reach %s within %s (last status %q)", id, StatusRunning, timeout, sb.Status), "sandbox wait-running")
+			return c.wrapErr(fmt.Errorf("sandbox %s did not reach %s within %s (last status %q)", id, StatusRunning, timeout, sb.Status), "sandbox wait-running")
 		}
 		select {
 		case <-ctx.Done():
@@ -382,7 +371,7 @@ func (c *CLI) WaitRunning(ctx context.Context, profile, id string, timeout, poll
 func (c *CLI) SandboxDelete(ctx context.Context, profile, id string) error {
 	out, err := c.runCombined(ctx, "sandbox", "delete", id, "--auto-approve", "-p", profile)
 	if err != nil {
-		return c.wrapErr(ctx, fmt.Errorf("sandbox delete %s -p %s: %w (output: %s)", id, profile, err, strings.TrimSpace(out)), "sandbox delete")
+		return c.wrapErr(fmt.Errorf("sandbox delete %s -p %s: %w (output: %s)", id, profile, err, strings.TrimSpace(out)), "sandbox delete")
 	}
 	return nil
 }
@@ -411,7 +400,7 @@ func (c *CLI) SandboxConfig(ctx context.Context, profile, id string, opts Sandbo
 
 	out, err := c.runCombined(ctx, args...)
 	if err != nil {
-		return c.wrapErr(ctx, fmt.Errorf("%s: %w (output: %s)", strings.Join(append([]string{c.binName()}, args...), " "), err, strings.TrimSpace(out)), "sandbox config")
+		return c.wrapErr(fmt.Errorf("%s: %w (output: %s)", strings.Join(append([]string{c.binName()}, args...), " "), err, strings.TrimSpace(out)), "sandbox config")
 	}
 	return nil
 }

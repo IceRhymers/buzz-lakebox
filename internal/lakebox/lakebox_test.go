@@ -296,7 +296,12 @@ func TestCLI_SandboxCreate(t *testing.T) {
 	}
 }
 
-func TestCLI_SandboxCreate_Failure_EmbedsVersion(t *testing.T) {
+// TestCLI_SandboxCreate_Failure_NoVersionStamp pins the round-2 stamping
+// boundary: lakebox.wrapErr must NOT stamp the CLI version onto its
+// errors — internal/deployflow.wrap is the single stamper of both the
+// sandbox id and CLI version annotations, so a lakebox-level stamp here
+// would duplicate it in every deploy-path error.
+func TestCLI_SandboxCreate_Failure_NoVersionStamp(t *testing.T) {
 	dir := t.TempDir()
 	writeFakeDatabricksFull(t, dir)
 	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
@@ -307,8 +312,11 @@ func TestCLI_SandboxCreate_Failure_EmbedsVersion(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	if !strings.Contains(err.Error(), "1.8.0") {
-		t.Fatalf("error %q should embed the CLI version", err.Error())
+	if strings.Contains(err.Error(), "databricks cli") {
+		t.Fatalf("error %q must not carry a lakebox-level CLI version stamp (deployflow.wrap is the single stamper)", err.Error())
+	}
+	if !strings.Contains(err.Error(), "sandbox create") {
+		t.Fatalf("error %q should still name the failing action", err.Error())
 	}
 }
 

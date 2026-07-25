@@ -145,41 +145,42 @@ func (d *Deployer) deploy(req *payload.DeployRequest) (string, error) {
 		profile = defaultProfile
 	}
 
-	// Step 2: preflight. CachedVersion (not Version) so this populates
-	// lakebox.CLI's shared sync.Once cache: every later wrapErr-driven
-	// annotation reuses it instead of spawning a second `databricks
-	// version` subprocess (BUG 9 fix).
+	// Step 2: preflight. CachedVersion (not Version) so the fetch shares
+	// lakebox.CLI's sync.Once cache (BUG 9 fix: no duplicate `databricks
+	// version` subprocess). The returned version is what wrap() — the
+	// single stamping boundary for the §4.3 sandbox-id + CLI-version
+	// error annotations — stamps onto every error below.
 	version, err := d.CLI.CachedVersion(ctx)
 	if err != nil {
 		return "", fmt.Errorf("preflight: could not determine databricks CLI version: %w", err)
 	}
 	meets, err := lakebox.MeetsMinVersion(version)
 	if err != nil {
-		return "", d.wrap("", fmt.Errorf("preflight: %w", err))
+		return "", d.wrap("", version, fmt.Errorf("preflight: %w", err))
 	}
 	if !meets {
-		return "", d.wrap("", fmt.Errorf("preflight: databricks CLI %s is below the minimum supported %s; upgrade the CLI", version, lakebox.MinCLIVersion))
+		return "", d.wrap("", version, fmt.Errorf("preflight: databricks CLI %s is below the minimum supported %s; upgrade the CLI", version, lakebox.MinCLIVersion))
 	}
 	if _, err := d.CLI.CurrentUser(ctx, profile); err != nil {
-		return "", d.wrap("", fmt.Errorf("preflight: profile %q does not resolve: %w", profile, err))
+		return "", d.wrap("", version, fmt.Errorf("preflight: profile %q does not resolve: %w", profile, err))
 	}
 	if err := d.CLI.SandboxRegister(ctx, profile); err != nil {
-		return "", d.wrap("", fmt.Errorf("preflight: sandbox register: %w", err))
+		return "", d.wrap("", version, fmt.Errorf("preflight: sandbox register: %w", err))
 	}
 
 	// Step 3: reuse-or-create, keyed on the agent's npub identity.
 	npub, err := identity.NsecToNpub(agent.PrivateKeyNsec)
 	if err != nil {
-		return "", d.wrap("", fmt.Errorf("derive identity from private_key_nsec: %w", err))
+		return "", d.wrap("", version, fmt.Errorf("derive identity from private_key_nsec: %w", err))
 	}
 	prefix, err := identity.PrefixFor(npub)
 	if err != nil {
-		return "", d.wrap("", err)
+		return "", d.wrap("", version, err)
 	}
 
 	sandboxes, _, err := d.CLI.SandboxList(ctx, profile)
 	if err != nil {
-		return "", d.wrap("", fmt.Errorf("sandbox list: %w", err))
+		return "", d.wrap("", version, fmt.Errorf("sandbox list: %w", err))
 	}
 
 	var matches []lakebox.Sandbox
@@ -196,28 +197,28 @@ func (d *Deployer) deploy(req *payload.DeployRequest) (string, error) {
 	case 0:
 		name, nerr := identity.SandboxName(npub, agent.Name)
 		if nerr != nil {
-			return "", d.wrap("", nerr)
+			return "", d.wrap("", version, nerr)
 		}
 		sb, cerr := d.CLI.SandboxCreate(ctx, profile, name)
 		if cerr != nil {
-			return "", d.wrap("", fmt.Errorf("sandbox create: %w", cerr))
+			return "", d.wrap("", version, fmt.Errorf("sandbox create: %w", cerr))
 		}
 		sandboxID = sb.ID
 		freshlyCreated = true
 		if !strings.EqualFold(sb.Status, lakebox.StatusRunning) {
 			if werr := d.CLI.WaitRunning(ctx, profile, sandboxID, d.waitTimeout(), d.pollInterval(), d.Sleep); werr != nil {
 				d.teardown(profile, sandboxID, freshlyCreated)
-				return "", d.wrap(sandboxID, fmt.Errorf("waiting for freshly created sandbox to reach Running: %w", werr))
+				return "", d.wrap(sandboxID, version, fmt.Errorf("waiting for freshly created sandbox to reach Running: %w", werr))
 			}
 		}
 	case 1:
 		sandboxID = matches[0].ID
 		if !strings.EqualFold(matches[0].Status, lakebox.StatusRunning) {
 			if serr := d.CLI.SandboxStart(ctx, profile, sandboxID); serr != nil {
-				return "", d.wrap(sandboxID, fmt.Errorf("sandbox start: %w", serr))
+				return "", d.wrap(sandboxID, version, fmt.Errorf("sandbox start: %w", serr))
 			}
 			if werr := d.CLI.WaitRunning(ctx, profile, sandboxID, d.waitTimeout(), d.pollInterval(), d.Sleep); werr != nil {
-				return "", d.wrap(sandboxID, fmt.Errorf("waiting for reused sandbox to reach Running: %w", werr))
+				return "", d.wrap(sandboxID, version, fmt.Errorf("waiting for reused sandbox to reach Running: %w", werr))
 			}
 		}
 	default:
@@ -225,7 +226,7 @@ func (d *Deployer) deploy(req *payload.DeployRequest) (string, error) {
 		for i, m := range matches {
 			ids[i] = m.ID
 		}
-		return "", d.wrap("", fmt.Errorf(
+		return "", d.wrap("", version, fmt.Errorf(
 			"ambiguous identity: %d sandboxes match prefix %q (%s); refusing to guess — manually delete the stale sandbox(es) and redeploy",
 			len(matches), prefix, strings.Join(ids, ", "),
 		))
@@ -241,7 +242,7 @@ func (d *Deployer) deploy(req *payload.DeployRequest) (string, error) {
 		if !errors.As(err, &pvf) {
 			d.teardown(profile, sandboxID, freshlyCreated)
 		}
-		return "", d.wrap(sandboxID, err)
+		return "", d.wrap(sandboxID, version, err)
 	}
 
 	return sandboxID, nil
@@ -275,22 +276,30 @@ func (d *Deployer) verifyDelay() time.Duration {
 	return defaultVerifyDelay
 }
 
-// wrap embeds the sandbox id (when known) in err, per docs/PLAN.md §4.3:
-// "Every {ok:false} error embeds the sandbox id (when one exists) and the
-// recorded CLI version." The CLI version half of that contract is now
-// stamped exactly once, by lakebox.wrapErr on lakebox-originated errors
-// (BUG 9 fix): wrap must NOT also stamp a version here, since doing so on
-// an already-lakebox-wrapped error duplicated the "(databricks cli X)"
-// text, and on non-lakebox errors it required a second `databricks
-// version` subprocess spawn just for the annotation.
-func (d *Deployer) wrap(sandboxID string, err error) error {
+// wrap embeds the sandbox id and CLI version (each when known) in err,
+// per docs/PLAN.md §4.3: "Every {ok:false} error embeds the sandbox id
+// (when one exists) and the recorded CLI version." This is the SINGLE
+// stamping boundary for BOTH annotations (review round 2, refining
+// BUG 9): lakebox.wrapErr no longer stamps a version, so every error
+// leaving deploy() — lakebox-originated or not (sshx install/verify
+// failures, identity errors, ambiguous-identity, semver parse) — gets
+// exactly one "(databricks cli X)" here, from the version CachedVersion
+// already fetched at preflight (no extra subprocess). Failures before
+// preflight fetched a version stamp what exists: empty → omitted.
+func (d *Deployer) wrap(sandboxID, version string, err error) error {
 	if err == nil {
 		return nil
 	}
-	if sandboxID == "" {
+	switch {
+	case sandboxID == "" && version == "":
 		return err
+	case sandboxID == "":
+		return fmt.Errorf("%w (databricks cli %s)", err, version)
+	case version == "":
+		return fmt.Errorf("%w (sandbox %s)", err, sandboxID)
+	default:
+		return fmt.Errorf("%w (sandbox %s, databricks cli %s)", err, sandboxID, version)
 	}
-	return fmt.Errorf("%w (sandbox %s)", err, sandboxID)
 }
 
 // postVerifyFailure marks an error that occurred AFTER launch
@@ -373,11 +382,16 @@ func (d *Deployer) provision(ctx context.Context, profile, sandboxID string, fre
 
 	// Step 11: autostop policy, set LAST. A failure here is a
 	// postVerifyFailure (BUG 6): launch already verified healthy, so the
-	// caller must not tear anything down for this specific failure.
+	// caller must not tear anything down for this specific failure. The
+	// message deliberately does NOT interpolate the sandbox id itself:
+	// deploy()'s wrap() appends "(sandbox <id>, databricks cli <v>)" to
+	// every error, and embedding the id here too duplicated it (review
+	// round 2) — the remedy names a <sandbox-id> placeholder that wrap's
+	// annotation resolves.
 	if err := d.setAutostopPolicy(ctx, profile, sandboxID, req.ProviderConfig); err != nil {
 		return &postVerifyFailure{err: fmt.Errorf(
-			"the agent launched and verified successfully, but the autostop policy could not be set: %w; sandbox %s remains on the default 10-minute idle autostop — redeploy, or run `databricks sandbox config %s --no-autostop` manually",
-			err, sandboxID, sandboxID,
+			"the agent launched and verified successfully, but the autostop policy could not be set: %w; the sandbox remains on the default 10-minute idle autostop — redeploy, or run `databricks sandbox config <sandbox-id> --no-autostop` manually (the sandbox id is in this error's trailing annotation)",
+			err,
 		)}
 	}
 
@@ -418,8 +432,12 @@ func (d *Deployer) installAndVerify(ctx context.Context, profile, sandboxID, buz
 	// Runtime verification: ACP initialize handshake with the agent env
 	// sourced (docs/M05_PROBE_RESULTS.md §6), env content shipped via
 	// stdin only.
+	verifyCmd, err := install.BuildVerifyCommand(verifyEnvFilePath, installVerifyTimeoutSeconds)
+	if err != nil {
+		return fmt.Errorf("install verification: %w", err)
+	}
 	out, err := d.SSH.RunWithStdin(ctx, profile, sandboxID,
-		step("verify-exec", install.BuildVerifyCommand(verifyEnvFilePath, installVerifyTimeoutSeconds)),
+		step("verify-exec", verifyCmd),
 		strings.NewReader(envContent),
 	)
 	if err != nil {
@@ -451,7 +469,14 @@ func (d *Deployer) verifyLaunch(ctx context.Context, profile, sandboxID string) 
 		return fmt.Errorf("verify: could not check buzz-acp process/log: %w", err)
 	}
 
-	rc, logOut := parsePgrepCheck(out)
+	rc, logOut, perr := parsePgrepCheck(out)
+	if perr != nil {
+		// Inconclusive, not conclusively dead: fail the deploy with a
+		// distinct diagnosis rather than pretending the process check
+		// itself returned rc=1 (review round 2 — an unparseable output
+		// must not masquerade as a confirmed-dead agent).
+		return fmt.Errorf("verify: could not parse verification output: %w (output: %s)", perr, truncate(strings.TrimSpace(out), maxErrorLogBytes))
+	}
 	logOut = truncate(logOut, maxErrorLogBytes)
 	if rc != 0 {
 		return fmt.Errorf("verify: buzz-acp process not found %s after launch (acp.log: %s)", d.verifyDelay(), strings.TrimSpace(logOut))
@@ -470,24 +495,32 @@ func (d *Deployer) verifyLaunch(ctx context.Context, profile, sandboxID string) 
 }
 
 // parsePgrepCheck splits verify-check's output into the pgrep exit code
-// (from its leading "BUZZ_PGREP_RC=<n>" line) and the remaining (already
-// tail -c 4096 bounded) acp.log content. Malformed output (missing/
-// unparseable marker line) is treated as a liveness failure (rc=1) rather
-// than silently passing.
-func parsePgrepCheck(out string) (rc int, log string) {
+// (from its "BUZZ_PGREP_RC=<n>" marker line) and the remaining (already
+// tail -c 4096 bounded) acp.log content. Lines are scanned IN ORDER and
+// the FIRST line carrying the marker wins (review round 2): the remote
+// echo always precedes the log tail, so first-match-in-order tolerates
+// any stdout preamble (e.g. a shell profile banner) AND is
+// collision-safe against the marker text appearing inside the log
+// content itself. Everything after the marker line is the log. When NO
+// line carries a parseable marker, a distinct error is returned rather
+// than a fabricated rc=1 — an inconclusive check must not masquerade as
+// a confirmed-dead agent (it still fails the deploy, with the raw
+// output in the diagnosis).
+func parsePgrepCheck(out string) (rc int, log string, err error) {
 	const prefix = "BUZZ_PGREP_RC="
-	line := out
-	if idx := strings.Index(out, "\n"); idx != -1 {
-		line = out[:idx]
-		log = out[idx+1:]
-	}
-	line = strings.TrimSpace(line)
-	if strings.HasPrefix(line, prefix) {
-		if n, err := strconv.Atoi(strings.TrimPrefix(line, prefix)); err == nil {
-			return n, log
+	lines := strings.Split(out, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, prefix) {
+			continue
 		}
+		n, aerr := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(trimmed, prefix)))
+		if aerr != nil {
+			return 0, "", fmt.Errorf("malformed %s marker line %q: %w", prefix, trimmed, aerr)
+		}
+		return n, strings.Join(lines[i+1:], "\n"), nil
 	}
-	return 1, out
+	return 0, "", fmt.Errorf("no %s marker line found in verification output", prefix)
 }
 
 // truncate bounds s to at most max bytes (BUG 5 fix: no remote log/output
