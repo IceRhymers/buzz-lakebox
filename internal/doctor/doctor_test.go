@@ -34,6 +34,8 @@ case "$1" in
     if [ "$2" = "list" ]; then
       if [ "${FAKE_SANDBOX_LIST_EXIT:-0}" != "0" ]; then
         echo "Error: sandbox not enabled for this workspace region (403)" >&2
+      else
+        echo '[]'
       fi
       exit "${FAKE_SANDBOX_LIST_EXIT:-0}"
     fi

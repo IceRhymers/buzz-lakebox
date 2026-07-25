@@ -14,9 +14,13 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/IceRhymers/buzz-lakebox/internal/deployflow"
 	"github.com/IceRhymers/buzz-lakebox/internal/doctor"
 	"github.com/IceRhymers/buzz-lakebox/internal/lakebox"
+	"github.com/IceRhymers/buzz-lakebox/internal/payload"
 	"github.com/IceRhymers/buzz-lakebox/internal/provider"
+	"github.com/IceRhymers/buzz-lakebox/internal/redact"
+	"github.com/IceRhymers/buzz-lakebox/internal/sshx"
 	"github.com/IceRhymers/buzz-lakebox/internal/version"
 )
 
@@ -31,10 +35,10 @@ func main() {
 }
 
 // runProvider is provider mode: no argv, one JSON request on stdin, one
-// JSON response on stdout. deploy is nil at M0 (stub); M1 wires the real
-// deployflow.DeployFunc in here.
+// JSON response on stdout.
 func runProvider() {
-	if err := provider.Run(os.Stdin, os.Stdout, nil); err != nil {
+	deployer := deployflow.New(lakebox.New(), sshx.New())
+	if err := provider.Run(os.Stdin, os.Stdout, deployer.Deploy); err != nil {
 		// Only unhandleable I/O failures (reading stdin, writing stdout)
 		// reach here — every parseable request is a "handled case" per
 		// docs/CONTRACT.md §2 and already got a written {"ok":false,...}
@@ -57,7 +61,7 @@ func newRootCmd() *cobra.Command {
 
 	root.AddCommand(newVersionCmd())
 	root.AddCommand(newDoctorCmd(&profile))
-	root.AddCommand(newDeployCmd())
+	root.AddCommand(newDeployCmd(&profile))
 	root.AddCommand(newNotImplementedCmd("status", "M2"))
 	root.AddCommand(newNotImplementedCmd("stop", "M2"))
 	root.AddCommand(newNotImplementedCmd("start", "M2"))
@@ -102,19 +106,77 @@ func newDoctorCmd(profile *string) *cobra.Command {
 	}
 }
 
-func newDeployCmd() *cobra.Command {
+// newDeployCmd implements the operator `deploy --payload-file <f>`
+// subcommand (docs/PLAN.md §3.3): the same deploy flow the provider-mode
+// stdin path runs, for testing without the desktop. The file may contain
+// either the full request envelope ({"agent":...,"provider_config":...})
+// or a bare agent object; presence of an "agent" key disambiguates.
+func newDeployCmd(profile *string) *cobra.Command {
 	var payloadFile string
 
 	cmd := &cobra.Command{
 		Use:   "deploy",
-		Short: "Deploy an agent from a payload file (not implemented until M1)",
+		Short: "Deploy an agent from a payload file (for testing without the desktop)",
 		Args:  cobra.NoArgs,
-		RunE: func(*cobra.Command, []string) error {
-			return fmt.Errorf("deploy not implemented (M1)")
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if payloadFile == "" {
+				return fmt.Errorf("--payload-file is required")
+			}
+			data, err := os.ReadFile(payloadFile)
+			if err != nil {
+				return fmt.Errorf("read payload file: %w", err)
+			}
+
+			req, perr := parseOperatorDeployPayload(data)
+			if perr != nil {
+				return printDeployResult(cmd, "", perr)
+			}
+			if req.ProviderConfig.Profile == "" {
+				req.ProviderConfig.Profile = *profile
+			}
+
+			deployer := deployflow.New(lakebox.New(), sshx.New())
+			agentID, derr := deployer.Deploy(req)
+			return printDeployResult(cmd, agentID, derr)
 		},
 	}
-	cmd.Flags().StringVar(&payloadFile, "payload-file", "", "path to a JSON deploy payload, for testing without the desktop (M1)")
+	cmd.Flags().StringVar(&payloadFile, "payload-file", "", `path to a JSON deploy payload: either the full envelope ({"agent":...,"provider_config":...}) or a bare agent object`)
 	return cmd
+}
+
+// parseOperatorDeployPayload accepts either the full request envelope or a
+// bare agent object, per newDeployCmd's doc comment.
+func parseOperatorDeployPayload(data []byte) (*payload.DeployRequest, error) {
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return nil, fmt.Errorf("parse payload file: %w", err)
+	}
+	if _, hasAgent := probe["agent"]; hasAgent {
+		return payload.ParseDeployRequest(data)
+	}
+	var agent payload.Agent
+	if err := json.Unmarshal(data, &agent); err != nil {
+		return nil, fmt.Errorf("parse payload file as a bare agent object: %w", err)
+	}
+	return &payload.DeployRequest{Op: "deploy", Agent: agent}, nil
+}
+
+// printDeployResult prints the same {"ok":true,"agent_id":...} /
+// {"ok":false,"error":...} response shape provider mode emits
+// (docs/CONTRACT.md §4), redacting any error text defensively.
+func printDeployResult(cmd *cobra.Command, agentID string, err error) error {
+	var out map[string]any
+	if err != nil {
+		out = map[string]any{"ok": false, "error": redact.Redact(err.Error(), nil)}
+	} else {
+		out = map[string]any{"ok": true, "agent_id": agentID}
+	}
+	data, merr := json.Marshal(out)
+	if merr != nil {
+		return fmt.Errorf("marshal deploy result: %w", merr)
+	}
+	_, _ = fmt.Fprintln(cmd.OutOrStdout(), string(data))
+	return nil
 }
 
 // newNotImplementedCmd registers a lifecycle subcommand (status, stop,

@@ -98,7 +98,7 @@ func Run(ctx context.Context, w io.Writer, cli *lakebox.CLI, profile string) Sum
 		summary.Checks = append(summary.Checks, Check{Name: "profile_resolves", Status: StatusPass})
 	}
 
-	if out, err := cli.SandboxList(ctx, profile); err != nil {
+	if _, out, err := cli.SandboxList(ctx, profile); err != nil {
 		_, _ = fmt.Fprintf(w, "FAIL sandbox command group unreachable for profile %q: %v\n", profile, err)
 		_, _ = fmt.Fprintf(w, "     guidance: Lakebox Sandboxes is a region-gated Beta feature (PLAN.md §4.4 step 2); confirm your workspace's region and Beta enrollment. CLI output: %s\n", strings.TrimSpace(out))
 		summary.Ok = false
