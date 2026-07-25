@@ -61,7 +61,7 @@ func TestRenderEnv_GoldenFields(t *testing.T) {
 		`export BUZZ_AUTH_TAG='tag-abc'`,
 		`export BUZZ_RELAY_URL='wss://relay.example.com'`,
 		`export BUZZ_ACP_AGENT_COMMAND='buzz-agent'`,
-		`export BUZZ_ACP_AGENT_ARGS='--flag value'`,
+		`export BUZZ_ACP_AGENT_ARGS='--flag,value'`,
 		`export BUZZ_ACP_AGENTS='2'`,
 		`export BUZZ_ACP_SYSTEM_PROMPT='You are a reviewer.'`,
 		`export BUZZ_ACP_MODEL='databricks-claude-opus-4-8'`,
@@ -86,6 +86,14 @@ func TestRenderEnv_GoldenFields(t *testing.T) {
 	// BUZZ_AGENT_PROVIDER/DATABRICKS_MODEL block.
 	if strings.Index(env, "DATABRICKS_MODEL") > strings.Index(env, "DATABRICKS_HOST") {
 		t.Fatal("env_vars must be rendered after the fixed inference defaults")
+	}
+}
+
+func TestRenderEnv_EmptyAllowlist_OmitsEnvVar(t *testing.T) {
+	agent := payload.Agent{AgentCommand: "buzz-agent"}
+	env := RenderEnv(agent)
+	if strings.Contains(env, "BUZZ_ACP_RESPOND_TO_ALLOWLIST") {
+		t.Fatalf("expected BUZZ_ACP_RESPOND_TO_ALLOWLIST to be omitted entirely when the allowlist is empty (the desktop only sets it in allowlist mode), got:\n%s", env)
 	}
 }
 
@@ -143,7 +151,7 @@ func TestRenderEnv_Deterministic(t *testing.T) {
 }
 
 func TestRenderLaunchScript_GoldenInvariants(t *testing.T) {
-	script := RenderLaunchScript()
+	script := RenderLaunchScript(false)
 
 	if !strings.Contains(script, "set -eu") {
 		t.Fatal("launch.sh must set -eu")
@@ -155,13 +163,13 @@ func TestRenderLaunchScript_GoldenInvariants(t *testing.T) {
 		}
 	}
 	if !strings.Contains(script, `cat > "$HOME/.databrickscfg"`) {
-		t.Fatal("launch.sh must re-assert the PAT stub")
+		t.Fatal("launch.sh (keep_workspace_pat=false, the default) must re-assert the PAT stub")
 	}
 	if !strings.Contains(script, "flock -n 9") {
 		t.Fatal("launch.sh must guard against double-launch via flock")
 	}
-	if !strings.Contains(script, "pgrep -f buzz-acp") {
-		t.Fatal("launch.sh must also guard via pgrep")
+	if !strings.Contains(script, "pgrep -f '[b]uzz-acp'") {
+		t.Fatal("launch.sh must also guard via pgrep, using the non-self-matching bracket idiom")
 	}
 	if !strings.Contains(script, "setsid nohup") {
 		t.Fatal("launch.sh must launch buzz-acp via setsid nohup")
@@ -171,14 +179,38 @@ func TestRenderLaunchScript_GoldenInvariants(t *testing.T) {
 	}
 }
 
+func TestRenderLaunchScript_KeepWorkspacePAT_OmitsStub(t *testing.T) {
+	// BUG 3: launch.sh runs on every deploy AND every future `start` /
+	// supervisor relaunch, so unconditionally re-asserting the PAT stub
+	// defeated provider_config.keep_workspace_pat=true by clobbering the
+	// kept PAT on the very next relaunch.
+	script := RenderLaunchScript(true)
+
+	if strings.Contains(script, `cat > "$HOME/.databrickscfg"`) {
+		t.Fatalf("launch.sh (keep_workspace_pat=true) must NOT re-assert the PAT stub, got:\n%s", script)
+	}
+	// Everything else must still be present.
+	if !strings.Contains(script, "flock -n 9") {
+		t.Fatal("launch.sh must still guard against double-launch via flock")
+	}
+	if !strings.Contains(script, "setsid nohup") {
+		t.Fatal("launch.sh must still launch buzz-acp via setsid nohup")
+	}
+	if !strings.Contains(script, `. "$HOME/.buzz-backend/env"`) {
+		t.Fatal("launch.sh must still source the env file")
+	}
+}
+
 func TestRenderLaunchScript_NoSecrets(t *testing.T) {
 	// launch.sh is a static template with no per-request substitution, so
 	// no secret value can ever appear in it structurally — this test
-	// pins that invariant.
-	script := RenderLaunchScript()
-	for _, marker := range []string{"nsec1", "BUZZ_PRIVATE_KEY=", "DATABRICKS_TOKEN="} {
-		if strings.Contains(script, marker) {
-			t.Fatalf("launch.sh unexpectedly contains %q", marker)
+	// pins that invariant, for both keep_workspace_pat variants.
+	for _, keep := range []bool{false, true} {
+		script := RenderLaunchScript(keep)
+		for _, marker := range []string{"nsec1", "BUZZ_PRIVATE_KEY=", "DATABRICKS_TOKEN="} {
+			if strings.Contains(script, marker) {
+				t.Fatalf("launch.sh (keepWorkspacePAT=%v) unexpectedly contains %q", keep, marker)
+			}
 		}
 	}
 }

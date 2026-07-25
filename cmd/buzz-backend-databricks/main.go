@@ -19,7 +19,6 @@ import (
 	"github.com/IceRhymers/buzz-lakebox/internal/lakebox"
 	"github.com/IceRhymers/buzz-lakebox/internal/payload"
 	"github.com/IceRhymers/buzz-lakebox/internal/provider"
-	"github.com/IceRhymers/buzz-lakebox/internal/redact"
 	"github.com/IceRhymers/buzz-lakebox/internal/sshx"
 	"github.com/IceRhymers/buzz-lakebox/internal/version"
 )
@@ -34,10 +33,17 @@ func main() {
 	}
 }
 
+// newDeployer builds a deployflow.Deployer wired to the real databricks
+// CLI/ssh transports (C4 cleanup: previously built identically in two
+// places — runProvider and newDeployCmd).
+func newDeployer() *deployflow.Deployer {
+	return deployflow.New(lakebox.New(), sshx.New())
+}
+
 // runProvider is provider mode: no argv, one JSON request on stdin, one
 // JSON response on stdout.
 func runProvider() {
-	deployer := deployflow.New(lakebox.New(), sshx.New())
+	deployer := newDeployer()
 	if err := provider.Run(os.Stdin, os.Stdout, deployer.Deploy); err != nil {
 		// Only unhandleable I/O failures (reading stdin, writing stdout)
 		// reach here — every parseable request is a "handled case" per
@@ -135,7 +141,7 @@ func newDeployCmd(profile *string) *cobra.Command {
 				req.ProviderConfig.Profile = *profile
 			}
 
-			deployer := deployflow.New(lakebox.New(), sshx.New())
+			deployer := newDeployer()
 			agentID, derr := deployer.Deploy(req)
 			return printDeployResult(cmd, agentID, derr)
 		},
@@ -163,20 +169,12 @@ func parseOperatorDeployPayload(data []byte) (*payload.DeployRequest, error) {
 
 // printDeployResult prints the same {"ok":true,"agent_id":...} /
 // {"ok":false,"error":...} response shape provider mode emits
-// (docs/CONTRACT.md §4), redacting any error text defensively.
+// (docs/CONTRACT.md §4). Delegates to provider.MarshalDeployResult (C3
+// cleanup) so there is exactly one rendering of the frozen wire shape,
+// rather than a second hand-rolled map literal here.
 func printDeployResult(cmd *cobra.Command, agentID string, err error) error {
-	var out map[string]any
-	if err != nil {
-		out = map[string]any{"ok": false, "error": redact.Redact(err.Error(), nil)}
-	} else {
-		out = map[string]any{"ok": true, "agent_id": agentID}
-	}
-	data, merr := json.Marshal(out)
-	if merr != nil {
-		return fmt.Errorf("marshal deploy result: %w", merr)
-	}
-	_, _ = fmt.Fprintln(cmd.OutOrStdout(), string(data))
-	return nil
+	_, ferr := fmt.Fprintln(cmd.OutOrStdout(), string(provider.MarshalDeployResult(agentID, err)))
+	return ferr
 }
 
 // newNotImplementedCmd registers a lifecycle subcommand (status, stop,

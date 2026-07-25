@@ -120,11 +120,8 @@ case "$1" in
           launch-exec)
             exit "${FAKE_LAUNCH_EXIT:-0}"
             ;;
-          verify-pgrep)
-            exit "${FAKE_PGREP_EXIT:-0}"
-            ;;
-          verify-log)
-            printf '%s' "${FAKE_ACP_LOG:-}"
+          verify-check)
+            printf 'BUZZ_PGREP_RC=%s\n%s' "${FAKE_PGREP_EXIT:-0}" "${FAKE_ACP_LOG:-}"
             exit 0
             ;;
           *)
@@ -367,10 +364,10 @@ func TestDeploy_HappyPath_FreshCreate(t *testing.T) {
 	assertOrder(t, seq, []string{
 		"CLI:version", "CLI:current-user", "CLI:register", "CLI:list", "CLI:create",
 		"SSH:pat-reset", "SSH:install-write", "SSH:install-exec",
-		"SSH:verify-env-write", "SSH:verify-exec",
-		"SSH:nest-dirs", "SSH:env-write", "SSH:prelaunch-kill",
+		"SSH:verify-exec",
+		"SSH:env-write", "SSH:prelaunch-kill",
 		"SSH:launch-write", "SSH:launch-exec",
-		"SSH:verify-pgrep", "SSH:verify-log",
+		"SSH:verify-check",
 		"CLI:config",
 	})
 	// config --no-autostop must be strictly last.
@@ -448,10 +445,10 @@ func TestDeploy_IdempotentRedeploy_ReuseStopped(t *testing.T) {
 		"CLI:version", "CLI:current-user", "CLI:register", "CLI:list",
 		"CLI:start", "CLI:status",
 		"SSH:pat-reset", "SSH:install-write", "SSH:install-exec",
-		"SSH:verify-env-write", "SSH:verify-exec",
-		"SSH:nest-dirs", "SSH:env-write", "SSH:prelaunch-kill",
+		"SSH:verify-exec",
+		"SSH:env-write", "SSH:prelaunch-kill",
 		"SSH:launch-write", "SSH:launch-exec",
-		"SSH:verify-pgrep", "SSH:verify-log",
+		"SSH:verify-check",
 		"CLI:config",
 	})
 }
@@ -522,9 +519,13 @@ func TestDeploy_InstallFails_FreshCreate_TearsDownAndDeletes(t *testing.T) {
 	if !strings.Contains(err.Error(), "sandbox-fresh-fail") {
 		t.Fatalf("error should embed the sandbox id, got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "1.8.0") {
-		t.Fatalf("error should embed the CLI version, got: %v", err)
-	}
+	// NOTE: this error originates from sshx (install-exec), not lakebox,
+	// so it carries no CLI version stamp under the BUG 9 fix:
+	// deployflow.wrap no longer stamps a version on any error (lakebox's
+	// own wrapErr is now the SINGLE stamper, and only lakebox-originated
+	// errors get one) — this avoided a duplicated "(databricks cli X)"
+	// on lakebox-originated errors and a second `databricks version`
+	// subprocess spawn just for the (now-removed) annotation here.
 	if strings.Contains(err.Error(), "MARKER-SHOULD-NOT-LEAK-1234") {
 		t.Fatalf("error leaked a planted marker secret: %v", err)
 	}
@@ -549,20 +550,28 @@ func TestDeploy_LaunchVerifyFails_TerminalError_ReusedSandbox_KillsNoDelete(t *t
 	if err == nil {
 		t.Fatal("expected launch verification to fail on the terminal-error line")
 	}
-	if !strings.Contains(err.Error(), "sandbox-reused-fail") || !strings.Contains(err.Error(), "1.9.0") {
-		t.Fatalf("error should embed sandbox id + cli version, got: %v", err)
+	// This error also originates from sshx (verify-check), not lakebox,
+	// so — per the BUG 9 fix note above — it carries no CLI version
+	// stamp; only the sandbox id is asserted here.
+	if !strings.Contains(err.Error(), "sandbox-reused-fail") {
+		t.Fatalf("error should embed the sandbox id, got: %v", err)
 	}
 	if !strings.Contains(err.Error(), "relay") {
 		t.Fatalf("error should carry the documented relay-membership guidance, got: %v", err)
 	}
 
 	seq := callSequence(h.events())
-	assertOrder(t, seq, []string{"SSH:verify-log", "SSH:teardown-shred", "SSH:teardown-pkill"})
+	assertOrder(t, seq, []string{"SSH:verify-check", "SSH:teardown-shred", "SSH:teardown-pkill"})
 	assertNotContains(t, seq, "CLI:delete")
 	assertNotContains(t, seq, "CLI:config")
 }
 
-func TestDeploy_ConfigFails_FreshCreate_TearsDownAndDeletes(t *testing.T) {
+// TestDeploy_ConfigFails_FreshCreate_NoTeardown_AgentHealthy pins BUG 6:
+// a step-11 (setAutostopPolicy) failure happens strictly AFTER launch
+// verification already succeeded, so the agent is healthy — deploy must
+// not run destructive teardown (no delete, no pkill, no env shred) for
+// this failure, and the error must explain the autostop remedy.
+func TestDeploy_ConfigFails_FreshCreate_NoTeardown_AgentHealthy(t *testing.T) {
 	h := newHarness(t)
 	setHappyPathEnv(t)
 	t.Setenv("FAKE_LIST_JSON", "[]")
@@ -578,9 +587,54 @@ func TestDeploy_ConfigFails_FreshCreate_TearsDownAndDeletes(t *testing.T) {
 	if !strings.Contains(err.Error(), "sandbox-config-fail") {
 		t.Fatalf("error should embed the sandbox id, got: %v", err)
 	}
+	if !strings.Contains(err.Error(), "autostop") {
+		t.Fatalf("error should mention the autostop remedy, got: %v", err)
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "verified") {
+		t.Fatalf("error should state the agent launched/verified successfully, got: %v", err)
+	}
 
 	seq := callSequence(h.events())
-	assertOrder(t, seq, []string{"CLI:config", "SSH:teardown-shred", "CLI:delete"})
+	assertOrder(t, seq, []string{"CLI:config"})
+	assertNotContains(t, seq, "CLI:delete")
+	assertNotContains(t, seq, "SSH:teardown-shred")
+	assertNotContains(t, seq, "SSH:teardown-pkill")
+}
+
+// TestDeploy_ContextExpiresMidProvision_TeardownStillRunsIndependently
+// pins BUG 4: when a provisioning step fails BECAUSE the deploy deadline
+// expired, teardown (shred + delete) must still complete — it must not
+// silently no-op by inheriting the same (already-dead) deploy context.
+// DeployTimeout is set to a few milliseconds, and Sleep (the step-10
+// post-launch wait) is overridden to really sleep well past that
+// deadline, so by the time verifyLaunch's SSH call runs, the deploy ctx
+// is genuinely expired — exactly the scenario that used to make teardown
+// silently no-op.
+func TestDeploy_ContextExpiresMidProvision_TeardownStillRunsIndependently(t *testing.T) {
+	h := newHarness(t)
+	setHappyPathEnv(t)
+	t.Setenv("FAKE_LIST_JSON", "[]")
+	t.Setenv("FAKE_CREATE_ID", "sandbox-ctx-expired")
+	t.Setenv("FAKE_CREATE_STATUS", "Running")
+
+	// DeployTimeout must be generous enough for the ~13 real subprocess
+	// spawns in steps 1-9 to complete (observed comfortably under 1s
+	// locally), but the step-10 Sleep override sleeps well past it so the
+	// ctx is genuinely expired by the time verifyLaunch's SSH call runs.
+	h.dep.DeployTimeout = 2 * time.Second
+	h.dep.Sleep = func(time.Duration) { time.Sleep(3 * time.Second) }
+
+	req := buildReq(reqOpts{})
+	_, err := h.dep.Deploy(req)
+	if err == nil {
+		t.Fatal("expected deploy to fail once its context deadline expires mid-provision")
+	}
+	if !strings.Contains(err.Error(), "sandbox-ctx-expired") {
+		t.Fatalf("error should embed the sandbox id, got: %v", err)
+	}
+
+	seq := callSequence(h.events())
+	assertOrder(t, seq, []string{"CLI:create", "SSH:teardown-shred", "CLI:delete"})
 }
 
 // --- (e) idle_timeout config variant ----------------------------------------

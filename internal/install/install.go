@@ -9,6 +9,8 @@ package install
 import (
 	"fmt"
 	"strings"
+
+	"github.com/IceRhymers/buzz-lakebox/internal/shellquote"
 )
 
 // DefaultVersion is the build-time-pinned Buzz release installed when a
@@ -64,14 +66,6 @@ func knownVersions() []string {
 	return out
 }
 
-// shellQuote single-quotes s for safe interpolation into a POSIX shell
-// script, escaping any embedded single quote via the standard
-// close-quote/escaped-quote/reopen-quote trick (PLAN.md §7: golden tests
-// cover embedded quotes/newlines).
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
-}
-
 // BuildInstallScript renders the `set -eu` (no `set -x`) install script
 // for the given pinned version (DefaultVersion if empty): curl -fL the
 // release .deb, verify its pinned sha256, dpkg-deb -x it into
@@ -93,9 +87,9 @@ func BuildInstallScript(version string) (string, error) {
 	b.WriteString("#!/bin/sh\n")
 	b.WriteString("set -eu\n")
 	b.WriteString("umask 077\n\n")
-	fmt.Fprintf(&b, "BUZZ_VERSION=%s\n", shellQuote(version))
-	fmt.Fprintf(&b, "BUZZ_SHA256=%s\n", shellQuote(sha))
-	fmt.Fprintf(&b, "BUZZ_URL=%s\n", shellQuote(url))
+	fmt.Fprintf(&b, "BUZZ_VERSION=%s\n", shellquote.Single(version))
+	fmt.Fprintf(&b, "BUZZ_SHA256=%s\n", shellquote.Single(sha))
+	fmt.Fprintf(&b, "BUZZ_URL=%s\n", shellquote.Single(url))
 	b.WriteString(`DIST_DIR="$HOME/.buzz-backend/dist"
 BIN_DIR="$HOME/.buzz-backend/bin"
 MARKER="$DIST_DIR/` + versionMarkerRel + `"
@@ -125,7 +119,7 @@ if [ -z "$SRC" ]; then
   exit 1
 fi
 ln -sf "$SRC" "$BIN_DIR/%s"
-`, shellQuote(bin), bin, bin)
+`, shellquote.Single(bin), bin, bin)
 	}
 
 	return b.String(), nil
@@ -141,16 +135,33 @@ const InitializeFrame = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":
 // agentInfo result").
 const AgentInfoMarker = "agentInfo"
 
-// BuildVerifyCommand renders the command that sources envFile (expected
-// to already exist, written via sshx.RunWithStdin so its secrets never
-// touch argv) and pipes InitializeFrame into buzz-agent with a timeout,
-// removing envFile afterward regardless of outcome. No secret is
-// interpolated into this command string itself.
+// BuildVerifyCommand renders the COMBINED verify script run as a single
+// sshx.RunWithStdin round trip (BUG 1 fix): it reads the agent's env
+// content from its own stdin, writes it to envFile (0600), sources it,
+// and pipes InitializeFrame into buzz-agent with a timeout — removing
+// envFile afterward regardless of outcome via a trap. No secret is ever
+// interpolated into this command string itself; the only sanctioned path
+// for the env content is stdin.
+//
+// envFile is a TRUSTED, static "$HOME"-relative literal (e.g.
+// "$HOME/.buzz-backend/.env.verify") — NEVER payload/untrusted data — so
+// it is interpolated via a double-quoted shell assignment (which must
+// expand "$HOME") rather than shellquote.Single (which would instead
+// suppress that expansion and break sourcing; this was the root cause of
+// the deploy-breaking bug this function now fixes: the file was written
+// with $HOME expanded but previously sourced/removed with $HOME literal,
+// so sourcing always failed and the trap never removed the real file).
 func BuildVerifyCommand(envFile string, timeoutSeconds int) string {
 	return fmt.Sprintf(`set -eu
-trap 'rm -f %s' EXIT
+umask 077
+ENVF="%s"
+trap 'rm -f "$ENVF"' EXIT
+cat > "$ENVF"
+chmod 600 "$ENVF"
+set -a
 # shellcheck disable=SC1090
-. %s
+. "$ENVF"
+set +a
 printf '%%s\n' %s | timeout %d "$HOME/.buzz-backend/bin/buzz-agent"
-`, shellQuote(envFile), shellQuote(envFile), shellQuote(InitializeFrame), timeoutSeconds)
+`, envFile, shellquote.Single(InitializeFrame), timeoutSeconds)
 }

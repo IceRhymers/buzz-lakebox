@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/IceRhymers/buzz-lakebox/internal/payload"
+	"github.com/IceRhymers/buzz-lakebox/internal/shellquote"
 )
 
 // EnvFilePath / LaunchScriptPath / PATStubPath are the well-known
@@ -27,16 +28,6 @@ const (
 // inference routing when the payload's provider field is empty
 // (docs/PLAN.md §4.4 step 7).
 const DefaultBuzzAgentProvider = "databricks_v2"
-
-// shellQuote single-quotes s for safe interpolation into a POSIX shell
-// script, escaping any embedded single quote via the standard
-// close-quote/escaped-quote/reopen-quote trick. Single-quoted shell
-// strings preserve embedded newlines literally, so multi-line values
-// (e.g. system_prompt) need no further escaping (PLAN.md §7 golden test:
-// "quoting incl. embedded quotes/newlines in system_prompt").
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
-}
 
 func derefOrEmpty(s *string) string {
 	if s == nil {
@@ -77,7 +68,7 @@ func RenderEnv(agent payload.Agent) string {
 		b.WriteString("export ")
 		b.WriteString(key)
 		b.WriteString("=")
-		b.WriteString(shellQuote(value))
+		b.WriteString(shellquote.Single(value))
 		b.WriteString("\n")
 	}
 
@@ -85,12 +76,23 @@ func RenderEnv(agent payload.Agent) string {
 	emit("BUZZ_AUTH_TAG", agent.AuthTag)
 	emit("BUZZ_RELAY_URL", agent.RelayURL)
 	emit("BUZZ_ACP_AGENT_COMMAND", agent.AgentCommand)
-	emit("BUZZ_ACP_AGENT_ARGS", strings.Join(agent.AgentArgs, " "))
+	// buzz-acp splits BUZZ_ACP_AGENT_ARGS on COMMAS, not spaces
+	// (block/buzz crates/buzz-acp/README.md: "comma-separated";
+	// crates/buzz-acp/src/config.rs value_delimiter = ','; the desktop
+	// joins with ",") — BUG 7 fix.
+	emit("BUZZ_ACP_AGENT_ARGS", strings.Join(agent.AgentArgs, ","))
 	emit("BUZZ_ACP_AGENTS", strconv.Itoa(agent.Parallelism))
 	emit("BUZZ_ACP_SYSTEM_PROMPT", agent.SystemPrompt)
 	emit("BUZZ_ACP_MODEL", derefOrEmpty(agent.Model))
 	emit("BUZZ_ACP_RESPOND_TO", agent.RespondTo)
-	emit("BUZZ_ACP_RESPOND_TO_ALLOWLIST", strings.Join(agent.RespondToAllowlist, ","))
+	// Only emit BUZZ_ACP_RESPOND_TO_ALLOWLIST in allowlist mode: the
+	// desktop sets it only when the list is non-empty and removes it
+	// otherwise (block/buzz desktop/src-tauri/src/managed_agents/
+	// runtime.rs:1574-1576) — BUG 7 fix. Comma-joined, same contract as
+	// BUZZ_ACP_AGENT_ARGS above.
+	if len(agent.RespondToAllowlist) > 0 {
+		emit("BUZZ_ACP_RESPOND_TO_ALLOWLIST", strings.Join(agent.RespondToAllowlist, ","))
+	}
 	emit("BUZZ_ACP_TURN_TIMEOUT_SECONDS", strconv.Itoa(agent.TurnTimeoutSeconds))
 	emit("BUZZ_ACP_IDLE_TIMEOUT_SECONDS", strconv.Itoa(agent.IdleTimeoutSeconds))
 	emit("BUZZ_ACP_MAX_TURN_DURATION_SECONDS", strconv.Itoa(agent.MaxTurnDurationSecs))
@@ -120,22 +122,34 @@ func RenderEnv(agent payload.Agent) string {
 // RenderLaunchScript renders the static $HOME/.buzz-backend/launch.sh
 // content (docs/PLAN.md §4.4 step 9): re-assert the PAT stub (covers the
 // unverified "does start restore the baked file?" question by
-// construction), source the env file, provision the nest working dirs,
-// guard against a double-launch via flock + pgrep, and launch buzz-acp
-// detached. No secret is ever embedded here — it only *sources* the env
-// file that was separately written via RunWithStdin.
-func RenderLaunchScript() string {
+// construction) UNLESS keepWorkspacePAT is true, source the env file,
+// provision the nest working dirs, guard against a double-launch via
+// flock + pgrep, and launch buzz-acp detached. No secret is ever
+// embedded here — it only *sources* the env file that was separately
+// written via RunWithStdin.
+//
+// keepWorkspacePAT mirrors provider_config.keep_workspace_pat (BUG 3
+// fix): when true, this script must NOT re-assert the stub, since
+// launch.sh runs on every deploy AND every future `start`/supervisor
+// relaunch — unconditionally re-asserting would clobber the owner's kept
+// PAT on the very first relaunch after deploy, defeating the opt-out.
+func RenderLaunchScript(keepWorkspacePAT bool) string {
 	var b strings.Builder
 	b.WriteString("#!/bin/sh\n")
 	b.WriteString("set -eu\n\n")
 
-	b.WriteString("# Re-assert the PAT stub on every launch (deploy, `start`, and any future\n")
-	b.WriteString("# supervisor all funnel through this script) — covers the unverified\n")
-	b.WriteString("# \"does sandbox start restore the baked PAT file?\" case by construction.\n")
-	b.WriteString("umask 077\n")
-	b.WriteString(`cat > "$HOME/.databrickscfg" <<'BUZZ_PAT_STUB_EOF'` + "\n")
-	b.WriteString(PATStub)
-	b.WriteString("BUZZ_PAT_STUB_EOF\n\n")
+	if !keepWorkspacePAT {
+		b.WriteString("# Re-assert the PAT stub on every launch (deploy, `start`, and any future\n")
+		b.WriteString("# supervisor all funnel through this script) — covers the unverified\n")
+		b.WriteString("# \"does sandbox start restore the baked PAT file?\" case by construction.\n")
+		b.WriteString("# Skipped entirely when provider_config.keep_workspace_pat=true, so the\n")
+		b.WriteString("# owner's retained PAT survives every relaunch, not just the initial\n")
+		b.WriteString("# deploy (BUG 3 fix: this used to run unconditionally here).\n")
+		b.WriteString("umask 077\n")
+		b.WriteString(`cat > "$HOME/.databrickscfg" <<'BUZZ_PAT_STUB_EOF'` + "\n")
+		b.WriteString(PATStub)
+		b.WriteString("BUZZ_PAT_STUB_EOF\n\n")
+	}
 
 	b.WriteString("# shellcheck disable=SC1090\n")
 	b.WriteString(`. "$HOME/.buzz-backend/env"` + "\n\n")
@@ -152,7 +166,12 @@ func RenderLaunchScript() string {
 	b.WriteString("  exit 0\n")
 	b.WriteString("fi\n\n")
 
-	b.WriteString("if pgrep -f buzz-acp >/dev/null 2>&1; then\n")
+	// "[b]uzz-acp" (not "buzz-acp"): this guard's own pattern lives in the
+	// script FILE, not in a remote command's argv, so it does not
+	// self-match today — but the bracket idiom is applied here too for
+	// consistency and safety against future argv-based invocations
+	// (BUG 2 fix note).
+	b.WriteString("if pgrep -f '[b]uzz-acp' >/dev/null 2>&1; then\n")
 	b.WriteString(`  echo "buzz-acp already running; not relaunching" >&2` + "\n")
 	b.WriteString("  exit 0\n")
 	b.WriteString("fi\n\n")

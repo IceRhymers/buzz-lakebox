@@ -88,30 +88,31 @@ func TestBuildInstallScript_ChecksumVerification(t *testing.T) {
 	}
 }
 
-func TestBuildVerifyCommand_NoSecretsSourcesEnvFile(t *testing.T) {
-	cmd := BuildVerifyCommand("$HOME/.buzz-backend/.env.verify", 10)
+func TestBuildVerifyCommand_CombinedScript(t *testing.T) {
+	cmd := BuildVerifyCommand(`$HOME/.buzz-backend/.env.verify`, 10)
 	if !strings.Contains(cmd, InitializeFrame) {
 		t.Fatal("verify command should pipe the ACP initialize frame")
 	}
 	if !strings.Contains(cmd, "timeout 10") {
 		t.Fatal("verify command should enforce a 10s timeout")
 	}
-	if !strings.Contains(cmd, `. '$HOME/.buzz-backend/.env.verify'`) {
-		t.Fatalf("verify command should source the env file, got: %q", cmd)
+	// envFile is a trusted "$HOME"-relative literal: it must be assigned
+	// via a double-quoted literal (so "$HOME" expands), not
+	// shellquote.Single (which would suppress that expansion and break
+	// sourcing — the exact BUG 1 regression this pins).
+	if !strings.Contains(cmd, `ENVF="$HOME/.buzz-backend/.env.verify"`) {
+		t.Fatalf("verify command should assign the trusted env file path with $HOME expansion preserved, got: %q", cmd)
 	}
-	if !strings.Contains(cmd, "trap 'rm -f") {
-		t.Fatal("verify command should clean up the temp env file on exit")
+	if !strings.Contains(cmd, `. "$ENVF"`) {
+		t.Fatalf("verify command should source the env file via the expanded $ENVF variable, got: %q", cmd)
+	}
+	if !strings.Contains(cmd, `cat > "$ENVF"`) {
+		t.Fatal("verify command should write its own stdin into the env file (single combined round trip)")
+	}
+	if !strings.Contains(cmd, `trap 'rm -f "$ENVF"' EXIT`) {
+		t.Fatal("verify command should clean up the real (expanded-path) env file on exit via trap")
 	}
 	if !strings.Contains(cmd, "buzz-agent") {
 		t.Fatal("verify command should invoke buzz-agent")
-	}
-}
-
-func TestBuildVerifyCommand_ShellQuotesEnvFilePath(t *testing.T) {
-	// Even a path with a single quote (pathological, but exercises the
-	// escaping) must round-trip safely.
-	cmd := BuildVerifyCommand("/tmp/weird'path", 5)
-	if !strings.Contains(cmd, `/tmp/weird'\''path`) {
-		t.Fatalf("expected escaped single quote in path, got: %q", cmd)
 	}
 }

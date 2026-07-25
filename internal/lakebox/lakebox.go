@@ -5,6 +5,7 @@
 package lakebox
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -165,24 +166,38 @@ type Sandbox struct {
 // reachable over SSH.
 const StatusRunning = "Running"
 
-// cachedVersion returns the CLI version string, fetching and caching it on
+// CachedVersion returns the CLI version string, fetching and caching it on
 // first call (M1 deliverable 1: "every method records the CLI version
-// string for error context; fetch once, cache on the struct"). Errors
-// fetching the version degrade to "unknown" rather than masking the
-// original error a caller is trying to report.
-func (c *CLI) cachedVersion(ctx context.Context) string {
+// string for error context; fetch once, cache on the struct"). Exported
+// so callers other than wrapErr (e.g. internal/deployflow's preflight
+// check) share the same sync.Once cache rather than each spawning their
+// own `databricks version` subprocess (BUG 9 fix: deployflow used to call
+// Version(ctx) directly, bypassing this cache entirely, causing a
+// redundant subprocess spawn on top of whatever wrapErr later spawned).
+func (c *CLI) CachedVersion(ctx context.Context) (string, error) {
 	c.versionOnce.Do(func() {
 		c.versionVal, c.versionErr = c.Version(ctx)
 	})
-	if c.versionErr != nil || c.versionVal == "" {
+	return c.versionVal, c.versionErr
+}
+
+// cachedVersion returns the cached CLI version string, degrading to
+// "unknown" rather than masking the original error a caller is trying to
+// report.
+func (c *CLI) cachedVersion(ctx context.Context) string {
+	v, err := c.CachedVersion(ctx)
+	if err != nil || v == "" {
 		return "unknown"
 	}
-	return c.versionVal
+	return v
 }
 
 // wrapErr annotates err with the recorded CLI version for diagnosability
 // (docs/PLAN.md §3.1, §4.3: "every error message embeds ... the recorded
-// CLI version").
+// CLI version"). This is the SINGLE stamper of CLI version onto error
+// text (BUG 9 fix): callers (e.g. internal/deployflow.wrap) must not
+// stamp their own version annotation on top of this one, to avoid
+// duplicated "(databricks cli X)" text.
 func (c *CLI) wrapErr(ctx context.Context, err error, action string) error {
 	return fmt.Errorf("%s: %w (databricks cli %s)", action, err, c.cachedVersion(ctx))
 }
@@ -191,6 +206,21 @@ func (c *CLI) runCombined(ctx context.Context, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, c.binName(), args...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
+}
+
+// runSplit runs the CLI capturing stdout and stderr SEPARATELY (BUG 8
+// fix): the real CLI intermittently prints advisory lines to stderr
+// (observed live: "Databricks skills are not installed..."), which would
+// otherwise interleave into and corrupt --json stdout when captured via
+// CombinedOutput/runCombined. JSON-parsing callers must parse stdout only
+// and use stderr purely for error diagnostics.
+func (c *CLI) runSplit(ctx context.Context, args ...string) (stdout string, stderr string, err error) {
+	cmd := exec.CommandContext(ctx, c.binName(), args...)
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	err = cmd.Run()
+	return outBuf.String(), errBuf.String(), err
 }
 
 // looksLikeUnsupportedFlag heuristically detects a CLI error caused by an
@@ -216,15 +246,16 @@ func (c *CLI) SandboxRegister(ctx context.Context, profile string) error {
 }
 
 // SandboxCreate runs `databricks sandbox create <name> --json -p <profile>`
-// and parses the resulting Sandbox.
+// and parses the resulting Sandbox. Parses stdout only (BUG 8 fix): a
+// stray advisory line on stderr must never corrupt --json stdout parsing.
 func (c *CLI) SandboxCreate(ctx context.Context, profile, name string) (Sandbox, error) {
-	out, err := c.runCombined(ctx, "sandbox", "create", name, "--json", "-p", profile)
+	stdout, stderr, err := c.runSplit(ctx, "sandbox", "create", name, "--json", "-p", profile)
 	if err != nil {
-		return Sandbox{}, c.wrapErr(ctx, fmt.Errorf("sandbox create %s -p %s: %w (output: %s)", name, profile, err, strings.TrimSpace(out)), "sandbox create")
+		return Sandbox{}, c.wrapErr(ctx, fmt.Errorf("sandbox create %s -p %s: %w (stdout: %s, stderr: %s)", name, profile, err, strings.TrimSpace(stdout), strings.TrimSpace(stderr)), "sandbox create")
 	}
 	var sb Sandbox
-	if jerr := json.Unmarshal([]byte(out), &sb); jerr != nil {
-		return Sandbox{}, c.wrapErr(ctx, fmt.Errorf("parse sandbox create --json output: %w (output: %s)", jerr, strings.TrimSpace(out)), "sandbox create")
+	if jerr := json.Unmarshal([]byte(stdout), &sb); jerr != nil {
+		return Sandbox{}, c.wrapErr(ctx, fmt.Errorf("parse sandbox create --json output: %w (stdout: %s, stderr: %s)", jerr, strings.TrimSpace(stdout), strings.TrimSpace(stderr)), "sandbox create")
 	}
 	return sb, nil
 }
@@ -232,14 +263,18 @@ func (c *CLI) SandboxCreate(ctx context.Context, profile, name string) (Sandbox,
 // SandboxList runs `databricks sandbox list --json -p <profile>`, falling
 // back to parsing whitespace-table output if the installed CLI doesn't
 // accept --json for this subcommand. Returns the parsed sandboxes and the
-// raw command output (for diagnostics, e.g. doctor's reachability check).
+// raw stdout (for diagnostics, e.g. doctor's reachability check). Parses
+// stdout only (BUG 8 fix): a stray advisory line on stderr (observed
+// live: "Databricks skills are not installed...") must never corrupt
+// --json stdout parsing; a literal `null` stdout (observed live for an
+// empty list) is tolerated as an empty slice by json.Unmarshal.
 func (c *CLI) SandboxList(ctx context.Context, profile string) ([]Sandbox, string, error) {
-	out, err := c.runCombined(ctx, "sandbox", "list", "--json", "-p", profile)
+	stdout, stderr, err := c.runSplit(ctx, "sandbox", "list", "--json", "-p", profile)
 	if err != nil {
-		if looksLikeUnsupportedFlag(out) {
-			tableOut, tErr := c.runCombined(ctx, "sandbox", "list", "-p", profile)
+		if looksLikeUnsupportedFlag(stdout + stderr) {
+			tableOut, tableErr, tErr := c.runSplit(ctx, "sandbox", "list", "-p", profile)
 			if tErr != nil {
-				return nil, tableOut, c.wrapErr(ctx, fmt.Errorf("sandbox list -p %s: %w (output: %s)", profile, tErr, strings.TrimSpace(tableOut)), "sandbox list")
+				return nil, tableOut, c.wrapErr(ctx, fmt.Errorf("sandbox list -p %s: %w (stdout: %s, stderr: %s)", profile, tErr, strings.TrimSpace(tableOut), strings.TrimSpace(tableErr)), "sandbox list")
 			}
 			sbs, pErr := parseSandboxTable(tableOut)
 			if pErr != nil {
@@ -247,13 +282,13 @@ func (c *CLI) SandboxList(ctx context.Context, profile string) ([]Sandbox, strin
 			}
 			return sbs, tableOut, nil
 		}
-		return nil, out, c.wrapErr(ctx, fmt.Errorf("sandbox list --json -p %s: %w (output: %s)", profile, err, strings.TrimSpace(out)), "sandbox list")
+		return nil, stdout, c.wrapErr(ctx, fmt.Errorf("sandbox list --json -p %s: %w (stdout: %s, stderr: %s)", profile, err, strings.TrimSpace(stdout), strings.TrimSpace(stderr)), "sandbox list")
 	}
-	sbs, pErr := parseSandboxArray(out)
+	sbs, pErr := parseSandboxArray(stdout)
 	if pErr != nil {
-		return nil, out, c.wrapErr(ctx, pErr, "sandbox list: parse json output")
+		return nil, stdout, c.wrapErr(ctx, pErr, "sandbox list: parse json output")
 	}
-	return sbs, out, nil
+	return sbs, stdout, nil
 }
 
 func parseSandboxArray(out string) ([]Sandbox, error) {
@@ -286,15 +321,16 @@ func parseSandboxTable(out string) ([]Sandbox, error) {
 }
 
 // SandboxStatus runs `databricks sandbox status <id> --json -p <profile>`
-// and parses the resulting Sandbox.
+// and parses the resulting Sandbox. Parses stdout only (BUG 8 fix): a
+// stray advisory line on stderr must never corrupt --json stdout parsing.
 func (c *CLI) SandboxStatus(ctx context.Context, profile, id string) (Sandbox, error) {
-	out, err := c.runCombined(ctx, "sandbox", "status", id, "--json", "-p", profile)
+	stdout, stderr, err := c.runSplit(ctx, "sandbox", "status", id, "--json", "-p", profile)
 	if err != nil {
-		return Sandbox{}, c.wrapErr(ctx, fmt.Errorf("sandbox status %s -p %s: %w (output: %s)", id, profile, err, strings.TrimSpace(out)), "sandbox status")
+		return Sandbox{}, c.wrapErr(ctx, fmt.Errorf("sandbox status %s -p %s: %w (stdout: %s, stderr: %s)", id, profile, err, strings.TrimSpace(stdout), strings.TrimSpace(stderr)), "sandbox status")
 	}
 	var sb Sandbox
-	if jerr := json.Unmarshal([]byte(out), &sb); jerr != nil {
-		return Sandbox{}, c.wrapErr(ctx, fmt.Errorf("parse sandbox status --json output: %w (output: %s)", jerr, strings.TrimSpace(out)), "sandbox status")
+	if jerr := json.Unmarshal([]byte(stdout), &sb); jerr != nil {
+		return Sandbox{}, c.wrapErr(ctx, fmt.Errorf("parse sandbox status --json output: %w (stdout: %s, stderr: %s)", jerr, strings.TrimSpace(stdout), strings.TrimSpace(stderr)), "sandbox status")
 	}
 	return sb, nil
 }

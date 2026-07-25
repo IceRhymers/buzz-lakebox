@@ -208,6 +208,9 @@ case "$1" in
         ;;
       create)
         name="$3"
+        if [ -n "${FAKE_STDERR_ADVISORY:-}" ]; then
+          echo "$FAKE_STDERR_ADVISORY" >&2
+        fi
         if [ "${FAKE_CREATE_EXIT:-0}" != "0" ]; then
           echo "create failed" >&2
           exit "${FAKE_CREATE_EXIT}"
@@ -216,6 +219,9 @@ case "$1" in
         exit 0
         ;;
       list)
+        if [ -n "${FAKE_STDERR_ADVISORY:-}" ]; then
+          echo "$FAKE_STDERR_ADVISORY" >&2
+        fi
         if [ "${FAKE_LIST_EXIT:-0}" != "0" ]; then
           echo "list failed" >&2
           exit "${FAKE_LIST_EXIT}"
@@ -225,6 +231,9 @@ case "$1" in
         ;;
       status)
         id="$3"
+        if [ -n "${FAKE_STDERR_ADVISORY:-}" ]; then
+          echo "$FAKE_STDERR_ADVISORY" >&2
+        fi
         if [ "${FAKE_STATUS_EXIT:-0}" != "0" ]; then
           echo "status failed" >&2
           exit "${FAKE_STATUS_EXIT}"
@@ -421,6 +430,99 @@ func TestCLI_SandboxConfig(t *testing.T) {
 			t.Fatal("expected error when neither NoAutostop nor IdleTimeout set")
 		}
 	})
+}
+
+// --- BUG 8: stderr advisory lines must not corrupt --json stdout parsing ---
+
+const stderrAdvisoryLine = "Databricks skills are not installed on this machine; some functionality may be limited."
+
+func TestCLI_SandboxCreate_ToleratesStderrAdvisory(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+	t.Setenv("FAKE_STDERR_ADVISORY", stderrAdvisoryLine)
+	t.Setenv("FAKE_CREATE_ID", "sandbox-advisory")
+
+	sb, err := cli.SandboxCreate(context.Background(), "DEFAULT", "buzz-x")
+	if err != nil {
+		t.Fatalf("SandboxCreate() error: %v", err)
+	}
+	if sb.ID != "sandbox-advisory" {
+		t.Fatalf("SandboxCreate() = %+v", sb)
+	}
+}
+
+func TestCLI_SandboxList_ToleratesStderrAdvisory(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+	t.Setenv("FAKE_STDERR_ADVISORY", stderrAdvisoryLine)
+	t.Setenv("FAKE_LIST_JSON", `[{"sandboxId":"a","name":"buzz-1-x","status":"Running"}]`)
+
+	sbs, _, err := cli.SandboxList(context.Background(), "DEFAULT")
+	if err != nil {
+		t.Fatalf("SandboxList() error: %v", err)
+	}
+	if len(sbs) != 1 || sbs[0].ID != "a" {
+		t.Fatalf("SandboxList() = %+v", sbs)
+	}
+}
+
+func TestCLI_SandboxStatus_ToleratesStderrAdvisory(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+	t.Setenv("FAKE_STDERR_ADVISORY", stderrAdvisoryLine)
+	t.Setenv("FAKE_STATUS_STATUS", "Running")
+
+	sb, err := cli.SandboxStatus(context.Background(), "DEFAULT", "sandbox-1")
+	if err != nil {
+		t.Fatalf("SandboxStatus() error: %v", err)
+	}
+	if sb.Status != "Running" {
+		t.Fatalf("SandboxStatus() = %+v", sb)
+	}
+}
+
+func TestCLI_SandboxList_NullJSON_ReturnsEmptySlice(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+	t.Setenv("FAKE_LIST_JSON", "null")
+
+	sbs, _, err := cli.SandboxList(context.Background(), "DEFAULT")
+	if err != nil {
+		t.Fatalf("SandboxList() error: %v", err)
+	}
+	if len(sbs) != 0 {
+		t.Fatalf("SandboxList() = %+v, want empty for a literal null stdout", sbs)
+	}
+}
+
+func TestCLI_CachedVersion_FetchesOnceAndCaches(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+	t.Setenv("FAKE_VERSION", "1.9.5")
+
+	v1, err := cli.CachedVersion(context.Background())
+	if err != nil {
+		t.Fatalf("CachedVersion() error: %v", err)
+	}
+	if v1 != "1.9.5" {
+		t.Fatalf("CachedVersion() = %q, want 1.9.5", v1)
+	}
+
+	// Even if the environment changes afterward, the cached value must
+	// stick (sync.Once: fetch once, cache on the struct).
+	t.Setenv("FAKE_VERSION", "9.9.9")
+	v2, err := cli.CachedVersion(context.Background())
+	if err != nil {
+		t.Fatalf("CachedVersion() (2nd call) error: %v", err)
+	}
+	if v2 != "1.9.5" {
+		t.Fatalf("CachedVersion() (2nd call) = %q, want cached 1.9.5", v2)
+	}
 }
 
 func TestParseSandboxTable(t *testing.T) {

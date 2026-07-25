@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/IceRhymers/buzz-lakebox/internal/payload"
 	"github.com/IceRhymers/buzz-lakebox/internal/redact"
@@ -113,8 +114,32 @@ func route(data []byte, deploy DeployFunc) any {
 	case opDeploy:
 		return handleDeploy(data, deploy)
 	default:
-		return newErrorResponse(fmt.Sprintf("unknown op %q; supported: %s", env.Op, joinOps()))
+		return newErrorResponse(fmt.Sprintf("unknown op %q; supported: %s", env.Op, strings.Join(supportedOps, ", ")))
 	}
+}
+
+// MarshalDeployResult renders the frozen {"ok":true,"agent_id":...} /
+// {"ok":false,"error":...} deploy response shape (docs/CONTRACT.md §4)
+// using the same typed response structs the provider-mode stdin path
+// emits — one rendering for the frozen wire shape, shared by both the
+// provider-mode handleDeploy path and cmd/buzz-backend-databricks's
+// operator `deploy --payload-file` command (which used to hand-roll an
+// equivalent map literal of its own).
+func MarshalDeployResult(agentID string, deployErr error) []byte {
+	var resp any
+	if deployErr != nil {
+		resp = newErrorResponse(redact.Redact(deployErr.Error(), nil))
+	} else {
+		resp = deploySuccessResponse{Ok: true, AgentID: agentID}
+	}
+	data, err := json.Marshal(resp)
+	if err != nil {
+		// These are fixed-shape structs with no exotic field types, so
+		// Marshal cannot fail in practice; degrade to a minimal valid
+		// JSON error object rather than panicking or returning nil.
+		return []byte(`{"ok":false,"error":"internal: failed to marshal deploy result"}`)
+	}
+	return data
 }
 
 func handleDeploy(data []byte, deploy DeployFunc) any {
@@ -142,15 +167,4 @@ func handleDeploy(data []byte, deploy DeployFunc) any {
 	}
 
 	return deploySuccessResponse{Ok: true, AgentID: agentID}
-}
-
-func joinOps() string {
-	out := ""
-	for i, op := range supportedOps {
-		if i > 0 {
-			out += ", "
-		}
-		out += op
-	}
-	return out
 }
