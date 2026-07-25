@@ -286,17 +286,42 @@ func looksLikeUnsupportedFlag(output string) bool {
 	return strings.Contains(lower, "unknown flag") || strings.Contains(lower, "unknown shorthand flag")
 }
 
-// SandboxRegister runs `databricks sandbox register -p <profile>`. It is
-// idempotent at the CLI/server level (docs/PLAN.md §4.4 step 2); an
-// "already registered"-shaped message on a non-zero exit is tolerated
-// rather than treated as failure, in case a given CLI version reports
-// idempotent no-ops that way.
+// localKeyRowPattern matches a `sandbox ssh-key list` data row for the
+// key that the CLI itself marked as "matches the one on this machine":
+// a `*`-prefixed row carrying a name and a 32-hex key hash. The legend
+// line ("* key matches the one on this machine") has no hex token, so
+// it cannot false-match. Live-verified row shape on CLI 1.8.0:
+//
+//	* FX7QY7K39J    1dc2bafb16acb3e407a95673944433c0  2026-07-24 21:14  ...
+var localKeyRowPattern = regexp.MustCompile(`(?m)^\s*\*\s+\S+\s+[0-9a-f]{32}\b`)
+
+// SandboxRegister runs `databricks sandbox register -p <profile>`.
+// Re-registering this machine's key under the same workspace identity
+// exits 0 (live-verified on CLI 1.8.0), so a non-zero exit is treated
+// as real unless VERIFIED recoverable: `sandbox ssh-key list` must show
+// the CLI's own this-machine marker row, proving the local key is
+// usable on this workspace despite the register failure.
+//
+// The previous blanket tolerance of any "already registered"-shaped
+// failure was a live-bitten bug: the shared regional sandbox gateway
+// binds a key to ONE workspace identity, and its fatal answer —
+// "this SSH key is already registered to another user" — contains that
+// exact substring. Preflight false-passed, and the deploy died at the
+// first SSH step (PAT reset) with an unactionable error instead.
 func (c *CLI) SandboxRegister(ctx context.Context, profile string) error {
 	out, err := c.runCombined(ctx, "sandbox", "register", "-p", profile)
-	if err != nil && !strings.Contains(strings.ToLower(out), "already registered") {
-		return c.wrapErr(fmt.Errorf("sandbox register -p %s: %w (output: %s)", profile, err, strings.TrimSpace(out)), "sandbox register")
+	if err == nil {
+		return nil
 	}
-	return nil
+	if listOut, listErr := c.runCombined(ctx, "sandbox", "ssh-key", "list", "-p", profile); listErr == nil && localKeyRowPattern.MatchString(listOut) {
+		return nil
+	}
+	if strings.Contains(strings.ToLower(out), "another user") {
+		return c.wrapErr(fmt.Errorf(
+			"sandbox register -p %s: %w (output: %s); this machine's sandbox key (~/.ssh/sandbox_ed25519) is bound to a different identity on the shared regional gateway — free it with `databricks sandbox ssh-key list/delete -p <other-profile>` on the workspace that owns it, or remove the local keypair to mint a fresh one",
+			profile, err, strings.TrimSpace(out)), "sandbox register")
+	}
+	return c.wrapErr(fmt.Errorf("sandbox register -p %s: %w (output: %s)", profile, err, strings.TrimSpace(out)), "sandbox register")
 }
 
 // SandboxCreate runs `databricks sandbox create <name> --json -p <profile>`

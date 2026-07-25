@@ -251,7 +251,17 @@ case "$1" in
   sandbox)
     case "$2" in
       register)
+        if [ -n "${FAKE_REGISTER_OUT:-}" ]; then
+          echo "$FAKE_REGISTER_OUT"
+        fi
         exit "${FAKE_REGISTER_EXIT:-0}"
+        ;;
+      ssh-key)
+        if [ "$3" = "list" ]; then
+          printf '%s\n' "${FAKE_SSHKEY_LIST_OUT:-No SSH keys registered. Run 'databricks sandbox register' to add one.}"
+          exit "${FAKE_SSHKEY_LIST_EXIT:-0}"
+        fi
+        exit 1
         ;;
       create)
         name="$3"
@@ -325,6 +335,90 @@ func TestCLI_SandboxRegister(t *testing.T) {
 	t.Setenv("FAKE_REGISTER_EXIT", "0")
 	if err := cli.SandboxRegister(context.Background(), "DEFAULT"); err != nil {
 		t.Fatalf("SandboxRegister() error: %v", err)
+	}
+}
+
+// fakeSSHKeyListWithLocalRow is a live-captured `sandbox ssh-key list`
+// output shape (CLI 1.8.0) where the `*` marker row proves this
+// machine's key is registered with the target workspace.
+const fakeSSHKeyListWithLocalRow = `
+    NAME          KEY HASH                          CREATED               LAST USED
+    ──────────────────────────────────────────────────────────────────────────────────────────
+  * FX7QY7K39J    1dc2bafb16acb3e407a95673944433c0  2026-07-24 21:14      2026-07-24 22:31
+
+  * key matches the one on this machine`
+
+// TestCLI_SandboxRegister_FailureToleratedWhenKeyVerified: a register
+// failure is tolerated ONLY when ssh-key list shows the CLI's
+// this-machine marker row — the verified-recoverable case.
+func TestCLI_SandboxRegister_FailureToleratedWhenKeyVerified(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+
+	t.Setenv("FAKE_REGISTER_EXIT", "1")
+	t.Setenv("FAKE_REGISTER_OUT", "Error: failed to register key: already registered")
+	t.Setenv("FAKE_SSHKEY_LIST_OUT", fakeSSHKeyListWithLocalRow)
+	if err := cli.SandboxRegister(context.Background(), "DEFAULT"); err != nil {
+		t.Fatalf("SandboxRegister() should tolerate failure with verified local key, got: %v", err)
+	}
+}
+
+// TestCLI_SandboxRegister_AnotherUserIsFatal pins the live-bitten bug:
+// "already registered to another user" contains the substring the old
+// blanket tolerance matched, but the key is NOT usable on this
+// workspace (list shows no marker row) — preflight must fail, with the
+// remedy in the message.
+func TestCLI_SandboxRegister_AnotherUserIsFatal(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+
+	t.Setenv("FAKE_REGISTER_EXIT", "1")
+	t.Setenv("FAKE_REGISTER_OUT", "Error: failed to register key: this SSH key is already registered to another user")
+	// Default FAKE_SSHKEY_LIST_OUT: "No SSH keys registered." — no marker row.
+	err := cli.SandboxRegister(context.Background(), "DEFAULT")
+	if err == nil {
+		t.Fatal("SandboxRegister() must fail when the key is bound to another user and absent from this workspace")
+	}
+	if !strings.Contains(err.Error(), "another user") || !strings.Contains(err.Error(), "ssh-key list/delete") {
+		t.Fatalf("error should carry the shared-gateway remedy, got: %v", err)
+	}
+}
+
+// TestCLI_SandboxRegister_LegendAloneDoesNotVerify: the legend line
+// ("* key matches the one on this machine") must not satisfy the marker
+// pattern without an actual `*`-marked data row carrying a key hash.
+func TestCLI_SandboxRegister_LegendAloneDoesNotVerify(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+
+	t.Setenv("FAKE_REGISTER_EXIT", "1")
+	t.Setenv("FAKE_REGISTER_OUT", "Error: failed to register key: already registered")
+	t.Setenv("FAKE_SSHKEY_LIST_OUT", "  * key matches the one on this machine")
+	if err := cli.SandboxRegister(context.Background(), "DEFAULT"); err == nil {
+		t.Fatal("SandboxRegister() must not treat the legend line alone as verification")
+	}
+}
+
+// TestCLI_SandboxRegister_ListFailureKeepsRegisterError: when the
+// verification list itself fails, the original register error (not the
+// list error) surfaces.
+func TestCLI_SandboxRegister_ListFailureKeepsRegisterError(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+
+	t.Setenv("FAKE_REGISTER_EXIT", "1")
+	t.Setenv("FAKE_REGISTER_OUT", "Error: register exploded")
+	t.Setenv("FAKE_SSHKEY_LIST_EXIT", "1")
+	err := cli.SandboxRegister(context.Background(), "DEFAULT")
+	if err == nil {
+		t.Fatal("SandboxRegister() must fail when register fails and verification is unavailable")
+	}
+	if !strings.Contains(err.Error(), "register exploded") {
+		t.Fatalf("error should carry the register failure, got: %v", err)
 	}
 }
 
