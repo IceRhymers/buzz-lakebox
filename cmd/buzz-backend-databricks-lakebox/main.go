@@ -205,6 +205,23 @@ func newUndeployCmd(profile *string) *cobra.Command {
 		Short: "Permanently delete the agent's sandbox (shreds secrets first) — destructive",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// With no positional id, resolveSandboxID infers the target
+			// from `sandbox list` — it never consults the state file
+			// mapping profile+npub to a specific deployed sandbox, so
+			// "the profile's one sandbox" is a guess, not a fact about
+			// what this provider deployed. --yes then skips
+			// confirmSandboxID's typed-id check below. Together, an
+			// unattended `undeploy --yes` with no id would delete
+			// whatever single sandbox the profile happens to have —
+			// $HOME, repos, OUTBOX, logs and all — aimed purely by
+			// inference and with nobody able to catch a wrong guess.
+			// Require the id explicitly whenever confirmation is
+			// skipped.
+			if assumeYes && len(args) == 0 {
+				return fmt.Errorf("refusing to run `undeploy --yes` without an explicit sandbox id: " +
+					"unattended deletion must not be aimed by inference from `sandbox list`")
+			}
+
 			id, err := resolveSandboxID(cmd.Context(), lakebox.New(), *profile, args)
 			if err != nil {
 				return err
