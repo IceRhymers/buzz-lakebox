@@ -25,6 +25,40 @@ const minSecretLen = 4
 // nsec strings that leak into logs).
 var nsecPrefixPattern = regexp.MustCompile(`nsec1[^\s"']*`)
 
+// secretAssignmentPattern scrubs credential-shaped `NAME=value` /
+// `NAME: value` pairs out of remote output. It exists for the paths
+// where there is no payload to derive known secrets from — the operator
+// lifecycle commands (status/logs/start) render an in-sandbox acp.log
+// tail, and buzz-acp's own output or a crashing agent's traceback can
+// echo the env file's exports. Deliberately narrow: bare "KEY" is NOT a
+// trigger, so buzz-acp's diagnostic `pubkey=…` startup line survives.
+//
+// The value alternation handles single-quoted, double-quoted, and bare
+// forms symmetrically: whichever quote (if any) opens the value, the
+// matching close must be present, and the whole token — quotes included —
+// is consumed by the match. Go's regexp is RE2, which has no
+// backreferences, so the two quote styles are spelled out as separate
+// alternatives rather than matched with a `("?)...\3`-style capture; the
+// replacement never re-emits a quote, so the output is uniformly
+// `NAME=[REDACTED]` regardless of how the original value was quoted —
+// no stray unbalanced quote survives.
+var secretAssignmentPattern = regexp.MustCompile(
+	`(?i)\b([A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY|CREDENTIALS?|AUTH_TAG)[A-Za-z0-9_]*)(\s*[=:]\s*)(?:'[^']*'|"[^"]*"|[^\s"']+)`)
+
+// Log scrubs remote output (an acp.log tail, a command's stdout) that is
+// about to be rendered into an error, a status payload, or the
+// operator's terminal. Unlike Redact it needs no known-secret list: it
+// removes any bare nsec token and any credential-shaped assignment.
+// Callers that DO have the payload should still call Redact as well —
+// Log is the floor, not a replacement.
+func Log(s string) string {
+	if s == "" {
+		return s
+	}
+	s = secretAssignmentPattern.ReplaceAllString(s, "${1}${2}"+Placeholder)
+	return nsecPrefixPattern.ReplaceAllString(s, Placeholder)
+}
+
 // Redact replaces every occurrence of each secret in secrets (deduplicated,
 // filtered to length >= minSecretLen, longest-first so that longer secrets
 // win over any shorter secret that happens to be a substring of it) with

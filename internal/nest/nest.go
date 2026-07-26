@@ -57,6 +57,34 @@ const PATStub = `# Databricks CLI config managed by buzz-backend-databricks-lake
 # This file intentionally contains no profile sections or credentials.
 `
 
+// AliveCheckSnippet defines the POSIX shell function every in-sandbox
+// buzz-acp liveness test uses: launch.sh's double-launch guard, deploy's
+// step-10 verification, and the operator `status` probe.
+//
+// It is a function rather than a bare `pgrep -f '[b]uzz-acp'` because a
+// bare pgrep also matches ZOMBIES. buzz-acp is launched detached
+// (`setsid nohup`), so when it dies its parent is already gone and it is
+// reparented to the sandbox's PID 1 — `sandbox-daemon`, not an init that
+// is guaranteed to reap (docs/M05_PROBE_RESULTS.md §5: systemd is not
+// booted). An unreaped <defunct> buzz-acp would make `status` report a
+// dead agent as running and make launch.sh refuse to relaunch it —
+// exactly the silent-death mode the whole verify path exists to catch.
+// Reproduced locally by the guard-proof tests in launch_exec_test.go.
+//
+// Bracket idiom ('[b]uzz-acp', not 'buzz-acp') for the reason documented
+// at deployflow's pkill sites: the literal pattern would otherwise match
+// this very command's own argv when run over `databricks sandbox ssh`.
+const AliveCheckSnippet = `buzz_acp_alive() {
+  for pid in $(pgrep -f '[b]uzz-acp' 2>/dev/null); do
+    st=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ')
+    case "$st" in
+      Z*|"") continue ;;
+      *) return 0 ;;
+    esac
+  done
+  return 1
+}`
+
 // RenderEnv renders the $HOME/.buzz-backend/env content for agent: one
 // `export KEY='value'` line per field (docs/PLAN.md §4.4 step 7 field
 // list), in a fixed order, with merged env_vars emitted LAST (sorted by
@@ -64,6 +92,14 @@ const PATStub = `# Databricks CLI config managed by buzz-backend-databricks-lake
 // `source` (agent env_vars carry DATABRICKS_HOST/DATABRICKS_TOKEN).
 func RenderEnv(agent payload.Agent) string {
 	var b strings.Builder
+	// emit writes KEY unquoted/raw (only VALUE is shellquote'd) into a file
+	// that RenderLaunchScript's `. "$HOME/.buzz-backend/env"` line
+	// `.`-sources with a shell — an attacker-controlled key containing
+	// shell metacharacters or a newline would execute in that shell, which
+	// has just exported the agent's nsec, auth tag, and DATABRICKS_TOKEN.
+	// This is safe ONLY because agent.EnvVars keys are validated upstream
+	// by payload.Agent.Validate() (^[A-Za-z_][A-Za-z0-9_]*$) before
+	// RenderEnv ever sees them; do not call RenderEnv on unvalidated input.
 	emit := func(key, value string) {
 		b.WriteString("export ")
 		b.WriteString(key)
@@ -206,17 +242,24 @@ func RenderLaunchScript(keepWorkspacePAT bool) string {
 	b.WriteString("  exit 0\n")
 	b.WriteString("fi\n\n")
 
-	// "[b]uzz-acp" (not "buzz-acp"): this guard's own pattern lives in the
-	// script FILE, not in a remote command's argv, so it does not
-	// self-match today — but the bracket idiom is applied here too for
-	// consistency and safety against future argv-based invocations
-	// (BUG 2 fix note).
-	b.WriteString("if pgrep -f '[b]uzz-acp' >/dev/null 2>&1; then\n")
+	// A zombie buzz-acp must not count as "already running" — see
+	// AliveCheckSnippet.
+	b.WriteString(AliveCheckSnippet)
+	b.WriteString("\n\n")
+	b.WriteString("if buzz_acp_alive; then\n")
 	b.WriteString(`  echo "buzz-acp already running; not relaunching" >&2` + "\n")
 	b.WriteString("  exit 0\n")
 	b.WriteString("fi\n\n")
 
-	b.WriteString(`setsid nohup "$HOME/.buzz-backend/bin/buzz-acp" >> "$HOME/.buzz-backend/acp.log" 2>&1 &` + "\n")
+	// 9>&- closes the lock fd in the launched child. Without it the agent
+	// — and every worker it spawns — inherits the open descriptor and so
+	// keeps the flock held for as long as ANY of them lives. A crashed
+	// buzz-acp with one lingering worker would then make every future
+	// `start` exit early with "already running (flock held)" while the
+	// agent is in fact dead: unrecoverable without manual intervention.
+	// The lock's job is only to serialize concurrent launch.sh runs;
+	// buzz_acp_alive above is what guards against a live agent.
+	b.WriteString(`setsid nohup "$HOME/.buzz-backend/bin/buzz-acp" >> "$HOME/.buzz-backend/acp.log" 2>&1 9>&- &` + "\n")
 	b.WriteString(`echo $! > "$HOME/.buzz-backend/acp.pid"` + "\n")
 
 	return b.String()

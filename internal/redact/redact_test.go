@@ -120,3 +120,125 @@ func TestSecretsFromPayload_EmptyFieldsSkipped(t *testing.T) {
 		t.Fatalf("expected no secrets from an empty agent, got %v", secrets)
 	}
 }
+
+func TestLog_ScrubsCredentialShapedAssignments(t *testing.T) {
+	in := strings.Join([]string{
+		"export DATABRICKS_TOKEN=dapi123456789abcdef",
+		"BUZZ_AUTH_TAG: tag-value-here",
+		`OPENAI_API_KEY="sk-proj-abcdefghijklmnop"`,
+		"password=hunter2",
+		"BUZZ_PRIVATE_KEY=nsec1qqqqqqqqqqqqqqqqqqqq",
+	}, "\n")
+
+	got := Log(in)
+	for _, leaked := range []string{"dapi123456789abcdef", "tag-value-here", "sk-proj-abcdefghijklmnop", "hunter2", "nsec1qqqqqqqqqqqqqqqqqqqq"} {
+		if strings.Contains(got, leaked) {
+			t.Fatalf("Log() left %q in the output: %s", leaked, got)
+		}
+	}
+	// The variable NAMES must survive — an operator debugging a missing
+	// env var needs to see which one was set.
+	for _, keep := range []string{"DATABRICKS_TOKEN", "BUZZ_AUTH_TAG", "OPENAI_API_KEY", "BUZZ_PRIVATE_KEY"} {
+		if !strings.Contains(got, keep) {
+			t.Fatalf("Log() removed the variable name %q: %s", keep, got)
+		}
+	}
+}
+
+// buzz-acp's startup line carries the agent's PUBLIC key and the relay
+// URL — the two most useful diagnostics in the log. Neither is a secret
+// and both must survive scrubbing.
+func TestLog_KeepsDiagnosticNonSecrets(t *testing.T) {
+	in := "buzz-acp starting: relay=wss://relay.example.com pubkey=abc123def456\nagent_pool_ready agents=2\n"
+	if got := Log(in); got != in {
+		t.Fatalf("Log() must not touch diagnostic output:\n got: %q\nwant: %q", got, in)
+	}
+}
+
+func TestLog_ScrubsBareNsecWithoutAnAssignment(t *testing.T) {
+	got := Log("panic: key nsec1abcdefghijklmnop was rejected")
+	if strings.Contains(got, "nsec1abcdefghijklmnop") {
+		t.Fatalf("Log() left a bare nsec in the output: %s", got)
+	}
+}
+
+// TestLog_ScrubsAssignmentShapes is the regression test for the
+// single-quote leak: internal/shellquote's Single wraps every value nest.go
+// writes into an env file in single quotes, so KEY='value' is the shape
+// this codebase actually produces. Each case asserts the exact scrubbed
+// output — no stray leading/trailing quote left behind — across quoted,
+// bare, and colon forms, and across more than one keyword family.
+func TestLog_ScrubsAssignmentShapes(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "single_quoted_auth_tag_export_prefixed",
+			in:   `export BUZZ_AUTH_TAG='sometag-secret-value'`,
+			want: "export BUZZ_AUTH_TAG=" + Placeholder,
+		},
+		{
+			name: "single_quoted_token_export_prefixed",
+			in:   `export DATABRICKS_TOKEN='dapi1234567890abcdef'`,
+			want: "export DATABRICKS_TOKEN=" + Placeholder,
+		},
+		{
+			name: "double_quoted_token",
+			in:   `export DATABRICKS_TOKEN="dapi1234567890abcdef"`,
+			want: "export DATABRICKS_TOKEN=" + Placeholder,
+		},
+		{
+			name: "bare_token",
+			in:   "DATABRICKS_TOKEN=dapi1234567890abcdef",
+			want: "DATABRICKS_TOKEN=" + Placeholder,
+		},
+		{
+			name: "colon_with_space_token",
+			in:   "DATABRICKS_TOKEN: dapi1234567890abcdef",
+			want: "DATABRICKS_TOKEN: " + Placeholder,
+		},
+		{
+			name: "colon_no_space_token",
+			in:   "DATABRICKS_TOKEN:dapi1234567890abcdef",
+			want: "DATABRICKS_TOKEN:" + Placeholder,
+		},
+		{
+			name: "single_quoted_api_key",
+			in:   `export OPENAI_API_KEY='sk-proj-abcdefghij'`,
+			want: "export OPENAI_API_KEY=" + Placeholder,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := Log(tt.in)
+			if got != tt.want {
+				t.Fatalf("Log(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestLog_DiagnosticKeywordsSurvive is the explicit negative-case
+// counterpart to TestLog_ScrubsAssignmentShapes: a broadened assignment
+// pattern must still not fire on pubkey=, relay=, or agents=2, none of
+// which contain a credential keyword.
+func TestLog_DiagnosticKeywordsSurvive(t *testing.T) {
+	in := "buzz-acp starting: relay=wss://relay.example.com pubkey=abc123def456\nagent_pool_ready agents=2\n"
+	got := Log(in)
+	for _, keep := range []string{"relay=wss://relay.example.com", "pubkey=abc123def456", "agents=2"} {
+		if !strings.Contains(got, keep) {
+			t.Fatalf("Log() removed diagnostic %q: %s", keep, got)
+		}
+	}
+	if strings.Contains(got, Placeholder) {
+		t.Fatalf("Log() redacted non-secret diagnostic output: %s", got)
+	}
+}
+
+func TestLog_EmptyInput(t *testing.T) {
+	if got := Log(""); got != "" {
+		t.Fatalf("Log(\"\") = %q", got)
+	}
+}

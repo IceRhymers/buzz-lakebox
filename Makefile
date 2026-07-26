@@ -10,7 +10,7 @@ LDFLAGS := -X $(MODULE)/internal/version.Version=$(VERSION) -X $(MODULE)/interna
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build install symlink test vet lint check clean
+.PHONY: help build install symlink test vet lint fmt-check check clean
 
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z_-]+:.*##/ {printf "  %-8s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -49,7 +49,10 @@ lint: ## Run golangci-lint (CI pins v2.11.4)
 	@command -v golangci-lint >/dev/null 2>&1 || { echo "golangci-lint not found; install it from https://golangci-lint.run (CI uses v2.11.4)"; exit 1; }
 	golangci-lint run ./...
 
-check: vet lint test ## Run all local verification (vet + lint + test)
+fmt-check: ## Check gofmt formatting (matches CI)
+	test -z "$$(gofmt -l .)"
+
+check: fmt-check vet lint test ## Run all local verification (fmt-check + vet + lint + test)
 
 clean: ## Remove build artifacts
 	rm -f $(BINARY)

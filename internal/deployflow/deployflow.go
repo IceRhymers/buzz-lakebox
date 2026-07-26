@@ -131,7 +131,7 @@ func (d *Deployer) Deploy(req *payload.DeployRequest) (string, error) {
 		// DeployFunc error, but deployflow must not depend on that when
 		// invoked directly (operator `deploy --payload-file`).
 		secrets := redact.SecretsFromPayload(req.Agent)
-		return "", errors.New(redact.Redact(err.Error(), secrets))
+		return "", Redacted(CodeOf(err), redact.Redact(err.Error(), secrets))
 	}
 	return id, nil
 }
@@ -146,7 +146,7 @@ func (d *Deployer) deploy(req *payload.DeployRequest) (string, error) {
 	// validates before invoking DeployFunc, but deployflow may also be
 	// invoked directly by the operator `deploy --payload-file` path).
 	if err := req.Validate(); err != nil {
-		return "", err
+		return "", failf(CodeValidation, "%w", err)
 	}
 
 	profile := req.ProviderConfig.Profile
@@ -161,30 +161,30 @@ func (d *Deployer) deploy(req *payload.DeployRequest) (string, error) {
 	// error annotations — stamps onto every error below.
 	version, err := d.CLI.CachedVersion(ctx)
 	if err != nil {
-		return "", fmt.Errorf("preflight: could not determine databricks CLI version: %w", err)
+		return "", failf(CodeCLIVersionUnknown, "preflight: could not determine databricks CLI version: %w", err)
 	}
 	meets, err := lakebox.MeetsMinVersion(version)
 	if err != nil {
-		return "", d.wrap("", version, fmt.Errorf("preflight: %w", err))
+		return "", d.wrap("", version, failf(CodeCLIVersionUnknown, "preflight: %w", err))
 	}
 	if !meets {
-		return "", d.wrap("", version, fmt.Errorf("preflight: databricks CLI %s is below the minimum supported %s; upgrade the CLI", version, lakebox.MinCLIVersion))
+		return "", d.wrap("", version, failf(CodeCLIVersionOld, "preflight: databricks CLI %s is below the minimum supported %s", version, lakebox.MinCLIVersion))
 	}
 	if _, err := d.CLI.CurrentUser(ctx, profile); err != nil {
-		return "", d.wrap("", version, fmt.Errorf("preflight: profile %q does not resolve: %w", profile, err))
+		return "", d.wrap("", version, failf(CodeProfileUnresolved, "preflight: profile %q does not resolve: %w", profile, err))
 	}
 	if err := d.CLI.SandboxRegister(ctx, profile); err != nil {
-		return "", d.wrap("", version, fmt.Errorf("preflight: sandbox register: %w", err))
+		return "", d.wrap("", version, failf(CodeSandboxRegister, "preflight: sandbox register: %w", err))
 	}
 
 	// Step 3: reuse-or-create, keyed on the agent's npub identity.
 	npub, err := identity.NsecToNpub(agent.PrivateKeyNsec)
 	if err != nil {
-		return "", d.wrap("", version, fmt.Errorf("derive identity from private_key_nsec: %w", err))
+		return "", d.wrap("", version, failf(CodeIdentityDerive, "derive identity from private_key_nsec: %w", err))
 	}
 	prefix, err := identity.PrefixFor(npub)
 	if err != nil {
-		return "", d.wrap("", version, err)
+		return "", d.wrap("", version, failf(CodeIdentityDerive, "derive sandbox name prefix: %w", err))
 	}
 
 	var sandboxID string
@@ -202,16 +202,16 @@ func (d *Deployer) deploy(req *payload.DeployRequest) (string, error) {
 	stateKey := state.Key(profile, npub)
 	if d.State != nil {
 		if entry, ok, serr := d.State.Lookup(stateKey); serr != nil {
-			return "", d.wrap("", version, fmt.Errorf("read sandbox state file: %w", serr))
+			return "", d.wrap("", version, failf(CodeStateRead, "read sandbox state file: %w", serr))
 		} else if ok {
 			if sb, perr := d.CLI.SandboxStatus(ctx, profile, entry.SandboxID); perr == nil {
 				sandboxID = sb.ID
 				if !strings.EqualFold(sb.Status, lakebox.StatusRunning) {
 					if serr := d.CLI.SandboxStart(ctx, profile, sandboxID); serr != nil {
-						return "", d.wrap(sandboxID, version, fmt.Errorf("sandbox start: %w", serr))
+						return "", d.wrap(sandboxID, version, failf(CodeSandboxStart, "sandbox start: %w", serr))
 					}
 					if werr := d.CLI.WaitRunning(ctx, profile, sandboxID, d.waitTimeout(), d.pollInterval(), d.Sleep); werr != nil {
-						return "", d.wrap(sandboxID, version, fmt.Errorf("waiting for reused sandbox to reach Running: %w", werr))
+						return "", d.wrap(sandboxID, version, failf(CodeSandboxWait, "waiting for reused sandbox to reach Running: %w", werr))
 					}
 				}
 			}
@@ -238,7 +238,7 @@ func (d *Deployer) deploy(req *payload.DeployRequest) (string, error) {
 			if freshlyCreated {
 				d.teardown(profile, sandboxID, freshlyCreated)
 			}
-			return "", d.wrap(sandboxID, version, fmt.Errorf("persist sandbox mapping (required to reuse this sandbox on redeploy): %w", rerr))
+			return "", d.wrap(sandboxID, version, failf(CodeStateWrite, "persist sandbox mapping (required to reuse this sandbox on redeploy): %w", rerr))
 		}
 	}
 
@@ -265,7 +265,7 @@ func (d *Deployer) deploy(req *payload.DeployRequest) (string, error) {
 func (d *Deployer) matchOrCreate(ctx context.Context, profile, prefix, npub, agentName string) (string, bool, error) {
 	sandboxes, _, err := d.CLI.SandboxList(ctx, profile)
 	if err != nil {
-		return "", false, fmt.Errorf("sandbox list: %w", err)
+		return "", false, failf(CodeSandboxList, "sandbox list: %w", err)
 	}
 
 	var matches []lakebox.Sandbox
@@ -282,28 +282,28 @@ func (d *Deployer) matchOrCreate(ctx context.Context, profile, prefix, npub, age
 	case 0:
 		name, nerr := identity.SandboxName(npub, agentName)
 		if nerr != nil {
-			return "", false, nerr
+			return "", false, failf(CodeIdentityDerive, "derive sandbox name: %w", nerr)
 		}
 		sb, cerr := d.CLI.SandboxCreate(ctx, profile, name)
 		if cerr != nil {
-			return "", false, fmt.Errorf("sandbox create: %w", cerr)
+			return "", false, failf(CodeSandboxCreate, "sandbox create: %w", cerr)
 		}
 		sandboxID = sb.ID
 		freshlyCreated = true
 		if !strings.EqualFold(sb.Status, lakebox.StatusRunning) {
 			if werr := d.CLI.WaitRunning(ctx, profile, sandboxID, d.waitTimeout(), d.pollInterval(), d.Sleep); werr != nil {
 				d.teardown(profile, sandboxID, freshlyCreated)
-				return "", false, fmt.Errorf("waiting for freshly created sandbox to reach Running: %w", werr)
+				return "", false, failf(CodeSandboxWait, "waiting for freshly created sandbox to reach Running: %w", werr)
 			}
 		}
 	case 1:
 		sandboxID = matches[0].ID
 		if !strings.EqualFold(matches[0].Status, lakebox.StatusRunning) {
 			if serr := d.CLI.SandboxStart(ctx, profile, sandboxID); serr != nil {
-				return sandboxID, false, fmt.Errorf("sandbox start: %w", serr)
+				return sandboxID, false, failf(CodeSandboxStart, "sandbox start: %w", serr)
 			}
 			if werr := d.CLI.WaitRunning(ctx, profile, sandboxID, d.waitTimeout(), d.pollInterval(), d.Sleep); werr != nil {
-				return sandboxID, false, fmt.Errorf("waiting for reused sandbox to reach Running: %w", werr)
+				return sandboxID, false, failf(CodeSandboxWait, "waiting for reused sandbox to reach Running: %w", werr)
 			}
 		}
 	default:
@@ -311,8 +311,8 @@ func (d *Deployer) matchOrCreate(ctx context.Context, profile, prefix, npub, age
 		for i, m := range matches {
 			ids[i] = m.ID
 		}
-		return "", false, fmt.Errorf(
-			"ambiguous identity: %d sandboxes match prefix %q (%s); refusing to guess — manually delete the stale sandbox(es) and redeploy",
+		return "", false, failf(CodeIdentityAmbiguous,
+			"ambiguous identity: %d sandboxes match prefix %q (%s); refusing to guess",
 			len(matches), prefix, strings.Join(ids, ", "),
 		)
 	}
@@ -402,7 +402,7 @@ func (d *Deployer) provision(ctx context.Context, profile, sandboxID string, fre
 			step("pat-reset", "set -eu; umask 077; cat > \"$HOME/.databrickscfg\""),
 			strings.NewReader(nest.PATStub),
 		); err != nil {
-			return fmt.Errorf("PAT reset: %w", err)
+			return failf(CodePATReset, "PAT reset: %w", err)
 		}
 	}
 
@@ -420,7 +420,7 @@ func (d *Deployer) provision(ctx context.Context, profile, sandboxID string, fre
 		step("env-write", fmt.Sprintf(`set -eu; umask 077; cat > %s && chmod 600 %s`, dquote(nest.EnvFilePath), dquote(nest.EnvFilePath))),
 		strings.NewReader(envContent),
 	); err != nil {
-		return fmt.Errorf("write env file: %w", err)
+		return failf(CodeEnvWrite, "write env file: %w", err)
 	}
 
 	// Step 8: update-in-place guard — kill any existing buzz-acp process
@@ -432,7 +432,7 @@ func (d *Deployer) provision(ctx context.Context, profile, sandboxID string, fre
 	// bracket idiom's regex still matches the real "buzz-acp" process
 	// name but the argv text "[b]uzz-acp" does not match itself.
 	if _, err := d.SSH.Run(ctx, profile, sandboxID, step("prelaunch-kill", `pkill -f '[b]uzz-acp' 2>/dev/null; true`)); err != nil {
-		return fmt.Errorf("kill existing buzz-acp process group: %w", err)
+		return failf(CodePrelaunchKill, "kill existing buzz-acp process group: %w", err)
 	}
 
 	// Step 9: write + run launch.sh.
@@ -440,10 +440,10 @@ func (d *Deployer) provision(ctx context.Context, profile, sandboxID string, fre
 		step("launch-write", fmt.Sprintf(`set -eu; umask 077; cat > %s && chmod 700 %s`, dquote(nest.LaunchScriptPath), dquote(nest.LaunchScriptPath))),
 		strings.NewReader(nest.RenderLaunchScript(req.ProviderConfig.KeepWorkspacePAT)),
 	); err != nil {
-		return fmt.Errorf("write launch.sh: %w", err)
+		return failf(CodeLaunchWrite, "write launch.sh: %w", err)
 	}
 	if _, err := d.SSH.Run(ctx, profile, sandboxID, step("launch-exec", fmt.Sprintf(`sh %s`, dquote(nest.LaunchScriptPath)))); err != nil {
-		return fmt.Errorf("run launch.sh: %w", err)
+		return failf(CodeLaunchExec, "run launch.sh: %w", err)
 	}
 
 	// Step 10: verify after N=VerifyDelay, then (only on success) set
@@ -461,8 +461,8 @@ func (d *Deployer) provision(ctx context.Context, profile, sandboxID string, fre
 	// round 2) — the remedy names a <sandbox-id> placeholder that wrap's
 	// annotation resolves.
 	if err := d.setAutostopPolicy(ctx, profile, sandboxID, req.ProviderConfig); err != nil {
-		return &postVerifyFailure{err: fmt.Errorf(
-			"the agent launched and verified successfully, but the autostop policy could not be set: %w; the sandbox remains on the default 10-minute idle autostop — redeploy, or run `databricks sandbox config <sandbox-id> --no-autostop` manually (the sandbox id is in this error's trailing annotation)",
+		return &postVerifyFailure{err: failf(CodeAutostopConfig,
+			"the agent launched and verified successfully, but the autostop policy could not be set: %w; the sandbox remains on the default 10-minute idle autostop (the sandbox id is in this error's trailing annotation)",
 			err,
 		)}
 	}
@@ -487,7 +487,7 @@ func (d *Deployer) provision(ctx context.Context, profile, sandboxID string, fre
 func (d *Deployer) installAndVerify(ctx context.Context, profile, sandboxID, buzzVersion, envContent string) error {
 	script, err := install.BuildInstallScript(buzzVersion)
 	if err != nil {
-		return fmt.Errorf("install: %w", err)
+		return failf(CodeInstallScript, "install: %w", err)
 	}
 
 	const installScriptPath = "$HOME/.buzz-backend/install.sh"
@@ -495,10 +495,10 @@ func (d *Deployer) installAndVerify(ctx context.Context, profile, sandboxID, buz
 		step("install-write", fmt.Sprintf(`set -eu; umask 077; mkdir -p "$HOME/.buzz-backend"; cat > %s`, dquote(installScriptPath))),
 		strings.NewReader(script),
 	); err != nil {
-		return fmt.Errorf("install: write install script: %w", err)
+		return failf(CodeInstallWrite, "install: write install script: %w", err)
 	}
 	if _, err := d.SSH.Run(ctx, profile, sandboxID, step("install-exec", fmt.Sprintf(`sh %s`, dquote(installScriptPath)))); err != nil {
-		return fmt.Errorf("install: %w", err)
+		return failf(CodeInstallExec, "install: %w", err)
 	}
 
 	// Runtime verification: ACP initialize handshake with the agent env
@@ -506,17 +506,17 @@ func (d *Deployer) installAndVerify(ctx context.Context, profile, sandboxID, buz
 	// stdin only.
 	verifyCmd, err := install.BuildVerifyCommand(verifyEnvFilePath, installVerifyTimeoutSeconds)
 	if err != nil {
-		return fmt.Errorf("install verification: %w", err)
+		return failf(CodeRuntimeVerify, "install verification: %w", err)
 	}
 	out, err := d.SSH.RunWithStdin(ctx, profile, sandboxID,
 		step("verify-exec", verifyCmd),
 		strings.NewReader(envContent),
 	)
 	if err != nil {
-		return fmt.Errorf("install verification: buzz-agent ACP initialize handshake failed: %w", err)
+		return failf(CodeRuntimeVerify, "install verification: buzz-agent ACP initialize handshake failed: %w", err)
 	}
 	if !strings.Contains(out, install.AgentInfoMarker) {
-		return fmt.Errorf("install verification: buzz-agent ACP initialize response did not contain %q: %s", install.AgentInfoMarker, truncate(strings.TrimSpace(out), maxErrorLogBytes))
+		return failf(CodeRuntimeVerify, "install verification: buzz-agent ACP initialize response did not contain %q: %s", install.AgentInfoMarker, remoteText(strings.TrimSpace(out)))
 	}
 	return nil
 }
@@ -534,11 +534,9 @@ func (d *Deployer) installAndVerify(ctx context.Context, profile, sandboxID, buz
 func (d *Deployer) verifyLaunch(ctx context.Context, profile, sandboxID string) error {
 	d.sleep(d.verifyDelay())
 
-	out, err := d.SSH.Run(ctx, profile, sandboxID, step("verify-check",
-		`pgrep -f '[b]uzz-acp' >/dev/null 2>&1; echo "BUZZ_PGREP_RC=$?"; tail -c 4096 "$HOME/.buzz-backend/acp.log" 2>/dev/null || true`,
-	))
+	out, err := d.SSH.Run(ctx, profile, sandboxID, step("verify-check", acpLivenessProbe()))
 	if err != nil {
-		return fmt.Errorf("verify: could not check buzz-acp process/log: %w", err)
+		return failf(CodeVerifySSH, "verify: could not check buzz-acp process/log: %w", err)
 	}
 
 	rc, logOut, perr := parsePgrepCheck(out)
@@ -547,21 +545,21 @@ func (d *Deployer) verifyLaunch(ctx context.Context, profile, sandboxID string) 
 		// distinct diagnosis rather than pretending the process check
 		// itself returned rc=1 (review round 2 — an unparseable output
 		// must not masquerade as a confirmed-dead agent).
-		return fmt.Errorf("verify: could not parse verification output: %w (output: %s)", perr, truncate(strings.TrimSpace(out), maxErrorLogBytes))
+		return failf(CodeVerifyUnparseable, "verify: could not parse verification output: %w (output: %s)", perr, remoteText(strings.TrimSpace(out)))
 	}
-	logOut = truncate(logOut, maxErrorLogBytes)
+	logOut = remoteText(logOut)
 	if rc != 0 {
-		return fmt.Errorf("verify: buzz-acp process not found %s after launch (acp.log: %s)", d.verifyDelay(), strings.TrimSpace(logOut))
+		return failf(CodeVerifyProcessDead, "verify: buzz-acp process not found %s after launch (acp.log: %s)", d.verifyDelay(), strings.TrimSpace(logOut))
 	}
 
 	if strings.Contains(logOut, terminalErrorLine) {
-		return fmt.Errorf(
-			"verify: relay connection failed (%q); this nostr key is very likely not a member of the target relay — mint/register a relay-member key for this agent and redeploy",
+		return failf(CodeVerifyRelayDenied,
+			"verify: relay connection failed (%q); this nostr key is very likely not a member of the target relay",
 			terminalErrorLine,
 		)
 	}
 	if !strings.Contains(logOut, agentPoolReadyMarker) {
-		return fmt.Errorf("verify: acp.log did not contain %q within %s; log: %s", agentPoolReadyMarker, d.verifyDelay(), strings.TrimSpace(logOut))
+		return failf(CodeVerifyNotReady, "verify: acp.log did not contain %q within %s; log: %s", agentPoolReadyMarker, d.verifyDelay(), strings.TrimSpace(logOut))
 	}
 	return nil
 }
@@ -593,6 +591,21 @@ func parsePgrepCheck(out string) (rc int, log string, err error) {
 		return n, strings.Join(lines[i+1:], "\n"), nil
 	}
 	return 0, "", fmt.Errorf("no %s marker line found in verification output", prefix)
+}
+
+// remoteText prepares output that came back from inside a sandbox (an
+// acp.log tail, a command's stdout) for rendering into an error, a
+// status payload, or the operator's terminal: bounded, then scrubbed of
+// anything credential-shaped.
+//
+// The scrub is what the payload-keyed redaction in Deploy cannot do:
+// the operator lifecycle commands have no payload to derive secrets
+// from, and a crashing agent that echoes its environment would
+// otherwise put a live DATABRICKS_TOKEN in the terminal (and in
+// whatever issue the owner pastes it into). Deploy still redacts its
+// own payload's secrets on top of this — remoteText is the floor.
+func remoteText(s string) string {
+	return redact.Log(truncate(s, maxErrorLogBytes))
 }
 
 // truncate bounds s to at most max bytes (BUG 5 fix: no remote log/output
@@ -637,11 +650,7 @@ func (d *Deployer) teardown(profile, sandboxID string, freshlyCreated bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), teardownTimeout)
 	defer cancel()
 
-	shredCmd := step("teardown-shred", fmt.Sprintf(
-		`shred -u %s 2>/dev/null || rm -f %s 2>/dev/null; shred -u %s 2>/dev/null || rm -f %s 2>/dev/null; true`,
-		dquote(nest.EnvFilePath), dquote(nest.EnvFilePath), dquote(verifyEnvFilePath), dquote(verifyEnvFilePath),
-	))
-	_, _ = d.SSH.Run(ctx, profile, sandboxID, shredCmd)
+	_, _ = d.SSH.Run(ctx, profile, sandboxID, step("teardown-shred", secretShredCommand()))
 
 	if freshlyCreated {
 		_ = d.CLI.SandboxDelete(ctx, profile, sandboxID)
@@ -654,6 +663,33 @@ func (d *Deployer) teardown(profile, sandboxID string, freshlyCreated bool) {
 	// "reused sandbox unhealthy — kill the lingering agent" teardown
 	// intent.
 	_, _ = d.SSH.Run(ctx, profile, sandboxID, step("teardown-pkill", `pkill -f '[b]uzz-acp' 2>/dev/null; true`))
+}
+
+// acpLivenessProbe is the one remote command behind both deploy's
+// step-10 verification and the operator `status`: report whether a
+// non-zombie buzz-acp is alive (as the parseable BUZZ_PGREP_RC marker
+// line — see parsePgrepCheck) and echo a bounded acp.log tail, in a
+// single round trip.
+//
+// The exit code is echoed rather than used as the command's own status
+// because a dead agent must still produce a readable log tail rather
+// than a failed SSH call.
+func acpLivenessProbe() string {
+	return nest.AliveCheckSnippet + "\n" +
+		`buzz_acp_alive; echo "BUZZ_PGREP_RC=$?"; tail -c 4096 "$HOME/.buzz-backend/acp.log" 2>/dev/null || true`
+}
+
+// secretShredCommand removes every secret-bearing file this provider
+// writes into a sandbox: the agent env file (nsec, auth tag, inference
+// token) and the transient verification env file. Shared by failure
+// teardown and Undeploy so neither can drift into shredding less than
+// the other. Always exits 0 — a missing file is the expected case on
+// most paths and must not fail the caller's own error reporting.
+func secretShredCommand() string {
+	return fmt.Sprintf(
+		`shred -u %s 2>/dev/null || rm -f %s 2>/dev/null; shred -u %s 2>/dev/null || rm -f %s 2>/dev/null; true`,
+		dquote(nest.EnvFilePath), dquote(nest.EnvFilePath), dquote(verifyEnvFilePath), dquote(verifyEnvFilePath),
+	)
 }
 
 // step prepends an inert shell comment tagging cmd with a short

@@ -6,11 +6,21 @@ package payload
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 )
 
 // SupportedAgentCommand is the only agent_command value v0 of this provider
 // accepts. PLAN.md §4.2 / Decision 4: goose/claude/codex are v0.1 scope.
 const SupportedAgentCommand = "buzz-agent"
+
+// envVarKeyPattern is a valid POSIX shell/environment variable name. Keys
+// that don't match this are rejected by Agent.Validate() because
+// internal/nest's RenderEnv writes the KEY of every env_vars entry raw
+// (unquoted) into a file that gets `.`-sourced by a shell — an attacker-
+// controlled key containing shell metacharacters or a newline would
+// achieve command execution in that shell, which has just exported the
+// agent's nsec, auth tag, and DATABRICKS_TOKEN.
+var envVarKeyPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // DeployRequest is the top-level envelope for an {"op":"deploy",...} request
 // (docs/CONTRACT.md §3).
@@ -80,6 +90,20 @@ func (a Agent) Validate() error {
 			"agent_command %q is not supported by this provider yet; v0 only supports %q, see v0.1 roadmap (https://github.com/IceRhymers/buzz-lakebox/issues/1) for goose/claude/codex support",
 			a.AgentCommand, SupportedAgentCommand,
 		)
+	}
+	// env_vars keys are written raw (unquoted) into a shell-sourced env
+	// file by internal/nest's RenderEnv, so a key that isn't a valid
+	// shell/environment variable name is an arbitrary-command-execution
+	// vector in that sandbox shell. Reject anything else here, the single
+	// choke point both deploy entry points (provider.handleDeploy and
+	// deployflow.Deploy) route through via DeployRequest.Validate().
+	for key := range a.EnvVars {
+		if !envVarKeyPattern.MatchString(key) {
+			return fmt.Errorf(
+				"env_vars key %q is not a valid environment variable name; only names matching ^[A-Za-z_][A-Za-z0-9_]*$ are allowed",
+				key,
+			)
+		}
 	}
 	return nil
 }
