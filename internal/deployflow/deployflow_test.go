@@ -13,6 +13,7 @@ import (
 	"github.com/IceRhymers/buzz-lakebox/internal/lakebox"
 	"github.com/IceRhymers/buzz-lakebox/internal/payload"
 	"github.com/IceRhymers/buzz-lakebox/internal/sshx"
+	"github.com/IceRhymers/buzz-lakebox/internal/state"
 )
 
 // testNsec is a throwaway nostr private key used only for
@@ -75,13 +76,29 @@ case "$1" in
         if [ "${FAKE_STATUS_EXIT:-0}" != "0" ]; then
           exit "${FAKE_STATUS_EXIT}"
         fi
-        printf '{"sandboxId":"%s","name":"fake","status":"%s"}' "$id" "${FAKE_STATUS_STATUS:-Running}"
+        status="${FAKE_STATUS_STATUS:-Running}"
+        # FAKE_STATUS_FLIP_FILE: first call reports FAKE_STATUS_STATUS and
+        # touches the file; later calls report Running — lets tests drive
+        # the stopped -> started -> Running transition WaitRunning polls.
+        if [ -n "${FAKE_STATUS_FLIP_FILE:-}" ]; then
+          if [ -f "$FAKE_STATUS_FLIP_FILE" ]; then
+            status="Running"
+          else
+            : > "$FAKE_STATUS_FLIP_FILE"
+          fi
+        fi
+        printf '{"sandboxId":"%s","name":"fake","status":"%s"}' "$id" "$status"
         exit 0
         ;;
       start)
         id="$3"
         { echo "CLI:start $id"; echo "---"; } >> "$LOG"
         exit "${FAKE_START_EXIT:-0}"
+        ;;
+      stop)
+        id="$3"
+        { echo "CLI:stop $id"; echo "---"; } >> "$LOG"
+        exit "${FAKE_STOP_EXIT:-0}"
         ;;
       delete)
         id="$3"
@@ -123,6 +140,21 @@ case "$1" in
           verify-check)
             printf 'BUZZ_PGREP_RC=%s\n%s' "${FAKE_PGREP_EXIT:-0}" "${FAKE_ACP_LOG:-}"
             exit 0
+            ;;
+          status-check)
+            printf 'BUZZ_PGREP_RC=%s\n%s' "${FAKE_PGREP_EXIT:-0}" "${FAKE_ACP_LOG:-}"
+            exit 0
+            ;;
+          logs-tail)
+            printf '%s' "${FAKE_ACP_LOG:-}"
+            exit 0
+            ;;
+          start-launch)
+            if [ "${FAKE_NO_LAUNCH_SH:-0}" = "1" ]; then
+              echo "BUZZ_NO_LAUNCH_SH=1"
+              exit 9
+            fi
+            exit "${FAKE_LAUNCH_EXIT:-0}"
             ;;
           *)
             exit 0
@@ -167,6 +199,9 @@ func newHarness(t *testing.T) *harness {
 	dep.Sleep = func(time.Duration) {} // no real wall-clock waits in tests
 	dep.WaitRunningTimeout = 5 * time.Second
 	dep.PollInterval = time.Millisecond
+	// Never let tests touch the real ~/.local/state mapping (New() wires
+	// the default store); point persistence at the test temp dir.
+	dep.State = &state.Store{Path: filepath.Join(dir, "agents.json")}
 
 	return &harness{t: t, logPath: logPath, dep: dep}
 }

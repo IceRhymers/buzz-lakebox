@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -68,13 +69,126 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newVersionCmd())
 	root.AddCommand(newDoctorCmd(&profile))
 	root.AddCommand(newDeployCmd(&profile))
-	root.AddCommand(newNotImplementedCmd("status", "M2"))
-	root.AddCommand(newNotImplementedCmd("stop", "M2"))
-	root.AddCommand(newNotImplementedCmd("start", "M2"))
-	root.AddCommand(newNotImplementedCmd("logs", "M2"))
+	root.AddCommand(newStatusCmd(&profile))
+	root.AddCommand(newStopCmd(&profile))
+	root.AddCommand(newStartCmd(&profile))
+	root.AddCommand(newLogsCmd(&profile))
 	root.AddCommand(newNotImplementedCmd("undeploy", "M2"))
 
 	return root
+}
+
+// resolveSandboxID picks the target sandbox for a lifecycle subcommand:
+// the explicit positional arg when given, else the profile's single
+// sandbox — refusing to guess between several.
+func resolveSandboxID(ctx context.Context, cli *lakebox.CLI, profile string, args []string) (string, error) {
+	if len(args) == 1 {
+		return args[0], nil
+	}
+	sandboxes, _, err := cli.SandboxList(ctx, profile)
+	if err != nil {
+		return "", fmt.Errorf("resolve sandbox: %w", err)
+	}
+	switch len(sandboxes) {
+	case 0:
+		return "", fmt.Errorf("no sandboxes exist on profile %q; deploy first", profile)
+	case 1:
+		return sandboxes[0].ID, nil
+	default:
+		ids := make([]string, len(sandboxes))
+		for i, sb := range sandboxes {
+			ids[i] = fmt.Sprintf("%s (%s)", sb.ID, sb.Status)
+		}
+		return "", fmt.Errorf("multiple sandboxes on profile %q — pass one explicitly: %s", profile, strings.Join(ids, ", "))
+	}
+}
+
+func newStartCmd(profile *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "start [sandbox-id]",
+		Short: "Recover a stopped/dead agent: start the sandbox if needed, rerun launch.sh, verify",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := resolveSandboxID(cmd.Context(), lakebox.New(), *profile, args)
+			if err != nil {
+				return err
+			}
+			if err := newDeployer().Start(*profile, id); err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "agent verified running in sandbox %s\n", id)
+			return nil
+		},
+	}
+}
+
+func newStatusCmd(profile *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "status [sandbox-id]",
+		Short: "Report sandbox state and in-sandbox buzz-acp liveness as JSON",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := resolveSandboxID(cmd.Context(), lakebox.New(), *profile, args)
+			if err != nil {
+				return err
+			}
+			st, err := newDeployer().Status(*profile, id)
+			if err != nil {
+				return err
+			}
+			data, err := json.Marshal(st)
+			if err != nil {
+				return fmt.Errorf("marshal status: %w", err)
+			}
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), string(data))
+			if !st.AcpRunning {
+				return fmt.Errorf("agent is NOT running (sandbox %s is %s); recover with `%s start %s`", id, st.SandboxStatus, cmd.Root().Name(), id)
+			}
+			return nil
+		},
+	}
+}
+
+func newLogsCmd(profile *string) *cobra.Command {
+	var tailBytes int
+	cmd := &cobra.Command{
+		Use:   "logs [sandbox-id]",
+		Short: "Print the tail of the agent's acp.log from inside the sandbox",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := resolveSandboxID(cmd.Context(), lakebox.New(), *profile, args)
+			if err != nil {
+				return err
+			}
+			out, err := newDeployer().Logs(*profile, id, tailBytes)
+			if err != nil {
+				return err
+			}
+			_, _ = fmt.Fprint(cmd.OutOrStdout(), out)
+			return nil
+		},
+	}
+	cmd.Flags().IntVar(&tailBytes, "tail-bytes", 4096, "how many trailing bytes of acp.log to print")
+	return cmd
+}
+
+func newStopCmd(profile *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "stop [sandbox-id]",
+		Short: "Stop the sandbox's compute (agent goes offline; $HOME persists — recover with start)",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := resolveSandboxID(cmd.Context(), lakebox.New(), *profile, args)
+			if err != nil {
+				return err
+			}
+			if err := newDeployer().Stop(*profile, id); err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "sandbox %s stopping; recover later with `%s start %s`\n", id, cmd.Root().Name(), id)
+			return nil
+		},
+	}
 }
 
 func newVersionCmd() *cobra.Command {

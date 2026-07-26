@@ -456,6 +456,17 @@ func (c *CLI) WaitRunning(ctx context.Context, profile, id string, timeout, poll
 	}
 }
 
+// SandboxStop runs `databricks sandbox stop <id> -p <profile>`. All
+// in-sandbox processes die; $HOME persists (lane C persistence
+// semantics), so a later SandboxStart + launch.sh recovers the agent.
+func (c *CLI) SandboxStop(ctx context.Context, profile, id string) error {
+	out, err := c.runCombined(ctx, "sandbox", "stop", id, "-p", profile)
+	if err != nil {
+		return c.wrapErr(fmt.Errorf("sandbox stop %s -p %s: %w (output: %s)", id, profile, err, strings.TrimSpace(out)), "sandbox stop")
+	}
+	return nil
+}
+
 // SandboxDelete runs `databricks sandbox delete <id> --auto-approve -p
 // <profile>` (docs/PLAN.md §4.3 failure teardown / M2 undeploy).
 func (c *CLI) SandboxDelete(ctx context.Context, profile, id string) error {

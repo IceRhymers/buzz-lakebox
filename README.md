@@ -19,9 +19,9 @@ Buzz Desktop ──stdin JSON {op:"deploy",...}──> buzz-backend-databricks-l
 
 | Op | Behavior |
 |---|---|
-| `deploy` | Create (or reuse via `backend_agent_id`) a sandbox → set autostop policy → install pinned Buzz binaries into `$HOME` → write deploy-payload env (0600, via SSH stdin — never argv) → `setsid nohup buzz-acp` → return `{ok: true, agent_id: "<sandbox-id>"}` |
+| `deploy` | Reuse-or-create a sandbox → install pinned Buzz binaries into `$HOME` → write deploy-payload env (0600, via SSH stdin — never argv) → `setsid nohup buzz-acp` → verify → set autostop policy → return `{ok: true, agent_id: "<sandbox-id>"}`. Reuse is keyed by the provider's own state file (`~/.local/state/buzz-lakebox/agents.json`, npub→sandbox-id per profile): the desktop does not echo `backend_agent_id` back, and Lakebox does not persist caller-set sandbox names, so without this file every redeploy would orphan the previous sandbox |
 | `info` | Provider name/version/description |
-| stop/status/logs/undeploy | Not in Buzz's provider protocol yet ("v2"). The binary registers matching subcommands but they are **M2 stubs** — operate deployed agents with the raw `databricks sandbox` CLI for now (see [Operating a deployed agent](#operating-a-deployed-agent)) |
+| start/status/logs/stop/undeploy | Not in Buzz's provider protocol yet ("v2"), so the desktop can't invoke them — but `start`, `status`, `logs`, and `stop` are implemented as operator CLI subcommands (see [Operating a deployed agent](#operating-a-deployed-agent)); `undeploy` remains an M2 stub (use `databricks sandbox delete`) |
 
 Auth: the operator's existing `~/.databrickscfg` profile, selected via `provider_config.profile`. The Databricks Sandbox preview is region-gated (verified in us-west-2).
 
@@ -150,17 +150,18 @@ Talk to the agent by **@mentioning it in a channel it's a member of** (`respond_
 
 ## Operating a deployed agent
 
-The provider's lifecycle subcommands are M2 stubs; until then, operate through the `databricks` CLI (the sandbox id is the `agent_id` returned by deploy, also visible in `databricks sandbox list`):
+The provider binary doubles as the operator CLI. Every lifecycle subcommand takes an optional `[sandbox-id]` (the `agent_id` returned by deploy) and defaults to the profile's single sandbox when there's exactly one:
 
 ```sh
-databricks sandbox list -p <profile>                     # find the sandbox; AUTOSTOP should read "never"
-databricks sandbox ssh <id> -p <profile> -- 'tail -50 $HOME/.buzz-backend/acp.log'   # agent health/log
-databricks sandbox stop <id> -p <profile>                # stop compute (agent dies; $HOME persists)
-databricks sandbox start <id> -p <profile>               # restart compute…
-databricks sandbox ssh <id> -p <profile> -- 'sh $HOME/.buzz-backend/launch.sh'       # …then relaunch the agent (nothing relaunches it automatically)
+buzz-backend-databricks-lakebox status    # sandbox state + buzz-acp liveness + log tail (JSON); non-zero exit when the agent is down
+buzz-backend-databricks-lakebox start     # THE recovery command: start the sandbox if stopped, rerun launch.sh, verify
+buzz-backend-databricks-lakebox logs      # tail acp.log (--tail-bytes to size)
+buzz-backend-databricks-lakebox stop      # stop compute (agent goes offline; $HOME persists — recover with start)
 ```
 
-Healthy log lines to look for: `agent_pool_ready agents=N`, `connected to relay`, `subscribed to channel …`, `presence set to online`. You can also stop a remote agent from chat with a `!shutdown` owner mention. Deploys default the sandbox to `--no-autostop` (relay traffic doesn't count as sandbox activity, so any idle timeout would kill healthy agents); pass `provider_config.idle_timeout` to opt back in, accepting manual `start`-based recovery.
+**When do you need `start`?** Whenever the sandbox stopped (manual stop, lifetime cap, or an opted-in idle timeout): all in-sandbox processes die with it and nothing relaunches buzz-acp automatically — and the desktop won't notice or redeploy on its own (its mention flow only redeploys agents whose record isn't "deployed"). Deploys default the sandbox to `--no-autostop` precisely because relay traffic doesn't count as sandbox activity, so any idle timeout kills healthy agents; pass `provider_config.idle_timeout` to opt back in, accepting `start`-based recovery.
+
+Healthy log lines: `agent_pool_ready agents=N`, `connected to relay`, `subscribed to channel …`, `presence set to online`. You can also stop a remote agent from chat with a `!shutdown` owner mention, and everything above has a raw `databricks sandbox list/ssh/stop/start` equivalent if the provider binary isn't at hand.
 
 ## Design inputs
 

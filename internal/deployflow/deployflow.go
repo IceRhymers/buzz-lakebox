@@ -21,6 +21,7 @@ import (
 	"github.com/IceRhymers/buzz-lakebox/internal/payload"
 	"github.com/IceRhymers/buzz-lakebox/internal/redact"
 	"github.com/IceRhymers/buzz-lakebox/internal/sshx"
+	"github.com/IceRhymers/buzz-lakebox/internal/state"
 	"github.com/IceRhymers/buzz-lakebox/internal/version"
 )
 
@@ -88,6 +89,15 @@ type Deployer struct {
 	// expire mid-provision, proving teardown still completes on its own
 	// independent budget (BUG 4 regression coverage).
 	DeployTimeout time.Duration
+
+	// State is the provider-side npub→sandbox mapping — the ONLY
+	// durable reuse key (see internal/state's package doc: the desktop
+	// never sends backend_agent_id and Lakebox does not persist
+	// caller-set names, so without this every redeploy orphans a
+	// still-billing --no-autostop sandbox). nil disables persistence
+	// (lookups skipped, nothing recorded); tests point it at a temp
+	// file.
+	State *state.Store
 }
 
 // New returns a Deployer with production defaults.
@@ -100,6 +110,7 @@ func New(cli *lakebox.CLI, ssh *sshx.Client) *Deployer {
 		WaitRunningTimeout: defaultWaitRunningTimeout,
 		PollInterval:       defaultPollInterval,
 		DeployTimeout:      deployTimeout,
+		State:              state.NewDefault(),
 	}
 }
 
@@ -176,58 +187,59 @@ func (d *Deployer) deploy(req *payload.DeployRequest) (string, error) {
 		return "", d.wrap("", version, err)
 	}
 
-	sandboxes, _, err := d.CLI.SandboxList(ctx, profile)
-	if err != nil {
-		return "", d.wrap("", version, fmt.Errorf("sandbox list: %w", err))
-	}
-
-	var matches []lakebox.Sandbox
-	for _, sb := range sandboxes {
-		if strings.HasPrefix(sb.Name, prefix) {
-			matches = append(matches, sb)
-		}
-	}
-
 	var sandboxID string
 	var freshlyCreated bool
 
-	switch len(matches) {
-	case 0:
-		name, nerr := identity.SandboxName(npub, agent.Name)
-		if nerr != nil {
-			return "", d.wrap("", version, nerr)
+	// Step 3a: provider-side state lookup — the PRIMARY reuse key. The
+	// desktop never echoes backend_agent_id back in deploy payloads, and
+	// Lakebox does not persist caller-set sandbox names (live-verified
+	// 2026-07-26: list/status return the id as "name"), so the name-prefix
+	// match below cannot find a sandbox created by an earlier process.
+	// Without this lookup, every redeploy would orphan the previous
+	// sandbox — still running, --no-autostop, billing forever. A stale
+	// mapping (sandbox deleted out-of-band) fails the status probe and
+	// falls through to the legacy match / create path.
+	stateKey := state.Key(profile, npub)
+	if d.State != nil {
+		if entry, ok, serr := d.State.Lookup(stateKey); serr != nil {
+			return "", d.wrap("", version, fmt.Errorf("read sandbox state file: %w", serr))
+		} else if ok {
+			if sb, perr := d.CLI.SandboxStatus(ctx, profile, entry.SandboxID); perr == nil {
+				sandboxID = sb.ID
+				if !strings.EqualFold(sb.Status, lakebox.StatusRunning) {
+					if serr := d.CLI.SandboxStart(ctx, profile, sandboxID); serr != nil {
+						return "", d.wrap(sandboxID, version, fmt.Errorf("sandbox start: %w", serr))
+					}
+					if werr := d.CLI.WaitRunning(ctx, profile, sandboxID, d.waitTimeout(), d.pollInterval(), d.Sleep); werr != nil {
+						return "", d.wrap(sandboxID, version, fmt.Errorf("waiting for reused sandbox to reach Running: %w", werr))
+					}
+				}
+			}
 		}
-		sb, cerr := d.CLI.SandboxCreate(ctx, profile, name)
-		if cerr != nil {
-			return "", d.wrap("", version, fmt.Errorf("sandbox create: %w", cerr))
+	}
+
+	if sandboxID == "" {
+		var merr error
+		sandboxID, freshlyCreated, merr = d.matchOrCreate(ctx, profile, prefix, npub, agent.Name)
+		if merr != nil {
+			// sandboxID may carry a partial id (e.g. a matched sandbox
+			// that failed to start) for wrap's annotation, or be empty.
+			return "", d.wrap(sandboxID, version, merr)
 		}
-		sandboxID = sb.ID
-		freshlyCreated = true
-		if !strings.EqualFold(sb.Status, lakebox.StatusRunning) {
-			if werr := d.CLI.WaitRunning(ctx, profile, sandboxID, d.waitTimeout(), d.pollInterval(), d.Sleep); werr != nil {
+	}
+
+	// Persist the mapping BEFORE provisioning: a mapping that cannot be
+	// written means every future redeploy leaks a sandbox, so fail fast
+	// (the teardown wrapper below cleans up a freshly created sandbox on
+	// provisioning failure, and a torn-down id left in the state file is
+	// self-healing — the next deploy's status probe rejects it).
+	if d.State != nil {
+		if rerr := d.State.Record(stateKey, state.Entry{SandboxID: sandboxID, Profile: profile}); rerr != nil {
+			if freshlyCreated {
 				d.teardown(profile, sandboxID, freshlyCreated)
-				return "", d.wrap(sandboxID, version, fmt.Errorf("waiting for freshly created sandbox to reach Running: %w", werr))
 			}
+			return "", d.wrap(sandboxID, version, fmt.Errorf("persist sandbox mapping (required to reuse this sandbox on redeploy): %w", rerr))
 		}
-	case 1:
-		sandboxID = matches[0].ID
-		if !strings.EqualFold(matches[0].Status, lakebox.StatusRunning) {
-			if serr := d.CLI.SandboxStart(ctx, profile, sandboxID); serr != nil {
-				return "", d.wrap(sandboxID, version, fmt.Errorf("sandbox start: %w", serr))
-			}
-			if werr := d.CLI.WaitRunning(ctx, profile, sandboxID, d.waitTimeout(), d.pollInterval(), d.Sleep); werr != nil {
-				return "", d.wrap(sandboxID, version, fmt.Errorf("waiting for reused sandbox to reach Running: %w", werr))
-			}
-		}
-	default:
-		ids := make([]string, len(matches))
-		for i, m := range matches {
-			ids[i] = m.ID
-		}
-		return "", d.wrap("", version, fmt.Errorf(
-			"ambiguous identity: %d sandboxes match prefix %q (%s); refusing to guess — manually delete the stale sandbox(es) and redeploy",
-			len(matches), prefix, strings.Join(ids, ", "),
-		))
 	}
 
 	// Steps 4-11: provisioning, wrapped by failure teardown. A
@@ -244,6 +256,68 @@ func (d *Deployer) deploy(req *payload.DeployRequest) (string, error) {
 	}
 
 	return sandboxID, nil
+}
+
+// matchOrCreate is the legacy step-3 path when the state file has no
+// usable mapping: match on the npub-derived name prefix (kept for
+// sandboxes created before the naming regression and for services that
+// persist names again), else create fresh.
+func (d *Deployer) matchOrCreate(ctx context.Context, profile, prefix, npub, agentName string) (string, bool, error) {
+	sandboxes, _, err := d.CLI.SandboxList(ctx, profile)
+	if err != nil {
+		return "", false, fmt.Errorf("sandbox list: %w", err)
+	}
+
+	var matches []lakebox.Sandbox
+	for _, sb := range sandboxes {
+		if strings.HasPrefix(sb.Name, prefix) {
+			matches = append(matches, sb)
+		}
+	}
+
+	var sandboxID string
+	var freshlyCreated bool
+
+	switch len(matches) {
+	case 0:
+		name, nerr := identity.SandboxName(npub, agentName)
+		if nerr != nil {
+			return "", false, nerr
+		}
+		sb, cerr := d.CLI.SandboxCreate(ctx, profile, name)
+		if cerr != nil {
+			return "", false, fmt.Errorf("sandbox create: %w", cerr)
+		}
+		sandboxID = sb.ID
+		freshlyCreated = true
+		if !strings.EqualFold(sb.Status, lakebox.StatusRunning) {
+			if werr := d.CLI.WaitRunning(ctx, profile, sandboxID, d.waitTimeout(), d.pollInterval(), d.Sleep); werr != nil {
+				d.teardown(profile, sandboxID, freshlyCreated)
+				return "", false, fmt.Errorf("waiting for freshly created sandbox to reach Running: %w", werr)
+			}
+		}
+	case 1:
+		sandboxID = matches[0].ID
+		if !strings.EqualFold(matches[0].Status, lakebox.StatusRunning) {
+			if serr := d.CLI.SandboxStart(ctx, profile, sandboxID); serr != nil {
+				return sandboxID, false, fmt.Errorf("sandbox start: %w", serr)
+			}
+			if werr := d.CLI.WaitRunning(ctx, profile, sandboxID, d.waitTimeout(), d.pollInterval(), d.Sleep); werr != nil {
+				return sandboxID, false, fmt.Errorf("waiting for reused sandbox to reach Running: %w", werr)
+			}
+		}
+	default:
+		ids := make([]string, len(matches))
+		for i, m := range matches {
+			ids[i] = m.ID
+		}
+		return "", false, fmt.Errorf(
+			"ambiguous identity: %d sandboxes match prefix %q (%s); refusing to guess — manually delete the stale sandbox(es) and redeploy",
+			len(matches), prefix, strings.Join(ids, ", "),
+		)
+	}
+
+	return sandboxID, freshlyCreated, nil
 }
 
 func (d *Deployer) deployTimeoutOrDefault() time.Duration {
