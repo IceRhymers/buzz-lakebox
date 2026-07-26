@@ -120,3 +120,50 @@ func TestSecretsFromPayload_EmptyFieldsSkipped(t *testing.T) {
 		t.Fatalf("expected no secrets from an empty agent, got %v", secrets)
 	}
 }
+
+func TestLog_ScrubsCredentialShapedAssignments(t *testing.T) {
+	in := strings.Join([]string{
+		"export DATABRICKS_TOKEN=dapi123456789abcdef",
+		"BUZZ_AUTH_TAG: tag-value-here",
+		`OPENAI_API_KEY="sk-proj-abcdefghijklmnop"`,
+		"password=hunter2",
+		"BUZZ_PRIVATE_KEY=nsec1qqqqqqqqqqqqqqqqqqqq",
+	}, "\n")
+
+	got := Log(in)
+	for _, leaked := range []string{"dapi123456789abcdef", "tag-value-here", "sk-proj-abcdefghijklmnop", "hunter2", "nsec1qqqqqqqqqqqqqqqqqqqq"} {
+		if strings.Contains(got, leaked) {
+			t.Fatalf("Log() left %q in the output: %s", leaked, got)
+		}
+	}
+	// The variable NAMES must survive — an operator debugging a missing
+	// env var needs to see which one was set.
+	for _, keep := range []string{"DATABRICKS_TOKEN", "BUZZ_AUTH_TAG", "OPENAI_API_KEY", "BUZZ_PRIVATE_KEY"} {
+		if !strings.Contains(got, keep) {
+			t.Fatalf("Log() removed the variable name %q: %s", keep, got)
+		}
+	}
+}
+
+// buzz-acp's startup line carries the agent's PUBLIC key and the relay
+// URL — the two most useful diagnostics in the log. Neither is a secret
+// and both must survive scrubbing.
+func TestLog_KeepsDiagnosticNonSecrets(t *testing.T) {
+	in := "buzz-acp starting: relay=wss://relay.example.com pubkey=abc123def456\nagent_pool_ready agents=2\n"
+	if got := Log(in); got != in {
+		t.Fatalf("Log() must not touch diagnostic output:\n got: %q\nwant: %q", got, in)
+	}
+}
+
+func TestLog_ScrubsBareNsecWithoutAnAssignment(t *testing.T) {
+	got := Log("panic: key nsec1abcdefghijklmnop was rejected")
+	if strings.Contains(got, "nsec1abcdefghijklmnop") {
+		t.Fatalf("Log() left a bare nsec in the output: %s", got)
+	}
+}
+
+func TestLog_EmptyInput(t *testing.T) {
+	if got := Log(""); got != "" {
+		t.Fatalf("Log(\"\") = %q", got)
+	}
+}
