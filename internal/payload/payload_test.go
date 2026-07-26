@@ -1,0 +1,167 @@
+package payload
+
+import (
+	"strings"
+	"testing"
+)
+
+const validDeployJSON = `{
+  "op": "deploy",
+  "request_id": "11111111-1111-1111-1111-111111111111",
+  "agent": {
+    "name": "Reviewer",
+    "relay_url": "wss://relay.example.com",
+    "private_key_nsec": "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5",
+    "auth_tag": "tag-abc",
+    "agent_command": "buzz-agent",
+    "agent_args": ["--flag"],
+    "system_prompt": "You are a reviewer.",
+    "model": "databricks-claude-opus-4-8",
+    "provider": "databricks_v2",
+    "turn_timeout_seconds": 120,
+    "idle_timeout_seconds": 900,
+    "max_turn_duration_seconds": 7200,
+    "parallelism": 1,
+    "respond_to": "owner-only",
+    "respond_to_allowlist": ["npub1abc"],
+    "env_vars": {"FOO": "bar"}
+  },
+  "provider_config": {
+    "profile": "tanner-west",
+    "idle_timeout": "1h",
+    "keep_workspace_pat": false,
+    "buzz_version": "0.4.24"
+  }
+}`
+
+func TestParseDeployRequest_GoldenValid(t *testing.T) {
+	req, err := ParseDeployRequest([]byte(validDeployJSON))
+	if err != nil {
+		t.Fatalf("ParseDeployRequest error: %v", err)
+	}
+	if req.Op != "deploy" {
+		t.Fatalf("Op = %q, want deploy", req.Op)
+	}
+	if req.Agent.Name != "Reviewer" {
+		t.Fatalf("Agent.Name = %q", req.Agent.Name)
+	}
+	if req.Agent.Model == nil || *req.Agent.Model != "databricks-claude-opus-4-8" {
+		t.Fatalf("Agent.Model = %v", req.Agent.Model)
+	}
+	if req.Agent.Provider == nil || *req.Agent.Provider != "databricks_v2" {
+		t.Fatalf("Agent.Provider = %v", req.Agent.Provider)
+	}
+	if req.ProviderConfig.Profile != "tanner-west" {
+		t.Fatalf("ProviderConfig.Profile = %q", req.ProviderConfig.Profile)
+	}
+	if err := req.Validate(); err != nil {
+		t.Fatalf("Validate() error on golden valid payload: %v", err)
+	}
+}
+
+func TestParseDeployRequest_NullableFieldsAcceptNull(t *testing.T) {
+	body := `{"op":"deploy","agent":{"name":"a","relay_url":"wss://r","private_key_nsec":"nsec1x","auth_tag":"t","agent_command":"buzz-agent","model":null,"provider":null}}`
+	req, err := ParseDeployRequest([]byte(body))
+	if err != nil {
+		t.Fatalf("ParseDeployRequest error: %v", err)
+	}
+	if req.Agent.Model != nil {
+		t.Fatalf("Agent.Model = %v, want nil", req.Agent.Model)
+	}
+	if req.Agent.Provider != nil {
+		t.Fatalf("Agent.Provider = %v, want nil", req.Agent.Provider)
+	}
+}
+
+func TestParseDeployRequest_TolerantOfUnknownFields(t *testing.T) {
+	body := `{
+	  "op":"deploy",
+	  "totally_new_top_level_field": 42,
+	  "agent":{
+	    "name":"a","relay_url":"wss://r","private_key_nsec":"nsec1x","auth_tag":"t",
+	    "agent_command":"buzz-agent",
+	    "some_future_agent_field": {"nested": true}
+	  },
+	  "provider_config": {"some_future_config_field": "x"}
+	}`
+	req, err := ParseDeployRequest([]byte(body))
+	if err != nil {
+		t.Fatalf("ParseDeployRequest should tolerate unknown fields, got error: %v", err)
+	}
+	if err := req.Validate(); err != nil {
+		t.Fatalf("Validate() error: %v", err)
+	}
+}
+
+func TestParseDeployRequest_MalformedJSON(t *testing.T) {
+	cases := []string{
+		``,
+		`{`,
+		`not json`,
+		`{"op": "deploy", "agent": "should be an object"}`,
+	}
+	for _, body := range cases {
+		if _, err := ParseDeployRequest([]byte(body)); err == nil {
+			t.Fatalf("ParseDeployRequest(%q) should have failed", body)
+		}
+	}
+}
+
+func TestValidate_MissingSecrets(t *testing.T) {
+	cases := []struct {
+		name string
+		json string
+	}{
+		{
+			"missing private_key_nsec",
+			`{"agent":{"relay_url":"wss://r","auth_tag":"t","agent_command":"buzz-agent"}}`,
+		},
+		{
+			"empty private_key_nsec",
+			`{"agent":{"relay_url":"wss://r","private_key_nsec":"","auth_tag":"t","agent_command":"buzz-agent"}}`,
+		},
+		{
+			"missing relay_url",
+			`{"agent":{"private_key_nsec":"nsec1x","auth_tag":"t","agent_command":"buzz-agent"}}`,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			req, err := ParseDeployRequest([]byte(c.json))
+			if err != nil {
+				t.Fatalf("ParseDeployRequest error: %v", err)
+			}
+			if err := req.Validate(); err == nil {
+				t.Fatalf("Validate() should have failed for %s", c.name)
+			}
+		})
+	}
+}
+
+func TestValidate_UnsupportedRuntimeRejected(t *testing.T) {
+	for _, runtime := range []string{"goose", "claude", "codex", "python foo.py", ""} {
+		body := `{"agent":{"relay_url":"wss://r","private_key_nsec":"nsec1x","auth_tag":"t","agent_command":"` + runtime + `"}}`
+		req, err := ParseDeployRequest([]byte(body))
+		if err != nil {
+			t.Fatalf("ParseDeployRequest error: %v", err)
+		}
+		err = req.Validate()
+		if err == nil {
+			t.Fatalf("Validate() should reject agent_command %q", runtime)
+		}
+		if !strings.Contains(err.Error(), "v0.1") {
+			t.Fatalf("error for agent_command %q should point at v0.1 roadmap, got: %v", runtime, err)
+		}
+	}
+}
+
+func TestValidate_SupportedRuntimeAccepted(t *testing.T) {
+	body := `{"agent":{"relay_url":"wss://r","private_key_nsec":"nsec1x","auth_tag":"t","agent_command":"buzz-agent"}}`
+	req, err := ParseDeployRequest([]byte(body))
+	if err != nil {
+		t.Fatalf("ParseDeployRequest error: %v", err)
+	}
+	if err := req.Validate(); err != nil {
+		t.Fatalf("Validate() should accept buzz-agent, got: %v", err)
+	}
+}

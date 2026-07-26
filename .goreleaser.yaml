@@ -1,0 +1,34 @@
+version: 2
+
+project_name: buzz-backend-databricks-lakebox
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: buzz-backend-databricks-lakebox
+    main: ./cmd/buzz-backend-databricks-lakebox
+    binary: buzz-backend-databricks-lakebox
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X github.com/IceRhymers/buzz-lakebox/internal/version.Version={{ .Version }}
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  disable: true

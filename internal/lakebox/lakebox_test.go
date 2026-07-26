@@ -1,0 +1,727 @@
+package lakebox
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestParseVersion(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"Databricks CLI v1.8.0\n", "1.8.0"},
+		{"1.9.2", "1.9.2"},
+		{"databricks version 2.0.10 (build abc)", "2.0.10"},
+	}
+	for _, c := range cases {
+		got, err := parseVersion(c.in)
+		if err != nil {
+			t.Fatalf("parseVersion(%q) error: %v", c.in, err)
+		}
+		if got != c.want {
+			t.Fatalf("parseVersion(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestParseVersion_NoVersionFound(t *testing.T) {
+	if _, err := parseVersion("no version here"); err == nil {
+		t.Fatal("expected error for input with no semver")
+	}
+}
+
+func TestCompareSemver(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want int
+	}{
+		{"1.8.0", "1.8.0", 0},
+		{"1.9.0", "1.8.0", 1},
+		{"1.7.9", "1.8.0", -1},
+		{"2.0.0", "1.99.99", 1},
+		{"1.8.1", "1.8.0", 1},
+	}
+	for _, c := range cases {
+		got, err := CompareSemver(c.a, c.b)
+		if err != nil {
+			t.Fatalf("CompareSemver(%q, %q) error: %v", c.a, c.b, err)
+		}
+		if got != c.want {
+			t.Fatalf("CompareSemver(%q, %q) = %d, want %d", c.a, c.b, got, c.want)
+		}
+	}
+}
+
+func TestMeetsMinVersion(t *testing.T) {
+	cases := []struct {
+		v    string
+		want bool
+	}{
+		{"1.8.0", true},
+		{"1.9.0", true},
+		{"2.0.0", true},
+		{"1.7.9", false},
+		{"0.9.9", false},
+	}
+	for _, c := range cases {
+		got, err := MeetsMinVersion(c.v)
+		if err != nil {
+			t.Fatalf("MeetsMinVersion(%q) error: %v", c.v, err)
+		}
+		if got != c.want {
+			t.Fatalf("MeetsMinVersion(%q) = %v, want %v", c.v, got, c.want)
+		}
+	}
+}
+
+// writeFakeDatabricks writes an executable shell script named "databricks"
+// into dir that fakes `version`/`current-user me`/`sandbox list` per the
+// FAKE_* environment variables the test sets (PLAN.md §7: exercise the CLI
+// wrapper against a fake PATH shim, not a real installation).
+func writeFakeDatabricks(t *testing.T, dir string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake databricks shim is a POSIX shell script")
+	}
+	script := `#!/bin/sh
+case "$1" in
+  version)
+    echo "Databricks CLI v${FAKE_VERSION:-1.9.0}"
+    exit 0
+    ;;
+  current-user)
+    exit "${FAKE_CURRENT_USER_EXIT:-0}"
+    ;;
+  sandbox)
+    if [ "$2" = "list" ]; then
+      if [ "${FAKE_SANDBOX_LIST_EXIT:-0}" != "0" ]; then
+        echo "Error: sandbox not enabled for this workspace region (403)" >&2
+      else
+        echo '[]'
+      fi
+      exit "${FAKE_SANDBOX_LIST_EXIT:-0}"
+    fi
+    exit 1
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+`
+	path := filepath.Join(dir, "databricks")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake databricks: %v", err)
+	}
+	return path
+}
+
+// TestResolveDefaultBin_PathWins: when plain PATH lookup succeeds, the
+// bare default name is kept (no fallback probing, no absolutization).
+func TestResolveDefaultBin_PathWins(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricks(t, dir)
+	t.Setenv("PATH", dir)
+
+	if got := resolveDefaultBin([]string{t.TempDir()}); got != defaultBin {
+		t.Fatalf("resolveDefaultBin = %q, want bare %q when PATH resolves", got, defaultBin)
+	}
+}
+
+// TestResolveDefaultBin_FallbackDir: with a launchd-style PATH that lacks
+// the CLI, the first executable hit among the fallback dirs is returned as
+// an absolute path — the GUI-launched-desktop preflight fix.
+func TestResolveDefaultBin_FallbackDir(t *testing.T) {
+	empty := t.TempDir()
+	t.Setenv("PATH", empty)
+
+	fallback := t.TempDir()
+	want := writeFakeDatabricks(t, fallback)
+
+	if got := resolveDefaultBin([]string{t.TempDir(), fallback}); got != want {
+		t.Fatalf("resolveDefaultBin = %q, want fallback hit %q", got, want)
+	}
+}
+
+// TestResolveDefaultBin_NothingResolves: the bare default name is kept so
+// downstream errors preserve the familiar not-found-in-$PATH shape.
+func TestResolveDefaultBin_NothingResolves(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+
+	if got := resolveDefaultBin([]string{t.TempDir()}); got != defaultBin {
+		t.Fatalf("resolveDefaultBin = %q, want bare %q when nothing resolves", got, defaultBin)
+	}
+}
+
+// TestBinName_ExplicitOverrideSkipsFallback: a non-default Bin (the test
+// shim pattern) is used verbatim, never fallback-resolved.
+func TestBinName_ExplicitOverrideSkipsFallback(t *testing.T) {
+	shim := filepath.Join(t.TempDir(), "databricks")
+	cli := &CLI{Bin: shim}
+	if got := cli.binName(); got != shim {
+		t.Fatalf("binName = %q, want explicit override %q", got, shim)
+	}
+}
+
+func TestCLI_Version_AgainstFakeShim(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricks(t, dir)
+	t.Setenv("FAKE_VERSION", "1.8.0")
+
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+	v, err := cli.Version(context.Background())
+	if err != nil {
+		t.Fatalf("Version() error: %v", err)
+	}
+	if v != "1.8.0" {
+		t.Fatalf("Version() = %q, want %q", v, "1.8.0")
+	}
+}
+
+func TestCLI_LookPath_MissingBinary(t *testing.T) {
+	cli := &CLI{Bin: filepath.Join(t.TempDir(), "databricks-does-not-exist")}
+	if _, err := cli.LookPath(); err == nil {
+		t.Fatal("expected LookPath to fail for a nonexistent binary")
+	}
+}
+
+func TestCLI_CurrentUser_AgainstFakeShim(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricks(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+
+	t.Run("success", func(t *testing.T) {
+		t.Setenv("FAKE_CURRENT_USER_EXIT", "0")
+		if _, err := cli.CurrentUser(context.Background(), "DEFAULT"); err != nil {
+			t.Fatalf("CurrentUser() error: %v", err)
+		}
+	})
+
+	t.Run("failure", func(t *testing.T) {
+		t.Setenv("FAKE_CURRENT_USER_EXIT", "1")
+		if _, err := cli.CurrentUser(context.Background(), "DEFAULT"); err == nil {
+			t.Fatal("expected CurrentUser to fail")
+		}
+	})
+}
+
+func TestCLI_SandboxList_AgainstFakeShim(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricks(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+
+	t.Run("success", func(t *testing.T) {
+		t.Setenv("FAKE_SANDBOX_LIST_EXIT", "0")
+		sbs, _, err := cli.SandboxList(context.Background(), "DEFAULT")
+		if err != nil {
+			t.Fatalf("SandboxList() error: %v", err)
+		}
+		if len(sbs) != 0 {
+			t.Fatalf("SandboxList() = %+v, want empty", sbs)
+		}
+	})
+
+	t.Run("failure", func(t *testing.T) {
+		t.Setenv("FAKE_SANDBOX_LIST_EXIT", "1")
+		if _, _, err := cli.SandboxList(context.Background(), "DEFAULT"); err == nil {
+			t.Fatal("expected SandboxList to fail")
+		}
+	})
+}
+
+// writeFakeDatabricksFull is a richer shim covering the M1 sandbox
+// lifecycle methods (create/list/status/start/delete/config), controlled
+// via FAKE_* env vars, mirroring writeFakeDatabricks's pattern.
+func writeFakeDatabricksFull(t *testing.T, dir string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake databricks shim is a POSIX shell script")
+	}
+	script := `#!/bin/sh
+case "$1" in
+  version)
+    echo "Databricks CLI v${FAKE_VERSION:-1.9.0}"
+    exit 0
+    ;;
+  sandbox)
+    case "$2" in
+      register)
+        if [ -n "${FAKE_REGISTER_OUT:-}" ]; then
+          echo "$FAKE_REGISTER_OUT"
+        fi
+        exit "${FAKE_REGISTER_EXIT:-0}"
+        ;;
+      ssh-key)
+        if [ "$3" = "list" ]; then
+          printf '%s\n' "${FAKE_SSHKEY_LIST_OUT:-No SSH keys registered. Run 'databricks sandbox register' to add one.}"
+          exit "${FAKE_SSHKEY_LIST_EXIT:-0}"
+        fi
+        exit 1
+        ;;
+      create)
+        name="$3"
+        if [ -n "${FAKE_STDERR_ADVISORY:-}" ]; then
+          echo "$FAKE_STDERR_ADVISORY" >&2
+        fi
+        if [ "${FAKE_CREATE_EXIT:-0}" != "0" ]; then
+          echo "create failed" >&2
+          exit "${FAKE_CREATE_EXIT}"
+        fi
+        printf '{"sandboxId":"%s","name":"%s","status":"%s"}' "${FAKE_CREATE_ID:-sandbox-1}" "$name" "${FAKE_CREATE_STATUS:-Running}"
+        exit 0
+        ;;
+      list)
+        if [ -n "${FAKE_STDERR_ADVISORY:-}" ]; then
+          echo "$FAKE_STDERR_ADVISORY" >&2
+        fi
+        if [ "${FAKE_LIST_EXIT:-0}" != "0" ]; then
+          echo "list failed" >&2
+          exit "${FAKE_LIST_EXIT}"
+        fi
+        printf '%s' "${FAKE_LIST_JSON:-[]}"
+        exit 0
+        ;;
+      status)
+        id="$3"
+        if [ -n "${FAKE_STDERR_ADVISORY:-}" ]; then
+          echo "$FAKE_STDERR_ADVISORY" >&2
+        fi
+        if [ "${FAKE_STATUS_EXIT:-0}" != "0" ]; then
+          echo "status failed" >&2
+          exit "${FAKE_STATUS_EXIT}"
+        fi
+        printf '{"sandboxId":"%s","name":"fake","status":"%s"}' "$id" "${FAKE_STATUS_STATUS:-Running}"
+        exit 0
+        ;;
+      start)
+        exit "${FAKE_START_EXIT:-0}"
+        ;;
+      delete)
+        echo "$3" >> "${FAKE_DELETE_LOG:-/dev/null}"
+        exit "${FAKE_DELETE_EXIT:-0}"
+        ;;
+      config)
+        shift 2
+        echo "$*" >> "${FAKE_CONFIG_LOG:-/dev/null}"
+        exit "${FAKE_CONFIG_EXIT:-0}"
+        ;;
+      *)
+        exit 1
+        ;;
+    esac
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+`
+	path := filepath.Join(dir, "databricks")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake databricks: %v", err)
+	}
+	return path
+}
+
+func TestCLI_SandboxRegister(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+
+	t.Setenv("FAKE_REGISTER_EXIT", "0")
+	if err := cli.SandboxRegister(context.Background(), "DEFAULT"); err != nil {
+		t.Fatalf("SandboxRegister() error: %v", err)
+	}
+}
+
+// fakeSSHKeyListWithLocalRow is a live-captured `sandbox ssh-key list`
+// output shape (CLI 1.8.0) where the `*` marker row proves this
+// machine's key is registered with the target workspace.
+const fakeSSHKeyListWithLocalRow = `
+    NAME          KEY HASH                          CREATED               LAST USED
+    ──────────────────────────────────────────────────────────────────────────────────────────
+  * FX7QY7K39J    1dc2bafb16acb3e407a95673944433c0  2026-07-24 21:14      2026-07-24 22:31
+
+  * key matches the one on this machine`
+
+// TestCLI_SandboxRegister_FailureToleratedWhenKeyVerified: a register
+// failure is tolerated ONLY when ssh-key list shows the CLI's
+// this-machine marker row — the verified-recoverable case.
+func TestCLI_SandboxRegister_FailureToleratedWhenKeyVerified(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+
+	t.Setenv("FAKE_REGISTER_EXIT", "1")
+	t.Setenv("FAKE_REGISTER_OUT", "Error: failed to register key: already registered")
+	t.Setenv("FAKE_SSHKEY_LIST_OUT", fakeSSHKeyListWithLocalRow)
+	if err := cli.SandboxRegister(context.Background(), "DEFAULT"); err != nil {
+		t.Fatalf("SandboxRegister() should tolerate failure with verified local key, got: %v", err)
+	}
+}
+
+// TestCLI_SandboxRegister_AnotherUserIsFatal pins the live-bitten bug:
+// "already registered to another user" contains the substring the old
+// blanket tolerance matched, but the key is NOT usable on this
+// workspace (list shows no marker row) — preflight must fail, with the
+// remedy in the message.
+func TestCLI_SandboxRegister_AnotherUserIsFatal(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+
+	t.Setenv("FAKE_REGISTER_EXIT", "1")
+	t.Setenv("FAKE_REGISTER_OUT", "Error: failed to register key: this SSH key is already registered to another user")
+	// Default FAKE_SSHKEY_LIST_OUT: "No SSH keys registered." — no marker row.
+	err := cli.SandboxRegister(context.Background(), "DEFAULT")
+	if err == nil {
+		t.Fatal("SandboxRegister() must fail when the key is bound to another user and absent from this workspace")
+	}
+	if !strings.Contains(err.Error(), "another user") || !strings.Contains(err.Error(), "ssh-key list/delete") {
+		t.Fatalf("error should carry the shared-gateway remedy, got: %v", err)
+	}
+}
+
+// TestCLI_SandboxRegister_LegendAloneDoesNotVerify: the legend line
+// ("* key matches the one on this machine") must not satisfy the marker
+// pattern without an actual `*`-marked data row carrying a key hash.
+func TestCLI_SandboxRegister_LegendAloneDoesNotVerify(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+
+	t.Setenv("FAKE_REGISTER_EXIT", "1")
+	t.Setenv("FAKE_REGISTER_OUT", "Error: failed to register key: already registered")
+	t.Setenv("FAKE_SSHKEY_LIST_OUT", "  * key matches the one on this machine")
+	if err := cli.SandboxRegister(context.Background(), "DEFAULT"); err == nil {
+		t.Fatal("SandboxRegister() must not treat the legend line alone as verification")
+	}
+}
+
+// TestCLI_SandboxRegister_ListFailureKeepsRegisterError: when the
+// verification list itself fails, the original register error (not the
+// list error) surfaces.
+func TestCLI_SandboxRegister_ListFailureKeepsRegisterError(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+
+	t.Setenv("FAKE_REGISTER_EXIT", "1")
+	t.Setenv("FAKE_REGISTER_OUT", "Error: register exploded")
+	t.Setenv("FAKE_SSHKEY_LIST_EXIT", "1")
+	err := cli.SandboxRegister(context.Background(), "DEFAULT")
+	if err == nil {
+		t.Fatal("SandboxRegister() must fail when register fails and verification is unavailable")
+	}
+	if !strings.Contains(err.Error(), "register exploded") {
+		t.Fatalf("error should carry the register failure, got: %v", err)
+	}
+}
+
+func TestCLI_SandboxCreate(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+
+	t.Setenv("FAKE_CREATE_ID", "sandbox-abc")
+	sb, err := cli.SandboxCreate(context.Background(), "DEFAULT", "buzz-npub12-agent")
+	if err != nil {
+		t.Fatalf("SandboxCreate() error: %v", err)
+	}
+	if sb.ID != "sandbox-abc" || sb.Name != "buzz-npub12-agent" || sb.Status != "Running" {
+		t.Fatalf("SandboxCreate() = %+v", sb)
+	}
+}
+
+// TestCLI_SandboxCreate_Failure_NoVersionStamp pins the round-2 stamping
+// boundary: lakebox.wrapErr must NOT stamp the CLI version onto its
+// errors — internal/deployflow.wrap is the single stamper of both the
+// sandbox id and CLI version annotations, so a lakebox-level stamp here
+// would duplicate it in every deploy-path error.
+func TestCLI_SandboxCreate_Failure_NoVersionStamp(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+	t.Setenv("FAKE_VERSION", "1.8.0")
+	t.Setenv("FAKE_CREATE_EXIT", "1")
+
+	_, err := cli.SandboxCreate(context.Background(), "DEFAULT", "buzz-x")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if strings.Contains(err.Error(), "databricks cli") {
+		t.Fatalf("error %q must not carry a lakebox-level CLI version stamp (deployflow.wrap is the single stamper)", err.Error())
+	}
+	if !strings.Contains(err.Error(), "sandbox create") {
+		t.Fatalf("error %q should still name the failing action", err.Error())
+	}
+}
+
+func TestCLI_SandboxList_ParsesJSONArray(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+	t.Setenv("FAKE_LIST_JSON", `[{"sandboxId":"a","name":"buzz-1-x","status":"Running"},{"sandboxId":"b","name":"buzz-2-y","status":"Stopped"}]`)
+
+	sbs, _, err := cli.SandboxList(context.Background(), "DEFAULT")
+	if err != nil {
+		t.Fatalf("SandboxList() error: %v", err)
+	}
+	if len(sbs) != 2 || sbs[0].ID != "a" || sbs[1].Status != "Stopped" {
+		t.Fatalf("SandboxList() = %+v", sbs)
+	}
+}
+
+func TestCLI_SandboxStatus(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+	t.Setenv("FAKE_STATUS_STATUS", "Stopped")
+
+	sb, err := cli.SandboxStatus(context.Background(), "DEFAULT", "sandbox-1")
+	if err != nil {
+		t.Fatalf("SandboxStatus() error: %v", err)
+	}
+	if sb.Status != "Stopped" {
+		t.Fatalf("SandboxStatus() = %+v", sb)
+	}
+}
+
+func TestCLI_SandboxStart(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+
+	if err := cli.SandboxStart(context.Background(), "DEFAULT", "sandbox-1"); err != nil {
+		t.Fatalf("SandboxStart() error: %v", err)
+	}
+}
+
+func TestCLI_WaitRunning_SucceedsImmediately(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+	t.Setenv("FAKE_STATUS_STATUS", "Running")
+
+	slept := false
+	err := cli.WaitRunning(context.Background(), "DEFAULT", "sandbox-1", 5*time.Second, time.Millisecond, func(time.Duration) { slept = true })
+	if err != nil {
+		t.Fatalf("WaitRunning() error: %v", err)
+	}
+	if slept {
+		t.Fatal("WaitRunning() should not have slept when already Running")
+	}
+}
+
+func TestCLI_WaitRunning_TimesOut(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+	t.Setenv("FAKE_STATUS_STATUS", "Stopping")
+
+	sleepCount := 0
+	// pollInterval is irrelevant here since sleep is mocked to a no-op
+	// counter instead of a real wait; the deadline is reached purely by
+	// real subprocess-spawn wall time across repeated status polls.
+	err := cli.WaitRunning(context.Background(), "DEFAULT", "sandbox-1", 400*time.Millisecond, time.Millisecond, func(time.Duration) { sleepCount++ })
+	if err == nil {
+		t.Fatal("expected WaitRunning to time out")
+	}
+	if sleepCount == 0 {
+		t.Fatal("expected WaitRunning to have polled at least once before timing out")
+	}
+}
+
+func TestCLI_SandboxDelete(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+
+	if err := cli.SandboxDelete(context.Background(), "DEFAULT", "sandbox-1"); err != nil {
+		t.Fatalf("SandboxDelete() error: %v", err)
+	}
+}
+
+func TestCLI_SandboxConfig(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+	logFile := filepath.Join(dir, "config.log")
+	t.Setenv("FAKE_CONFIG_LOG", logFile)
+
+	t.Run("no-autostop", func(t *testing.T) {
+		if err := cli.SandboxConfig(context.Background(), "DEFAULT", "sandbox-1", SandboxConfigOptions{NoAutostop: true}); err != nil {
+			t.Fatalf("SandboxConfig() error: %v", err)
+		}
+		data, _ := os.ReadFile(logFile)
+		if !strings.Contains(string(data), "--no-autostop") {
+			t.Fatalf("config log %q missing --no-autostop", data)
+		}
+	})
+
+	t.Run("idle-timeout", func(t *testing.T) {
+		_ = os.Remove(logFile)
+		if err := cli.SandboxConfig(context.Background(), "DEFAULT", "sandbox-1", SandboxConfigOptions{IdleTimeout: "1h"}); err != nil {
+			t.Fatalf("SandboxConfig() error: %v", err)
+		}
+		data, _ := os.ReadFile(logFile)
+		if !strings.Contains(string(data), "--idle-timeout 1h") {
+			t.Fatalf("config log %q missing --idle-timeout 1h", data)
+		}
+	})
+
+	t.Run("neither-set-errors", func(t *testing.T) {
+		if err := cli.SandboxConfig(context.Background(), "DEFAULT", "sandbox-1", SandboxConfigOptions{}); err == nil {
+			t.Fatal("expected error when neither NoAutostop nor IdleTimeout set")
+		}
+	})
+}
+
+// --- BUG 8: stderr advisory lines must not corrupt --json stdout parsing ---
+
+const stderrAdvisoryLine = "Databricks skills are not installed on this machine; some functionality may be limited."
+
+func TestCLI_SandboxCreate_ToleratesStderrAdvisory(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+	t.Setenv("FAKE_STDERR_ADVISORY", stderrAdvisoryLine)
+	t.Setenv("FAKE_CREATE_ID", "sandbox-advisory")
+
+	sb, err := cli.SandboxCreate(context.Background(), "DEFAULT", "buzz-x")
+	if err != nil {
+		t.Fatalf("SandboxCreate() error: %v", err)
+	}
+	if sb.ID != "sandbox-advisory" {
+		t.Fatalf("SandboxCreate() = %+v", sb)
+	}
+}
+
+func TestCLI_SandboxList_ToleratesStderrAdvisory(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+	t.Setenv("FAKE_STDERR_ADVISORY", stderrAdvisoryLine)
+	t.Setenv("FAKE_LIST_JSON", `[{"sandboxId":"a","name":"buzz-1-x","status":"Running"}]`)
+
+	sbs, _, err := cli.SandboxList(context.Background(), "DEFAULT")
+	if err != nil {
+		t.Fatalf("SandboxList() error: %v", err)
+	}
+	if len(sbs) != 1 || sbs[0].ID != "a" {
+		t.Fatalf("SandboxList() = %+v", sbs)
+	}
+}
+
+func TestCLI_SandboxStatus_ToleratesStderrAdvisory(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+	t.Setenv("FAKE_STDERR_ADVISORY", stderrAdvisoryLine)
+	t.Setenv("FAKE_STATUS_STATUS", "Running")
+
+	sb, err := cli.SandboxStatus(context.Background(), "DEFAULT", "sandbox-1")
+	if err != nil {
+		t.Fatalf("SandboxStatus() error: %v", err)
+	}
+	if sb.Status != "Running" {
+		t.Fatalf("SandboxStatus() = %+v", sb)
+	}
+}
+
+func TestCLI_SandboxList_NullJSON_ReturnsEmptySlice(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+	t.Setenv("FAKE_LIST_JSON", "null")
+
+	sbs, _, err := cli.SandboxList(context.Background(), "DEFAULT")
+	if err != nil {
+		t.Fatalf("SandboxList() error: %v", err)
+	}
+	if len(sbs) != 0 {
+		t.Fatalf("SandboxList() = %+v, want empty for a literal null stdout", sbs)
+	}
+}
+
+func TestCLI_CachedVersion_FetchesOnceAndCaches(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDatabricksFull(t, dir)
+	cli := &CLI{Bin: filepath.Join(dir, "databricks")}
+	t.Setenv("FAKE_VERSION", "1.9.5")
+
+	v1, err := cli.CachedVersion(context.Background())
+	if err != nil {
+		t.Fatalf("CachedVersion() error: %v", err)
+	}
+	if v1 != "1.9.5" {
+		t.Fatalf("CachedVersion() = %q, want 1.9.5", v1)
+	}
+
+	// Even if the environment changes afterward, the cached value must
+	// stick (sync.Once: fetch once, cache on the struct).
+	t.Setenv("FAKE_VERSION", "9.9.9")
+	v2, err := cli.CachedVersion(context.Background())
+	if err != nil {
+		t.Fatalf("CachedVersion() (2nd call) error: %v", err)
+	}
+	if v2 != "1.9.5" {
+		t.Fatalf("CachedVersion() (2nd call) = %q, want cached 1.9.5", v2)
+	}
+}
+
+func TestParseSandboxTable(t *testing.T) {
+	out := "ID           NAME              STATUS\n" +
+		"sandbox-a    buzz-abc-one      Running\n" +
+		"sandbox-b    buzz-abc-two      Stopped\n" +
+		"\n"
+	sbs, err := parseSandboxTable(out)
+	if err != nil {
+		t.Fatalf("parseSandboxTable() error: %v", err)
+	}
+	want := []Sandbox{
+		{ID: "sandbox-a", Name: "buzz-abc-one", Status: "Running"},
+		{ID: "sandbox-b", Name: "buzz-abc-two", Status: "Stopped"},
+	}
+	if len(sbs) != len(want) {
+		t.Fatalf("parseSandboxTable() = %+v, want %+v", sbs, want)
+	}
+	for i := range want {
+		if sbs[i] != want[i] {
+			t.Fatalf("parseSandboxTable()[%d] = %+v, want %+v", i, sbs[i], want[i])
+		}
+	}
+}
+
+func TestSandboxList_FallsBackToTableWhenJSONUnsupported(t *testing.T) {
+	dir := t.TempDir()
+	script := `#!/bin/sh
+if [ "$2" = "list" ]; then
+  if printf '%s\n' "$*" | grep -q -- '--json'; then
+    echo "Error: unknown flag: --json" >&2
+    exit 1
+  fi
+  echo "ID           NAME              STATUS"
+  echo "sandbox-x    buzz-xyz-agent    Running"
+  exit 0
+fi
+exit 1
+`
+	path := filepath.Join(dir, "databricks")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake databricks: %v", err)
+	}
+	cli := &CLI{Bin: path}
+
+	sbs, _, err := cli.SandboxList(context.Background(), "DEFAULT")
+	if err != nil {
+		t.Fatalf("SandboxList() error: %v", err)
+	}
+	if len(sbs) != 1 || sbs[0].ID != "sandbox-x" || sbs[0].Status != "Running" {
+		t.Fatalf("SandboxList() fallback = %+v", sbs)
+	}
+}
