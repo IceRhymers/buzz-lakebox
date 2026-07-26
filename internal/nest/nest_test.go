@@ -277,3 +277,28 @@ func evalEnvVar(t *testing.T, env, key string) string {
 	script := env + "\nprintf '%s' \"$" + key + "\"\n"
 	return runSh(t, script)
 }
+
+// TestRenderLaunchScript_LivenessGuardInvariants pins the two guard
+// properties whose absence is invisible in a golden diff but fatal in
+// production — both found by the executable proofs in
+// launch_exec_test.go.
+func TestRenderLaunchScript_LivenessGuardInvariants(t *testing.T) {
+	script := RenderLaunchScript(false)
+
+	// A zombie buzz-acp must not count as running (see AliveCheckSnippet).
+	if !strings.Contains(script, "buzz_acp_alive") {
+		t.Fatal("launch.sh must use the zombie-aware liveness check, not a bare pgrep")
+	}
+	if !strings.Contains(script, AliveCheckSnippet) {
+		t.Fatal("launch.sh must embed AliveCheckSnippet verbatim so the check cannot drift from status/verify")
+	}
+
+	// The launched agent must NOT inherit the lock fd, or a lingering
+	// worker keeps the flock held and every future start no-ops while
+	// the agent is dead.
+	for _, line := range strings.Split(script, "\n") {
+		if strings.Contains(line, "setsid nohup") && !strings.Contains(line, "9>&-") {
+			t.Fatalf("the detached launch must close the lock fd (9>&-), got: %q", line)
+		}
+	}
+}
