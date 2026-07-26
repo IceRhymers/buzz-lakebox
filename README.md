@@ -21,7 +21,7 @@ Buzz Desktop ──stdin JSON {op:"deploy",...}──> buzz-backend-databricks-l
 |---|---|
 | `deploy` | Reuse-or-create a sandbox → install pinned Buzz binaries into `$HOME` → write deploy-payload env (0600, via SSH stdin — never argv) → `setsid nohup buzz-acp` → verify → set autostop policy → return `{ok: true, agent_id: "<sandbox-id>"}`. Reuse is keyed by the provider's own state file (`~/.local/state/buzz-lakebox/agents.json`, npub→sandbox-id per profile): the desktop does not echo `backend_agent_id` back, and Lakebox does not persist caller-set sandbox names, so without this file every redeploy would orphan the previous sandbox |
 | `info` | Provider name/version/description |
-| start/status/logs/stop/undeploy | Not in Buzz's provider protocol yet ("v2"), so the desktop can't invoke them — but `start`, `status`, `logs`, and `stop` are implemented as operator CLI subcommands (see [Operating a deployed agent](#operating-a-deployed-agent)); `undeploy` remains an M2 stub (use `databricks sandbox delete`) |
+| start/status/logs/stop/undeploy | Not in Buzz's provider protocol yet ("v2"), so the desktop can't invoke them — all five are implemented as operator CLI subcommands instead (see [Operating a deployed agent](#operating-a-deployed-agent) and the [runbook](docs/RUNBOOK.md)) |
 
 Auth: the operator's existing `~/.databrickscfg` profile, selected via `provider_config.profile`. The Databricks Sandbox preview is region-gated (verified in us-west-2).
 
@@ -157,7 +157,10 @@ buzz-backend-databricks-lakebox status    # sandbox state + buzz-acp liveness + 
 buzz-backend-databricks-lakebox start     # THE recovery command: start the sandbox if stopped, rerun launch.sh, verify
 buzz-backend-databricks-lakebox logs      # tail acp.log (--tail-bytes to size)
 buzz-backend-databricks-lakebox stop      # stop compute (agent goes offline; $HOME persists — recover with start)
+buzz-backend-databricks-lakebox undeploy  # DESTRUCTIVE: shred in-sandbox secrets, delete the sandbox, drop the reuse mapping (--yes to skip the prompt)
 ```
+
+[`docs/RUNBOOK.md`](docs/RUNBOOK.md) is the full operator guide: triage table, `!shutdown`/`stop`/`undeploy` trade-offs, orphan cleanup, Beta-storage-loss playbook, and the error-code reference. Every failure this provider reports is shaped `[<code>] <what happened> — remedy: <what to do> (sandbox <id>, databricks cli <version>)`; match on the code.
 
 **When do you need `start`?** Whenever the sandbox stopped (manual stop, lifetime cap, or an opted-in idle timeout): all in-sandbox processes die with it and nothing relaunches buzz-acp automatically — and the desktop won't notice or redeploy on its own (its mention flow only redeploys agents whose record isn't "deployed"). Deploys default the sandbox to `--no-autostop` precisely because relay traffic doesn't count as sandbox activity, so any idle timeout kills healthy agents; pass `provider_config.idle_timeout` to opt back in, accepting `start`-based recovery.
 
@@ -182,4 +185,8 @@ Full research (buzz architecture, omnigent's Lakebox integration patterns, live 
 
 ## Status
 
-**M1 — working end-to-end** (live-verified 2026-07-25): deploy from Buzz Desktop → Databricks Sandbox provisioned → harness installed → agent online on the relay → owner mention answered via the workspace AI Gateway. Lifecycle ops (`status`/`logs`/`stop`/`start`/`undeploy`) remain M2 stubs; operate via the `databricks sandbox` CLI in the interim.
+**M1 — working end-to-end** (live-verified 2026-07-25): deploy from Buzz Desktop → Databricks Sandbox provisioned → harness installed → agent online on the relay → owner mention answered via the workspace AI Gateway.
+
+**M2 — complete**: `status`, `start`, `logs`, `stop`, and `undeploy` ship as operator CLI subcommands (the desktop still can't call them — Buzz's provider protocol has no v2 lifecycle ops).
+
+**M3 — hardening in place**: a failure taxonomy (stable code + remedy on every error), marker-secret fuzz across every deploy path plus credential-shaped scrubbing of any rendered log tail, executable double-launch/zombie/relaunch proofs against the real `launch.sh`, the `keep_workspace_pat` opt-out matrix, and [`docs/RUNBOOK.md`](docs/RUNBOOK.md). Live acceptance checks are listed in the runbook's §9.

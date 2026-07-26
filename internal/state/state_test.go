@@ -93,3 +93,70 @@ func TestLookup_CorruptFileIsAnError(t *testing.T) {
 		t.Fatal("corrupt state file must surface as an error, not silent not-found")
 	}
 }
+
+func TestForgetSandbox_RemovesOnlyTheMatchingEntry(t *testing.T) {
+	s := tempStore(t)
+	keep := Key("west", "npub1keep")
+	drop := Key("west", "npub1drop")
+	if err := s.Record(keep, Entry{SandboxID: "sandbox-keep", Profile: "west"}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	if err := s.Record(drop, Entry{SandboxID: "sandbox-drop", Profile: "west"}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+
+	removed, err := s.ForgetSandbox("west", "sandbox-drop")
+	if err != nil {
+		t.Fatalf("ForgetSandbox: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+	if _, ok, _ := s.Lookup(drop); ok {
+		t.Fatal("the deleted sandbox's mapping must be gone")
+	}
+	if _, ok, _ := s.Lookup(keep); !ok {
+		t.Fatal("ForgetSandbox must not touch other agents' mappings")
+	}
+}
+
+// The same agent identity may be deployed to two workspaces; undeploying
+// one must not forget the other.
+func TestForgetSandbox_ScopedByProfile(t *testing.T) {
+	s := tempStore(t)
+	west := Key("west", "npub1same")
+	east := Key("east", "npub1same")
+	if err := s.Record(west, Entry{SandboxID: "sandbox-shared-name", Profile: "west"}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	if err := s.Record(east, Entry{SandboxID: "sandbox-shared-name", Profile: "east"}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+
+	removed, err := s.ForgetSandbox("west", "sandbox-shared-name")
+	if err != nil {
+		t.Fatalf("ForgetSandbox: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+	if _, ok, _ := s.Lookup(east); !ok {
+		t.Fatal("the other profile's mapping must survive")
+	}
+}
+
+// Undeploy of a sandbox that was never mapped (or after the file was
+// deleted) must not fail — there is simply nothing to forget.
+func TestForgetSandbox_NoMatchIsNotAnError(t *testing.T) {
+	s := tempStore(t)
+	removed, err := s.ForgetSandbox("west", "sandbox-never-seen")
+	if err != nil {
+		t.Fatalf("ForgetSandbox on empty store: %v", err)
+	}
+	if removed != 0 {
+		t.Fatalf("removed = %d, want 0", removed)
+	}
+	if _, err := os.Stat(s.Path); !os.IsNotExist(err) {
+		t.Fatal("a no-op ForgetSandbox must not create the state file")
+	}
+}

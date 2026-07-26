@@ -149,6 +149,9 @@ case "$1" in
             printf '%s' "${FAKE_ACP_LOG:-}"
             exit 0
             ;;
+          undeploy-shred)
+            exit "${FAKE_SHRED_EXIT:-0}"
+            ;;
           start-launch)
             if [ "${FAKE_NO_LAUNCH_SH:-0}" = "1" ]; then
               echo "BUZZ_NO_LAUNCH_SH=1"

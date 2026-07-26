@@ -7,6 +7,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -73,7 +74,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newStopCmd(&profile))
 	root.AddCommand(newStartCmd(&profile))
 	root.AddCommand(newLogsCmd(&profile))
-	root.AddCommand(newNotImplementedCmd("undeploy", "M2"))
+	root.AddCommand(newUndeployCmd(&profile))
 
 	return root
 }
@@ -191,6 +192,74 @@ func newStopCmd(profile *string) *cobra.Command {
 	}
 }
 
+// newUndeployCmd is the one destructive subcommand: it shreds the
+// in-sandbox secrets and then deletes the sandbox permanently (its
+// $HOME, and with it any repos/OUTBOX the agent produced, is gone). It
+// therefore refuses to run unattended without --yes, and when a TTY is
+// attached it makes the operator type the sandbox id back.
+func newUndeployCmd(profile *string) *cobra.Command {
+	var assumeYes bool
+
+	cmd := &cobra.Command{
+		Use:   "undeploy [sandbox-id]",
+		Short: "Permanently delete the agent's sandbox (shreds secrets first) — destructive",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := resolveSandboxID(cmd.Context(), lakebox.New(), *profile, args)
+			if err != nil {
+				return err
+			}
+			if !assumeYes {
+				if err := confirmSandboxID(cmd, id); err != nil {
+					return err
+				}
+			}
+
+			res, err := newDeployer().Undeploy(*profile, id)
+			if err != nil {
+				return err
+			}
+			if !res.Shredded {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+					"note: the sandbox was not Running, so the in-sandbox secret shred was skipped; its storage was destroyed with the sandbox instead\n")
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "sandbox %s deleted (%d reuse mapping(s) dropped)\n", id, res.StateEntriesRemoved)
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&assumeYes, "yes", false, "skip the interactive confirmation (required when stdin is not a terminal)")
+	return cmd
+}
+
+// confirmSandboxID makes a destructive undeploy deliberate: the operator
+// must type the sandbox id back. Without a terminal there is nobody to
+// ask, so it fails pointing at --yes rather than silently proceeding.
+func confirmSandboxID(cmd *cobra.Command, id string) error {
+	in, ok := cmd.InOrStdin().(*os.File)
+	if !ok {
+		return fmt.Errorf("refusing to delete sandbox %s without confirmation: pass --yes", id)
+	}
+	info, err := in.Stat()
+	if err != nil || info.Mode()&os.ModeCharDevice == 0 {
+		return fmt.Errorf("refusing to delete sandbox %s without confirmation: stdin is not a terminal, pass --yes", id)
+	}
+
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+		"This permanently deletes sandbox %s and everything in its $HOME (repos, OUTBOX, logs).\nType the sandbox id to confirm: ", id)
+	reader := bufio.NewReader(in)
+	line, err := reader.ReadString('\n')
+	answer := strings.TrimSpace(line)
+	if answer == "" && err != nil {
+		// /dev/null and closed pipes look like character devices too, so
+		// this — not the Stat above — is what catches an unattended run.
+		return fmt.Errorf("refusing to delete sandbox %s: no confirmation could be read from stdin; rerun in a terminal, or pass --yes", id)
+	}
+	if answer != id {
+		return fmt.Errorf("confirmation did not match %q; nothing was deleted", id)
+	}
+	return nil
+}
+
 func newVersionCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "version",
@@ -289,18 +358,4 @@ func parseOperatorDeployPayload(data []byte) (*payload.DeployRequest, error) {
 func printDeployResult(cmd *cobra.Command, agentID string, err error) error {
 	_, ferr := fmt.Fprintln(cmd.OutOrStdout(), string(provider.MarshalDeployResult(agentID, err)))
 	return ferr
-}
-
-// newNotImplementedCmd registers a lifecycle subcommand (status, stop,
-// start, logs, undeploy) that exists so `--help` and shell completion are
-// accurate ahead of its real milestone, but always fails clearly until
-// then.
-func newNotImplementedCmd(name, milestone string) *cobra.Command {
-	return &cobra.Command{
-		Use:   name,
-		Short: fmt.Sprintf("%s (not implemented until %s)", name, milestone),
-		RunE: func(*cobra.Command, []string) error {
-			return fmt.Errorf("%s not implemented (%s)", name, milestone)
-		},
-	}
 }
