@@ -108,6 +108,36 @@ func (s *Store) Record(key string, e Entry) error {
 	return s.save(f)
 }
 
+// ForgetSandbox removes every mapping that points at sandboxID (scoped
+// to profile when non-empty) and reports how many entries were dropped.
+// Called by Undeploy: once the sandbox is deleted, a mapping still
+// naming it would send the next deploy through a status probe that can
+// only fail. A missing file or no matching entry is (0, nil) — undeploy
+// must not fail because there was nothing to forget.
+func (s *Store) ForgetSandbox(profile, sandboxID string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f, err := s.load()
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for key, e := range f.Agents {
+		if e.SandboxID != sandboxID {
+			continue
+		}
+		if profile != "" && e.Profile != "" && e.Profile != profile {
+			continue
+		}
+		delete(f.Agents, key)
+		removed++
+	}
+	if removed == 0 {
+		return 0, nil
+	}
+	return removed, s.save(f)
+}
+
 func (s *Store) load() (fileFormat, error) {
 	f := fileFormat{Version: currentVersion, Agents: map[string]Entry{}}
 	data, err := os.ReadFile(s.Path)
