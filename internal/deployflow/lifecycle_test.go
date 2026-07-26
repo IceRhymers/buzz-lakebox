@@ -1,10 +1,14 @@
 package deployflow
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/IceRhymers/buzz-lakebox/internal/nest"
+	"github.com/IceRhymers/buzz-lakebox/internal/redact"
 	"github.com/IceRhymers/buzz-lakebox/internal/state"
 )
 
@@ -233,5 +237,109 @@ func TestUndeploy_KeepsMappingWhenDeleteFails(t *testing.T) {
 	}
 	if _, ok, err := h.dep.State.Lookup(key); err != nil || !ok {
 		t.Fatalf("mapping must survive a failed delete (ok=%v, err=%v)", ok, err)
+	}
+}
+
+// TestUndeploy_DeleteSucceedsButForgetSandboxFails_ReportsResidueNotError
+// pins the HIGH-severity fix: a successful, irreversible delete must not
+// be reported as a failed undeploy just because the best-effort mapping
+// cleanup that follows it could not write. The operator must still see
+// the deletion succeeded (main.go prints the success line unconditionally);
+// the residue is surfaced via UndeployResult, not via a non-nil error.
+func TestUndeploy_DeleteSucceedsButForgetSandboxFails_ReportsResidueNotError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	h := newHarness(t)
+	t.Setenv("FAKE_STATUS_STATUS", "Running")
+
+	// State lives in its OWN temp dir, separate from newHarness's dir
+	// (which also holds the fake databricks binary and the call log):
+	// chmod'ing that shared dir read-only would silently break the
+	// shim's own `>> "$LOG"` appends too, and this test needs the call
+	// log intact to assert CLI:delete happened.
+	stateDir := t.TempDir()
+	h.dep.State = &state.Store{Path: filepath.Join(stateDir, "agents.json")}
+
+	key := state.Key("DEFAULT", "npub1example")
+	if err := h.dep.State.Record(key, state.Entry{SandboxID: "sandbox-1", Profile: "DEFAULT"}); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+
+	// Make the state directory unwritable so ForgetSandbox's save (a
+	// temp-file + rename, same discipline as Record) fails, without
+	// touching the sandbox delete path at all.
+	if err := os.Chmod(stateDir, 0o500); err != nil {
+		t.Fatalf("chmod state dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(stateDir, 0o700) })
+
+	res, err := h.dep.Undeploy("DEFAULT", "sandbox-1")
+	if err != nil {
+		t.Fatalf("Undeploy() must return a nil error when only the post-delete state cleanup fails, got: %v", err)
+	}
+	if res.StateResidue == "" {
+		t.Fatal("StateResidue must report the cleanup failure")
+	}
+	if res.StateEntriesRemoved != 0 {
+		t.Fatalf("StateEntriesRemoved = %d, want 0 (the write never completed)", res.StateEntriesRemoved)
+	}
+	assertOrder(t, callSequence(h.events()), []string{"CLI:delete"})
+}
+
+// TestStatus_UnparseableOutput_UsesStatusUnparseableCode pins the
+// MEDIUM-severity fix: Status's own parse failure must NOT reuse
+// CodeVerifyUnparseable, whose remedy ("run status and logs") is
+// circular when the failure came from status itself.
+func TestStatus_UnparseableOutput_UsesStatusUnparseableCode(t *testing.T) {
+	h := newHarness(t)
+	t.Setenv("FAKE_STATUS_STATUS", "Running")
+	t.Setenv("FAKE_PGREP_EXIT", "not-a-number")
+
+	_, err := h.dep.Status("DEFAULT", "sandbox-1")
+	if err == nil {
+		t.Fatal("Status() must fail when the probe output is unparseable")
+	}
+	if got := CodeOf(err); got != CodeStatusUnparseable {
+		t.Fatalf("code = %q, want %q", got, CodeStatusUnparseable)
+	}
+	if strings.Contains(err.Error(), "run `status") {
+		t.Fatalf("remedy must not point back at status when the failure came from status, got: %v", err)
+	}
+}
+
+// TestLifecycleErr_ScrubsCredentialShapedTailAndPreservesCode pins the
+// MEDIUM-severity redaction-boundary fix directly against lifecycleErr,
+// the single point every lifecycle op (Start/Status/Logs/Stop/Undeploy)
+// routes its error through. CodeLaunchExec's real-world shape is
+// exactly this: sshx.Client.run wraps the sandbox's full, unbounded,
+// unscrubbed combined stdout+stderr into the error via "(output: ...)"
+// (internal/sshx/sshx.go), and that text is never passed through
+// remoteText before this boundary.
+func TestLifecycleErr_ScrubsCredentialShapedTailAndPreservesCode(t *testing.T) {
+	raw := failf(CodeLaunchExec, "run launch.sh: %w",
+		fmt.Errorf("ssh sandbox-1 -p DEFAULT: exit status 1 (output: DATABRICKS_TOKEN='dapi1234567890abcdef' still starting)"))
+
+	got := lifecycleErr(raw)
+	if got == nil {
+		t.Fatal("lifecycleErr(non-nil) must not return nil")
+	}
+	if code := CodeOf(got); code != CodeLaunchExec {
+		t.Fatalf("code = %q, want %q (error: %v)", code, CodeLaunchExec, got)
+	}
+	if strings.Contains(got.Error(), "dapi1234567890abcdef") {
+		t.Fatalf("lifecycleErr must scrub credential-shaped output, got: %v", got)
+	}
+	if !strings.Contains(got.Error(), redact.Placeholder) {
+		t.Fatalf("expected the redaction placeholder in the scrubbed error, got: %v", got)
+	}
+}
+
+// TestLifecycleErr_Nil pins the nil short-circuit: a healthy lifecycle
+// op (which returns a nil error) must not have that nil turned into a
+// non-nil *Failure by the deferred redaction wrapper.
+func TestLifecycleErr_Nil(t *testing.T) {
+	if err := lifecycleErr(nil); err != nil {
+		t.Fatalf("lifecycleErr(nil) = %v, want nil", err)
 	}
 }

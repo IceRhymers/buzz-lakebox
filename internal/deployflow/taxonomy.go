@@ -72,6 +72,11 @@ const (
 	CodeNotDeployed Code = "lifecycle.not_deployed"
 	CodeLogsRead    Code = "lifecycle.logs_read"
 	CodeStatusProbe Code = "lifecycle.status_probe"
+	// CodeStatusUnparseable is Status's own parse-failure code, distinct
+	// from CodeVerifyUnparseable: that code's remedy tells the operator
+	// to run `status` and `logs`, which is circular when the failure
+	// came FROM status itself.
+	CodeStatusUnparseable Code = "lifecycle.status_unparseable"
 )
 
 // AllCodes is every code this package can emit, in flow order. It is
@@ -86,7 +91,7 @@ var AllCodes = []Code{
 	CodeEnvWrite, CodePrelaunchKill, CodeLaunchWrite, CodeLaunchExec,
 	CodeVerifySSH, CodeVerifyUnparseable, CodeVerifyProcessDead, CodeVerifyRelayDenied, CodeVerifyNotReady,
 	CodeAutostopConfig,
-	CodeNotDeployed, CodeLogsRead, CodeStatusProbe,
+	CodeNotDeployed, CodeLogsRead, CodeStatusProbe, CodeStatusUnparseable,
 }
 
 // remedies is the single source of truth for what an operator should do
@@ -130,9 +135,10 @@ var remedies = map[Code]string{
 
 	CodeAutostopConfig: "run `databricks sandbox config <sandbox-id> --no-autostop` manually, or redeploy — the agent itself is healthy",
 
-	CodeNotDeployed: "deploy this sandbox first (from Buzz Desktop, or `deploy --payload-file`)",
-	CodeLogsRead:    "confirm the sandbox is Running with `status <sandbox-id>` — a stopped sandbox has no readable log",
-	CodeStatusProbe: "confirm sandbox SSH reachability with `databricks sandbox ssh <id> -- true`",
+	CodeNotDeployed:       "deploy this sandbox first (from Buzz Desktop, or `deploy --payload-file`)",
+	CodeLogsRead:          "confirm the sandbox is Running with `status <sandbox-id>` — a stopped sandbox has no readable log",
+	CodeStatusProbe:       "confirm sandbox SSH reachability with `databricks sandbox ssh <id> -- true`",
+	CodeStatusUnparseable: "run `logs <sandbox-id>` for the agent's raw output, or inspect the sandbox directly with `databricks sandbox ssh <id> -- true`",
 }
 
 // Failure is the typed error every deployflow entry point returns. It
@@ -164,6 +170,16 @@ func (f *Failure) Error() string {
 // redacts its error text at the package boundary; without this the
 // scrubbed error would lose its code and every caller would be back to
 // substring-matching prose.
+//
+// msg MUST already be the fully-rendered text that code's own Error()
+// would have produced (i.e. the output of failf(code, ...).Error(),
+// possibly then scrubbed) — Redacted has no way to verify this and sets
+// rendered unconditionally, so the returned *Failure's Error() returns
+// msg verbatim regardless of code. Passing a mismatched pair (msg
+// rendered from a DIFFERENT code, or hand-written prose) silently
+// produces a *Failure whose .Code a caller can match on while the
+// printed text says something else entirely — a footgun for whoever
+// reads the mismatch later, since nothing here catches the disagreement.
 func Redacted(code Code, msg string) error {
 	if code == "" {
 		return errors.New(msg)

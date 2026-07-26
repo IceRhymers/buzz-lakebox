@@ -197,6 +197,7 @@ Match on the code, not the prose.
 | `lifecycle.not_deployed` | deploy this sandbox first (from Buzz Desktop, or `deploy --payload-file`) |
 | `lifecycle.logs_read` | confirm the sandbox is Running with `status <sandbox-id>` — a stopped sandbox has no readable log |
 | `lifecycle.status_probe` | confirm sandbox SSH reachability with `databricks sandbox ssh <id> -- true` |
+| `lifecycle.status_unparseable` | run `logs <sandbox-id>` for the agent's raw output, or inspect the sandbox directly with `databricks sandbox ssh <id> -- true` |
 
 The table is kept honest by `TestRunbook_DocumentsEveryCode` — a new code
 without a row here fails CI.

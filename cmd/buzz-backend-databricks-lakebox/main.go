@@ -241,6 +241,12 @@ func newUndeployCmd(profile *string) *cobra.Command {
 					"note: the sandbox was not Running, so the in-sandbox secret shred was skipped; its storage was destroyed with the sandbox instead\n")
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "sandbox %s deleted (%d reuse mapping(s) dropped)\n", id, res.StateEntriesRemoved)
+			if res.StateResidue != "" {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+					"warning: sandbox %s was deleted, but its reuse mapping could not be dropped: %s\n"+
+						"a redeploy of this agent will probe the stale mapping, find no sandbox, and fall through to creating a fresh one — no manual action required, but a redeploy will not reuse this id\n",
+					id, res.StateResidue)
+			}
 			return nil
 		},
 	}

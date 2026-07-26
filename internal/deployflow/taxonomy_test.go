@@ -328,6 +328,24 @@ func TestLifecycle_FailureModesAreCoded(t *testing.T) {
 			t.Fatalf("code = %q, want %q (error: %v)", got, CodeSandboxDelete, err)
 		}
 	})
+
+	// TestLifecycle_FailureModesAreCoded/status output unparseable pins
+	// the MEDIUM-severity fix: Status's own parse failure must use its
+	// own distinct code, not CodeVerifyUnparseable (whose remedy is
+	// circular when the failure came from status itself).
+	t.Run("status output unparseable", func(t *testing.T) {
+		h := newHarness(t)
+		t.Setenv("FAKE_STATUS_STATUS", "Running")
+		t.Setenv("FAKE_PGREP_EXIT", "not-a-number")
+
+		_, err := h.dep.Status("DEFAULT", "sandbox-1")
+		if got := CodeOf(err); got != CodeStatusUnparseable {
+			t.Fatalf("code = %q, want %q (error: %v)", got, CodeStatusUnparseable, err)
+		}
+		if got := CodeOf(err); got == CodeVerifyUnparseable {
+			t.Fatalf("status must not reuse verify's code, whose remedy points back at status/logs: %v", err)
+		}
+	})
 }
 
 // TestRunbook_DocumentsEveryCode keeps docs/RUNBOOK.md §7 in sync with
