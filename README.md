@@ -170,6 +170,7 @@ Full research (buzz architecture, omnigent's Lakebox integration patterns, live 
 - [`BUZZ_AGENT_SESSION_ARCHITECTURE.md`](docs/BUZZ_AGENT_SESSION_ARCHITECTURE.md) — how buzz hosts agent sessions today and the `BackendKind::Provider` seam
 - [`OMNIGENT_DATABRICKS_SANDBOX_PATTERNS.md`](docs/OMNIGENT_DATABRICKS_SANDBOX_PATTERNS.md) — prior art: omnigent's lakebox launcher contract, bootstrap, auth gotchas
 - [`LAKEBOX_LIVE_PROBE_RESULTS.md`](docs/LAKEBOX_LIVE_PROBE_RESULTS.md) — live-verified API surface, lifecycle timings, egress, persistence semantics, end-to-end `buzz` CLI ↔ relay proof from inside a sandbox
+- [`UPSTREAM_BUZZ_GAPS.md`](docs/UPSTREAM_BUZZ_GAPS.md) — live-operations findings at the provider seam (misleading status, no recovery affordance, lost mentions, missing `backend_agent_id` echo, protocol v2), drafted as future block/buzz contributions
 
 ## Key facts the design leans on (live-verified 2026-07-24)
 
