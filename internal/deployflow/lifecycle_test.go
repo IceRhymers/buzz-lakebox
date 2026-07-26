@@ -3,6 +3,9 @@ package deployflow
 import (
 	"strings"
 	"testing"
+
+	"github.com/IceRhymers/buzz-lakebox/internal/nest"
+	"github.com/IceRhymers/buzz-lakebox/internal/state"
 )
 
 // TestStart_StoppedSandbox_RecoversAndVerifies: the autostop/lifetime-cap
@@ -117,4 +120,118 @@ func TestStop_StopsSandbox(t *testing.T) {
 		t.Fatalf("Stop() error: %v", err)
 	}
 	assertOrder(t, callSequence(h.events()), []string{"CLI:stop"})
+}
+
+// TestUndeploy_ShredsBeforeDeletingAndForgetsMapping pins the ordering
+// undeploy's safety rests on: the secret shred must happen while the
+// sandbox is still reachable, the delete must follow it, and the reuse
+// mapping must be gone afterwards so the next deploy does not probe a
+// sandbox that no longer exists.
+func TestUndeploy_ShredsBeforeDeletingAndForgetsMapping(t *testing.T) {
+	h := newHarness(t)
+	t.Setenv("FAKE_STATUS_STATUS", "Running")
+
+	key := state.Key("DEFAULT", "npub1example")
+	if err := h.dep.State.Record(key, state.Entry{SandboxID: "sandbox-1", Profile: "DEFAULT"}); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+
+	res, err := h.dep.Undeploy("DEFAULT", "sandbox-1")
+	if err != nil {
+		t.Fatalf("Undeploy() error: %v", err)
+	}
+	if !res.Shredded {
+		t.Fatal("Shredded must be true when the sandbox was Running")
+	}
+	if res.StateEntriesRemoved != 1 {
+		t.Fatalf("StateEntriesRemoved = %d, want 1", res.StateEntriesRemoved)
+	}
+
+	assertOrder(t, callSequence(h.events()), []string{"CLI:status", "SSH:undeploy-shred", "CLI:delete"})
+
+	if _, ok, err := h.dep.State.Lookup(key); err != nil || ok {
+		t.Fatalf("mapping should be gone after undeploy (ok=%v, err=%v)", ok, err)
+	}
+}
+
+// TestUndeploy_ShredCoversEverySecretBearingFile: the shred and the
+// deploy-failure teardown must remove the same set of files — a secret
+// that only one of them knows about is a stranded nsec.
+func TestUndeploy_ShredCoversEverySecretBearingFile(t *testing.T) {
+	h := newHarness(t)
+	t.Setenv("FAKE_STATUS_STATUS", "Running")
+
+	if _, err := h.dep.Undeploy("DEFAULT", "sandbox-1"); err != nil {
+		t.Fatalf("Undeploy() error: %v", err)
+	}
+
+	var shredArgs string
+	for _, e := range h.events() {
+		if e.sshTag == "undeploy-shred" {
+			shredArgs = e.args(t)
+		}
+	}
+	for _, want := range []string{nest.EnvFilePath, verifyEnvFilePath} {
+		if !strings.Contains(shredArgs, want) {
+			t.Fatalf("shred command must cover %q, got: %s", want, shredArgs)
+		}
+	}
+}
+
+// TestUndeploy_StoppedSandbox_SkipsShredButStillDeletes: a stopped
+// sandbox cannot be SSH'd into. Deleting it anyway is the point — its
+// storage (and the env file in it) dies with it, and leaving it behind
+// would keep billing.
+func TestUndeploy_StoppedSandbox_SkipsShredButStillDeletes(t *testing.T) {
+	h := newHarness(t)
+	t.Setenv("FAKE_STATUS_STATUS", "Stopped")
+
+	res, err := h.dep.Undeploy("DEFAULT", "sandbox-1")
+	if err != nil {
+		t.Fatalf("Undeploy() error: %v", err)
+	}
+	if res.Shredded {
+		t.Fatal("Shredded must be false for a stopped sandbox")
+	}
+	seq := callSequence(h.events())
+	assertNotContains(t, seq, "SSH:undeploy-shred")
+	assertOrder(t, seq, []string{"CLI:delete"})
+}
+
+// TestUndeploy_ShredFailureStillDeletes: an unreachable sandbox must
+// not strand a running, billing sandbox — the delete is what actually
+// protects the owner, so a failed shred cannot abort it.
+func TestUndeploy_ShredFailureStillDeletes(t *testing.T) {
+	h := newHarness(t)
+	t.Setenv("FAKE_STATUS_STATUS", "Running")
+	t.Setenv("FAKE_SHRED_EXIT", "1")
+
+	res, err := h.dep.Undeploy("DEFAULT", "sandbox-1")
+	if err != nil {
+		t.Fatalf("Undeploy() error: %v", err)
+	}
+	if res.Shredded {
+		t.Fatal("Shredded must be false when the shred command failed")
+	}
+	assertOrder(t, callSequence(h.events()), []string{"SSH:undeploy-shred", "CLI:delete"})
+}
+
+// TestUndeploy_KeepsMappingWhenDeleteFails: the sandbox still exists, so
+// the next deploy should reuse it rather than orphan it.
+func TestUndeploy_KeepsMappingWhenDeleteFails(t *testing.T) {
+	h := newHarness(t)
+	t.Setenv("FAKE_STATUS_STATUS", "Running")
+	t.Setenv("FAKE_DELETE_EXIT", "1")
+
+	key := state.Key("DEFAULT", "npub1example")
+	if err := h.dep.State.Record(key, state.Entry{SandboxID: "sandbox-1", Profile: "DEFAULT"}); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+
+	if _, err := h.dep.Undeploy("DEFAULT", "sandbox-1"); err == nil {
+		t.Fatal("expected a delete failure to surface")
+	}
+	if _, ok, err := h.dep.State.Lookup(key); err != nil || !ok {
+		t.Fatalf("mapping must survive a failed delete (ok=%v, err=%v)", ok, err)
+	}
 }

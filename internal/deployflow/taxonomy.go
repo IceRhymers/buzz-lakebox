@@ -1,0 +1,191 @@
+// Failure taxonomy (docs/PLAN.md §6 M3: "every failure mode → distinct
+// actionable ok:false").
+//
+// Every error this package returns to a caller carries a stable machine
+// code and exactly one canonical operator remedy, rendered as:
+//
+//	[<code>] <what went wrong> — remedy: <what to do about it>
+//
+// The code is the part a human (or, later, a protocol-v2 desktop) can
+// match on: it never changes when the surrounding prose does, and no two
+// distinct failure modes share one. The remedy lives in a single table
+// here rather than at each call site, so the same failure always
+// suggests the same fix no matter which step raised it.
+package deployflow
+
+import (
+	"errors"
+	"fmt"
+)
+
+// Code identifies one distinct failure mode. Values are stable
+// identifiers — treat them as API: rename only with a deliberate
+// migration, since operators and runbooks match on them
+// (docs/RUNBOOK.md).
+type Code string
+
+const (
+	// Preflight — nothing has been provisioned yet (docs/PLAN.md §4.4 step 2).
+	CodeValidation        Code = "validation"
+	CodeCLIVersionUnknown Code = "preflight.cli_version_unknown"
+	CodeCLIVersionOld     Code = "preflight.cli_too_old"
+	CodeProfileUnresolved Code = "preflight.profile"
+	CodeSandboxRegister   Code = "preflight.sandbox_register"
+
+	// Identity + reuse (docs/PLAN.md §4.1).
+	CodeIdentityDerive    Code = "identity.derive"
+	CodeIdentityAmbiguous Code = "identity.ambiguous"
+	CodeStateRead         Code = "state.read"
+	CodeStateWrite        Code = "state.write"
+
+	// Sandbox lifecycle CLI calls (docs/PLAN.md §4.4 step 3).
+	CodeSandboxList   Code = "sandbox.list"
+	CodeSandboxCreate Code = "sandbox.create"
+	CodeSandboxStart  Code = "sandbox.start"
+	CodeSandboxWait   Code = "sandbox.wait_running"
+	CodeSandboxStatus Code = "sandbox.status"
+	CodeSandboxStop   Code = "sandbox.stop"
+	CodeSandboxDelete Code = "sandbox.delete"
+
+	// In-sandbox provisioning (docs/PLAN.md §4.4 steps 4-9).
+	CodePATReset      Code = "provision.pat_reset"
+	CodeInstallScript Code = "install.script"
+	CodeInstallWrite  Code = "install.write"
+	CodeInstallExec   Code = "install.exec"
+	CodeRuntimeVerify Code = "install.runtime_verify"
+	CodeEnvWrite      Code = "provision.env_write"
+	CodePrelaunchKill Code = "launch.prelaunch_kill"
+	CodeLaunchWrite   Code = "launch.write"
+	CodeLaunchExec    Code = "launch.exec"
+
+	// Launch verification (docs/PLAN.md §4.4 step 10).
+	CodeVerifySSH         Code = "verify.unreachable"
+	CodeVerifyUnparseable Code = "verify.unparseable"
+	CodeVerifyProcessDead Code = "verify.process_dead"
+	CodeVerifyRelayDenied Code = "verify.relay_denied"
+	CodeVerifyNotReady    Code = "verify.pool_not_ready"
+
+	// Post-verification (docs/PLAN.md §4.4 step 11).
+	CodeAutostopConfig Code = "autostop.config"
+
+	// Operator lifecycle subcommands (docs/PLAN.md §6 M2).
+	CodeNotDeployed Code = "lifecycle.not_deployed"
+	CodeLogsRead    Code = "lifecycle.logs_read"
+	CodeStatusProbe Code = "lifecycle.status_probe"
+)
+
+// AllCodes is every code this package can emit, in flow order. It is
+// what docs/RUNBOOK.md's table is generated from and what the taxonomy
+// tests iterate — a new code that is not listed here has no remedy
+// coverage, which the tests fail on.
+var AllCodes = []Code{
+	CodeValidation, CodeCLIVersionUnknown, CodeCLIVersionOld, CodeProfileUnresolved, CodeSandboxRegister,
+	CodeIdentityDerive, CodeIdentityAmbiguous, CodeStateRead, CodeStateWrite,
+	CodeSandboxList, CodeSandboxCreate, CodeSandboxStart, CodeSandboxWait, CodeSandboxStatus, CodeSandboxStop, CodeSandboxDelete,
+	CodePATReset, CodeInstallScript, CodeInstallWrite, CodeInstallExec, CodeRuntimeVerify,
+	CodeEnvWrite, CodePrelaunchKill, CodeLaunchWrite, CodeLaunchExec,
+	CodeVerifySSH, CodeVerifyUnparseable, CodeVerifyProcessDead, CodeVerifyRelayDenied, CodeVerifyNotReady,
+	CodeAutostopConfig,
+	CodeNotDeployed, CodeLogsRead, CodeStatusProbe,
+}
+
+// remedies is the single source of truth for what an operator should do
+// about each failure mode. Every Code declared above must appear here —
+// TestTaxonomy_EveryCodeHasARemedy enforces it.
+var remedies = map[Code]string{
+	CodeValidation:        "fix the deploy payload field named above and redeploy",
+	CodeCLIVersionUnknown: "install the Databricks CLI and make sure it is on PATH (`databricks version` must work); run `buzz-backend-databricks-lakebox doctor`",
+	CodeCLIVersionOld:     "upgrade the Databricks CLI, then rerun `buzz-backend-databricks-lakebox doctor`",
+	CodeProfileUnresolved: "check ~/.databrickscfg for the profile and re-authenticate (`databricks auth login -p <profile>`)",
+	CodeSandboxRegister:   "confirm the workspace is in a Lakebox-enabled region (us-west-2 verified) and that your profile may use sandboxes",
+
+	CodeIdentityDerive:    "the agent's private_key_nsec is not a valid bech32 nsec — re-mint the agent's key in Buzz Desktop and redeploy",
+	CodeIdentityAmbiguous: "delete the stale sandbox(es) listed above with `databricks sandbox delete <id>`, then redeploy",
+	CodeStateRead:         "inspect (or delete) ~/.local/state/buzz-lakebox/agents.json — a corrupt mapping file blocks reuse; deleting it costs only orphan detection, which `databricks sandbox list` can replace",
+	CodeStateWrite:        "make ~/.local/state/buzz-lakebox writable — without a persisted mapping every redeploy orphans a still-billing sandbox",
+
+	CodeSandboxList:   "verify sandbox access with `databricks sandbox list -p <profile>`",
+	CodeSandboxCreate: "check the workspace's sandbox quota and region gating with `databricks sandbox list -p <profile>`",
+	CodeSandboxStart:  "retry; if the sandbox is mid-transition (Stopping), wait for it to settle and redeploy",
+	CodeSandboxWait:   "check the sandbox with `databricks sandbox status <id>` — it may be stuck mid-transition; retry once it settles",
+	CodeSandboxStatus: "confirm the sandbox still exists with `databricks sandbox list -p <profile>`; if it was deleted, redeploy to create a new one",
+	CodeSandboxStop:   "retry, or stop it directly with `databricks sandbox stop <id>`",
+	CodeSandboxDelete: "delete it manually with `databricks sandbox delete <id> --auto-approve` — an undeleted sandbox keeps billing",
+
+	CodePATReset:      "retry; if it persists the sandbox may be unreachable over SSH — check `databricks sandbox ssh <id> -- true`",
+	CodeInstallScript: "pass a known `provider_config.buzz_version` (the error lists the pinned versions this build ships sha256s for)",
+	CodeInstallWrite:  "check sandbox SSH reachability with `databricks sandbox ssh <id> -- true`",
+	CodeInstallExec:   "read the install output above: a sha256 mismatch means the pinned release changed; a fetch failure means the sandbox lost egress to GitHub",
+	CodeRuntimeVerify: "the installed buzz-agent could not complete an ACP initialize handshake — check `logs` and the inference env (BUZZ_AGENT_PROVIDER / DATABRICKS_HOST / DATABRICKS_TOKEN)",
+	CodeEnvWrite:      "check sandbox SSH reachability and that $HOME is writable in the sandbox",
+	CodePrelaunchKill: "check sandbox SSH reachability with `databricks sandbox ssh <id> -- true`",
+	CodeLaunchWrite:   "check sandbox SSH reachability and that $HOME is writable in the sandbox",
+	CodeLaunchExec:    "run `logs <sandbox-id>` for the agent's own output, then `start <sandbox-id>` to retry the launch",
+
+	CodeVerifySSH:         "the sandbox stopped responding right after launch — run `status <sandbox-id>`, then `start <sandbox-id>`",
+	CodeVerifyUnparseable: "run `status <sandbox-id>` and `logs <sandbox-id>` to see the agent's real state before redeploying",
+	CodeVerifyProcessDead: "run `logs <sandbox-id>` for the crash output; the acp.log tail is included above",
+	CodeVerifyRelayDenied: "mint or register a relay-member key for this agent in Buzz Desktop and redeploy — this key is not a member of the target relay",
+	CodeVerifyNotReady:    "run `logs <sandbox-id>`; the agent started but never reported a ready pool within the verification window",
+
+	CodeAutostopConfig: "run `databricks sandbox config <sandbox-id> --no-autostop` manually, or redeploy — the agent itself is healthy",
+
+	CodeNotDeployed: "deploy this sandbox first (from Buzz Desktop, or `deploy --payload-file`)",
+	CodeLogsRead:    "confirm the sandbox is Running with `status <sandbox-id>` — a stopped sandbox has no readable log",
+	CodeStatusProbe: "confirm sandbox SSH reachability with `databricks sandbox ssh <id> -- true`",
+}
+
+// Failure is the typed error every deployflow entry point returns. It
+// renders as "[code] cause — remedy: ...", and unwraps to its cause so
+// errors.Is/As on the underlying error keeps working.
+type Failure struct {
+	Code Code
+	Err  error
+
+	// rendered marks an Err whose message is already the finished
+	// "[code] … — remedy: …" text (see Redacted): re-rendering it would
+	// duplicate the code and the remedy.
+	rendered bool
+}
+
+func (f *Failure) Error() string {
+	if f.rendered {
+		return f.Err.Error()
+	}
+	remedy, ok := remedies[f.Code]
+	if !ok || remedy == "" {
+		return fmt.Sprintf("[%s] %v", f.Code, f.Err)
+	}
+	return fmt.Sprintf("[%s] %v — remedy: %s", f.Code, f.Err, remedy)
+}
+
+// Redacted rebuilds an error from an already-rendered (and scrubbed)
+// message while preserving its taxonomy code. Deploy renders and
+// redacts its error text at the package boundary; without this the
+// scrubbed error would lose its code and every caller would be back to
+// substring-matching prose.
+func Redacted(code Code, msg string) error {
+	if code == "" {
+		return errors.New(msg)
+	}
+	return &Failure{Code: code, Err: errors.New(msg), rendered: true}
+}
+
+func (f *Failure) Unwrap() error { return f.Err }
+
+// failf builds a *Failure whose cause is fmt.Errorf(format, a...), so
+// call sites keep using %w to chain the underlying error.
+func failf(code Code, format string, a ...any) error {
+	return &Failure{Code: code, Err: fmt.Errorf(format, a...)}
+}
+
+// CodeOf reports the taxonomy code carried by err (searching wrapped
+// errors), or "" when err did not originate here. Tests and the runbook
+// use it; a protocol-v2 desktop could too.
+func CodeOf(err error) Code {
+	var f *Failure
+	if errors.As(err, &f) {
+		return f.Code
+	}
+	return ""
+}

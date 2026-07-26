@@ -57,14 +57,14 @@ func (d *Deployer) Start(profile, sandboxID string) error {
 
 	sb, err := d.CLI.SandboxStatus(ctx, profile, sandboxID)
 	if err != nil {
-		return fmt.Errorf("sandbox status: %w", err)
+		return failf(CodeSandboxStatus, "sandbox status: %w", err)
 	}
 	if !strings.EqualFold(sb.Status, lakebox.StatusRunning) {
 		if err := d.CLI.SandboxStart(ctx, profile, sandboxID); err != nil {
-			return fmt.Errorf("sandbox start: %w", err)
+			return failf(CodeSandboxStart, "sandbox start: %w", err)
 		}
 		if err := d.CLI.WaitRunning(ctx, profile, sandboxID, d.waitTimeout(), d.pollInterval(), d.Sleep); err != nil {
-			return fmt.Errorf("waiting for sandbox to reach Running: %w", err)
+			return failf(CodeSandboxWait, "waiting for sandbox to reach Running: %w", err)
 		}
 	}
 
@@ -77,9 +77,9 @@ func (d *Deployer) Start(profile, sandboxID string) error {
 	)))
 	if err != nil {
 		if strings.Contains(out, noLaunchScriptMarker) || strings.Contains(err.Error(), noLaunchScriptMarker) {
-			return fmt.Errorf("no launch.sh in this sandbox — it has never been provisioned by a deploy; run a deploy first (from Buzz Desktop, or `deploy --payload-file`)")
+			return failf(CodeNotDeployed, "no launch.sh in this sandbox — it has never been provisioned by a deploy; run a deploy first")
 		}
-		return fmt.Errorf("run launch.sh: %w", err)
+		return failf(CodeLaunchExec, "run launch.sh: %w", err)
 	}
 
 	if err := d.verifyLaunch(ctx, profile, sandboxID); err != nil {
@@ -97,25 +97,23 @@ func (d *Deployer) Status(profile, sandboxID string) (AgentStatus, error) {
 	st := AgentStatus{SandboxID: sandboxID}
 	sb, err := d.CLI.SandboxStatus(ctx, profile, sandboxID)
 	if err != nil {
-		return st, fmt.Errorf("sandbox status: %w", err)
+		return st, failf(CodeSandboxStatus, "sandbox status: %w", err)
 	}
 	st.SandboxStatus = sb.Status
 	if !strings.EqualFold(sb.Status, lakebox.StatusRunning) {
 		return st, nil // stopped sandbox: no processes, nothing to SSH into
 	}
 
-	out, err := d.SSH.Run(ctx, profile, sandboxID, step("status-check",
-		`pgrep -f '[b]uzz-acp' >/dev/null 2>&1; echo "BUZZ_PGREP_RC=$?"; tail -c 4096 "$HOME/.buzz-backend/acp.log" 2>/dev/null || true`,
-	))
+	out, err := d.SSH.Run(ctx, profile, sandboxID, step("status-check", acpLivenessProbe()))
 	if err != nil {
-		return st, fmt.Errorf("status: could not check buzz-acp process/log: %w", err)
+		return st, failf(CodeStatusProbe, "status: could not check buzz-acp process/log: %w", err)
 	}
 	rc, logOut, perr := parsePgrepCheck(out)
 	if perr != nil {
-		return st, fmt.Errorf("status: could not parse check output: %w (output: %s)", perr, truncate(strings.TrimSpace(out), maxErrorLogBytes))
+		return st, failf(CodeVerifyUnparseable, "status: could not parse check output: %w (output: %s)", perr, remoteText(strings.TrimSpace(out)))
 	}
 	st.AcpRunning = rc == 0
-	st.LogTail = truncate(strings.TrimSpace(logOut), maxErrorLogBytes)
+	st.LogTail = remoteText(strings.TrimSpace(logOut))
 	return st, nil
 }
 
@@ -132,9 +130,9 @@ func (d *Deployer) Logs(profile, sandboxID string, tailBytes int) (string, error
 		`tail -c %d "$HOME/.buzz-backend/acp.log"`, tailBytes,
 	)))
 	if err != nil {
-		return "", fmt.Errorf("read acp.log: %w", err)
+		return "", failf(CodeLogsRead, "read acp.log: %w", err)
 	}
-	return out, nil
+	return remoteText(out), nil
 }
 
 // Stop stops the sandbox's compute. All in-sandbox processes die and
@@ -144,7 +142,66 @@ func (d *Deployer) Stop(profile, sandboxID string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), lifecycleTimeout)
 	defer cancel()
 	if err := d.CLI.SandboxStop(ctx, profile, sandboxID); err != nil {
-		return err
+		return failf(CodeSandboxStop, "sandbox stop: %w", err)
 	}
 	return nil
+}
+
+// UndeployResult reports what Undeploy actually did, so the CLI can tell
+// the operator whether the secret shred ran (it cannot on an already
+// stopped sandbox) and whether a reuse mapping was dropped.
+type UndeployResult struct {
+	SandboxID string `json:"sandbox_id"`
+	// Shredded is true when the in-sandbox secret shred ran. False means
+	// the sandbox was not Running, so no SSH was possible — the secrets
+	// die with the sandbox's storage on delete instead.
+	Shredded bool `json:"shredded"`
+	// StateEntriesRemoved counts reuse mappings dropped from the
+	// provider's state file.
+	StateEntriesRemoved int `json:"state_entries_removed"`
+}
+
+// Undeploy is the destructive teardown of a deployed agent (docs/PLAN.md
+// §3.2, §6 M2): shred the in-sandbox secrets first, then delete the
+// sandbox, then forget the reuse mapping.
+//
+// Order matters and is the inverse of deploy's: the shred is
+// best-effort and must be attempted while the sandbox can still be
+// reached, but a shred failure must NOT abort the delete — an
+// undeleted sandbox keeps billing and keeps the nsec on disk, which is
+// strictly worse than an unshredded one that gets destroyed with its
+// storage. The state mapping is dropped last, and only after the delete
+// succeeds: a mapping outliving a failed delete still points at a real
+// sandbox that a redeploy should reuse rather than orphan.
+func (d *Deployer) Undeploy(profile, sandboxID string) (UndeployResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), lifecycleTimeout)
+	defer cancel()
+
+	res := UndeployResult{SandboxID: sandboxID}
+
+	// Only a Running sandbox can be SSH'd into. A status failure is not
+	// fatal here: the delete below is what actually protects the owner,
+	// so treat "cannot tell" as "cannot shred" and carry on.
+	if sb, err := d.CLI.SandboxStatus(ctx, profile, sandboxID); err == nil && strings.EqualFold(sb.Status, lakebox.StatusRunning) {
+		if _, err := d.SSH.Run(ctx, profile, sandboxID, step("undeploy-shred", secretShredCommand())); err == nil {
+			res.Shredded = true
+		}
+	}
+
+	if err := d.CLI.SandboxDelete(ctx, profile, sandboxID); err != nil {
+		return res, failf(CodeSandboxDelete, "sandbox delete: %w", err)
+	}
+
+	if d.State != nil {
+		removed, err := d.State.ForgetSandbox(profile, sandboxID)
+		if err != nil {
+			// The sandbox is already gone; a stale mapping is
+			// self-healing (the next deploy's status probe rejects it),
+			// so report the residue rather than failing the undeploy.
+			return res, failf(CodeStateWrite, "sandbox %s was deleted, but its reuse mapping could not be dropped: %w", sandboxID, err)
+		}
+		res.StateEntriesRemoved = removed
+	}
+
+	return res, nil
 }
