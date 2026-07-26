@@ -1,6 +1,7 @@
 package payload
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -163,5 +164,80 @@ func TestValidate_SupportedRuntimeAccepted(t *testing.T) {
 	}
 	if err := req.Validate(); err != nil {
 		t.Fatalf("Validate() should accept buzz-agent, got: %v", err)
+	}
+}
+
+// TestValidate_EnvVarsKeyNames guards against a CRITICAL bug: internal/nest's
+// RenderEnv writes env_vars KEYS raw (unquoted) into a file that is later
+// `.`-sourced by a shell (see nest.go's emit()). An env_vars key containing
+// shell metacharacters or a newline would achieve arbitrary command
+// execution in that shell — right after it has exported the agent's nsec,
+// auth tag, and DATABRICKS_TOKEN. Agent.Validate() must reject any key that
+// isn't a valid POSIX shell/environment variable name.
+func TestValidate_EnvVarsKeyNames(t *testing.T) {
+	baseAgent := func(envVars map[string]string) Agent {
+		return Agent{
+			RelayURL:       "wss://r",
+			PrivateKeyNsec: "nsec1x",
+			AuthTag:        "t",
+			AgentCommand:   SupportedAgentCommand,
+			EnvVars:        envVars,
+		}
+	}
+
+	accepted := []string{"PATH", "DATABRICKS_TOKEN", "_UNDERSCORE_LEAD", "A1"}
+	for _, key := range accepted {
+		t.Run("accepted/"+key, func(t *testing.T) {
+			agent := baseAgent(map[string]string{key: "value"})
+			if err := agent.Validate(); err != nil {
+				t.Fatalf("Validate() should accept env_vars key %q, got: %v", key, err)
+			}
+		})
+	}
+
+	rejected := []string{
+		"X=1$(id)",
+		"FOO\nBAR",
+		"FOO BAR",
+		"FOO;id",
+		"FOO-BAR",
+		"1LEADINGDIGIT",
+		"",
+		"FOO`id`",
+	}
+	for _, key := range rejected {
+		t.Run(fmt.Sprintf("rejected/%q", key), func(t *testing.T) {
+			agent := baseAgent(map[string]string{key: "value"})
+			err := agent.Validate()
+			if err == nil {
+				t.Fatalf("Validate() should reject env_vars key %q", key)
+			}
+			if !strings.Contains(err.Error(), fmt.Sprintf("%q", key)) {
+				t.Fatalf("error should name the offending key %q, got: %v", key, err)
+			}
+			if strings.Contains(err.Error(), "value") {
+				t.Fatalf("error must not echo the key's VALUE, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestValidate_EnvVarsAllValidKeysStillPasses is a regression check: a
+// payload with only valid env_vars keys must still validate cleanly.
+func TestValidate_EnvVarsAllValidKeysStillPasses(t *testing.T) {
+	agent := Agent{
+		RelayURL:       "wss://r",
+		PrivateKeyNsec: "nsec1x",
+		AuthTag:        "t",
+		AgentCommand:   SupportedAgentCommand,
+		EnvVars: map[string]string{
+			"PATH":             "/usr/bin",
+			"DATABRICKS_TOKEN": "dapi-xyz",
+			"_UNDERSCORE_LEAD": "1",
+			"A1":               "2",
+		},
+	}
+	if err := agent.Validate(); err != nil {
+		t.Fatalf("Validate() should accept a payload with only valid env_vars keys, got: %v", err)
 	}
 }

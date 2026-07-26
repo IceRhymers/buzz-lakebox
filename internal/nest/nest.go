@@ -92,6 +92,14 @@ const AliveCheckSnippet = `buzz_acp_alive() {
 // `source` (agent env_vars carry DATABRICKS_HOST/DATABRICKS_TOKEN).
 func RenderEnv(agent payload.Agent) string {
 	var b strings.Builder
+	// emit writes KEY unquoted/raw (only VALUE is shellquote'd) into a file
+	// that RenderLaunchScript's `. "$HOME/.buzz-backend/env"` line
+	// `.`-sources with a shell — an attacker-controlled key containing
+	// shell metacharacters or a newline would execute in that shell, which
+	// has just exported the agent's nsec, auth tag, and DATABRICKS_TOKEN.
+	// This is safe ONLY because agent.EnvVars keys are validated upstream
+	// by payload.Agent.Validate() (^[A-Za-z_][A-Za-z0-9_]*$) before
+	// RenderEnv ever sees them; do not call RenderEnv on unvalidated input.
 	emit := func(key, value string) {
 		b.WriteString("export ")
 		b.WriteString(key)
