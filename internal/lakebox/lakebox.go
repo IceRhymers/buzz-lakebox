@@ -290,9 +290,14 @@ func looksLikeUnsupportedFlag(output string) bool {
 // key that the CLI itself marked as "matches the one on this machine":
 // a `*`-prefixed row carrying a name and a 32-hex key hash. The legend
 // line ("* key matches the one on this machine") has no hex token, so
-// it cannot false-match. Live-verified row shape on CLI 1.8.0:
+// it cannot false-match. Live-verified row shape on CLI 1.8.0 (prefixed
+// with a "Sample row:" label so the line does not start with a literal
+// "*" — Go 1.19+ doc-comment parsing treats a leading "*" as a markdown
+// list item and gofmt -w would rewrite it to "-", which would make the
+// sample contradict the `*`-anchored regex it documents; do not "fix"
+// this back to a bare `*`-prefixed line):
 //
-//	* FX7QY7K39J    1dc2bafb16acb3e407a95673944433c0  2026-07-24 21:14  ...
+//	Sample row: * FX7QY7K39J    1dc2bafb16acb3e407a95673944433c0  2026-07-24 21:14  ...
 var localKeyRowPattern = regexp.MustCompile(`(?m)^\s*\*\s+\S+\s+[0-9a-f]{32}\b`)
 
 // SandboxRegister runs `databricks sandbox register -p <profile>`.
