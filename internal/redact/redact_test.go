@@ -162,6 +162,81 @@ func TestLog_ScrubsBareNsecWithoutAnAssignment(t *testing.T) {
 	}
 }
 
+// TestLog_ScrubsAssignmentShapes is the regression test for the
+// single-quote leak: internal/shellquote's Single wraps every value nest.go
+// writes into an env file in single quotes, so KEY='value' is the shape
+// this codebase actually produces. Each case asserts the exact scrubbed
+// output — no stray leading/trailing quote left behind — across quoted,
+// bare, and colon forms, and across more than one keyword family.
+func TestLog_ScrubsAssignmentShapes(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "single_quoted_auth_tag_export_prefixed",
+			in:   `export BUZZ_AUTH_TAG='sometag-secret-value'`,
+			want: "export BUZZ_AUTH_TAG=" + Placeholder,
+		},
+		{
+			name: "single_quoted_token_export_prefixed",
+			in:   `export DATABRICKS_TOKEN='dapi1234567890abcdef'`,
+			want: "export DATABRICKS_TOKEN=" + Placeholder,
+		},
+		{
+			name: "double_quoted_token",
+			in:   `export DATABRICKS_TOKEN="dapi1234567890abcdef"`,
+			want: "export DATABRICKS_TOKEN=" + Placeholder,
+		},
+		{
+			name: "bare_token",
+			in:   "DATABRICKS_TOKEN=dapi1234567890abcdef",
+			want: "DATABRICKS_TOKEN=" + Placeholder,
+		},
+		{
+			name: "colon_with_space_token",
+			in:   "DATABRICKS_TOKEN: dapi1234567890abcdef",
+			want: "DATABRICKS_TOKEN: " + Placeholder,
+		},
+		{
+			name: "colon_no_space_token",
+			in:   "DATABRICKS_TOKEN:dapi1234567890abcdef",
+			want: "DATABRICKS_TOKEN:" + Placeholder,
+		},
+		{
+			name: "single_quoted_api_key",
+			in:   `export OPENAI_API_KEY='sk-proj-abcdefghij'`,
+			want: "export OPENAI_API_KEY=" + Placeholder,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := Log(tt.in)
+			if got != tt.want {
+				t.Fatalf("Log(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestLog_DiagnosticKeywordsSurvive is the explicit negative-case
+// counterpart to TestLog_ScrubsAssignmentShapes: a broadened assignment
+// pattern must still not fire on pubkey=, relay=, or agents=2, none of
+// which contain a credential keyword.
+func TestLog_DiagnosticKeywordsSurvive(t *testing.T) {
+	in := "buzz-acp starting: relay=wss://relay.example.com pubkey=abc123def456\nagent_pool_ready agents=2\n"
+	got := Log(in)
+	for _, keep := range []string{"relay=wss://relay.example.com", "pubkey=abc123def456", "agents=2"} {
+		if !strings.Contains(got, keep) {
+			t.Fatalf("Log() removed diagnostic %q: %s", keep, got)
+		}
+	}
+	if strings.Contains(got, Placeholder) {
+		t.Fatalf("Log() redacted non-secret diagnostic output: %s", got)
+	}
+}
+
 func TestLog_EmptyInput(t *testing.T) {
 	if got := Log(""); got != "" {
 		t.Fatalf("Log(\"\") = %q", got)
