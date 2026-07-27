@@ -15,6 +15,12 @@ Buzz Desktop ──stdin JSON {op:"deploy",...}──> buzz-backend-databricks-l
                                           └─ buzz-acp ──WSS──> Buzz relay ──> agent runtime
 ```
 
+## Inference auth: bring a token (default) or zero-token (opt-in)
+
+By default, the agent authenticates to the workspace AI Gateway with a token you supply: mint a personal access token or a scoped service-principal token and set `DATABRICKS_HOST`/`DATABRICKS_TOKEN` in the agent's environment variables (see [Setting up an agent in Buzz Desktop](#setting-up-an-agent-in-buzz-desktop) below). This is least-privilege and the recommended default — the token needs only CAN QUERY on the gateway endpoints, and the sandbox's baked creator-identity credential stays neutralized (reset to a stub, per [Key facts](#key-facts-the-design-leans-on-live-verified-2026-07-24)).
+
+Setting `provider_config.inference_auth` to `"sandbox"` opts into zero-token inference instead: no token is minted or set anywhere in setup. The provider leaves the sandbox's baked creator-identity `~/.databrickscfg` in place and derives `DATABRICKS_HOST`/`DATABRICKS_TOKEN` from it at every launch. Stated bluntly, because it's exactly why this is opt-in: **the agent can act as you across the entire workspace**, not just call the AI Gateway. Set it via the "Where to run" provider-config field in Buzz Desktop's create-agent dialog (rendered from this provider's `config_schema` — see [`docs/CONTRACT.md`](docs/CONTRACT.md) §4), or in the `provider_config` JSON for operator deploys. See [`docs/RUNBOOK.md`](docs/RUNBOOK.md#zero-token-inference-auth-inference_auth-sandbox) for how derivation and rotation tolerance work, and what happens when the baked credential can't be used.
+
 ## Provider protocol
 
 | Op | Behavior |
@@ -23,7 +29,7 @@ Buzz Desktop ──stdin JSON {op:"deploy",...}──> buzz-backend-databricks-l
 | `info` | Provider name/version/description |
 | start/status/logs/stop/undeploy | Not in Buzz's provider protocol yet ("v2"), so the desktop can't invoke them — all five are implemented as operator CLI subcommands instead (see [Operating a deployed agent](#operating-a-deployed-agent) and the [runbook](docs/RUNBOOK.md)) |
 
-Auth: the operator's existing `~/.databrickscfg` profile, selected via `provider_config.profile`. The Databricks Sandbox preview is region-gated (verified in us-west-2).
+Auth: the operator's existing `~/.databrickscfg` profile, selected via `provider_config.profile`, is used to provision the sandbox itself. The agent's own inference auth is a separate knob, `provider_config.inference_auth` — see [Inference auth](#inference-auth-bring-a-token-default-or-zero-token-opt-in) above. The Databricks Sandbox preview is region-gated (verified in us-west-2).
 
 ## Install from source
 
@@ -140,9 +146,13 @@ With the binary symlinked into `~/.local/bin`, **restart Buzz Desktop** (it snap
    - **Agent harness**: Buzz Agent
    - **LLM provider**: **Databricks v2** from the list — *not* "Custom provider…" (buzz-agent only understands the built-in provider ids, and v2 routes Claude/GPT models through the workspace AI Gateway)
    - **Model**: pick from the discovered list or enter a custom gateway model id (e.g. `databricks-claude-opus-5`)
-3. **Environment variables** (Advanced):
-   - `DATABRICKS_HOST` — the workspace URL serving the model
-   - `DATABRICKS_TOKEN` — **required for sandbox deploys.** buzz-agent's default Databricks auth is a browser OAuth (PKCE) flow, which cannot happen inside a headless sandbox; without a token the agent deploys fine and then fails its first LLM call. Least-privilege option: a service-principal token with CAN QUERY on the gateway endpoints.
+3. **Environment variables** (Advanced) — depends on `inference_auth` (see [Inference auth](#inference-auth-bring-a-token-default-or-zero-token-opt-in) above):
+   - **`inference_auth` unset or `"env"` (default):**
+     - `DATABRICKS_HOST` — the workspace URL serving the model
+     - `DATABRICKS_TOKEN` — **required.** buzz-agent's default Databricks auth is a browser OAuth (PKCE) flow, which cannot happen inside a headless sandbox; without a token the agent deploys fine and then fails its first LLM call. Least-privilege option: a service-principal token with CAN QUERY on the gateway endpoints.
+   - **`inference_auth: "sandbox"`:** leave both unset. The provider derives them from the sandbox's baked creator-identity `~/.databrickscfg` at every launch; only set them here if you want to override the derived credential — explicit env vars always win.
+
+   Switching an **existing** agent's sandbox from env mode to sandbox mode requires deleting the sandbox first (`databricks sandbox delete <id>`) and redeploying fresh: that sandbox's PAT-reset stub already clobbered the baked cfg during its earlier env-mode deploy, so redeploying it in place fails at deploy time with `[provision.sandbox_auth]` (cause: stub marker present — see [`docs/RUNBOOK.md`](docs/RUNBOOK.md#zero-token-inference-auth-inference_auth-sandbox)).
 4. **Run on** → select `databricks-lakebox`. (The section only appears when at least one `buzz-backend-*` binary is discoverable; if it's missing, re-check the symlink and restart the desktop.)
 5. **Create agent** — the deploy takes a couple of minutes on the first run (it downloads and installs the Buzz `.deb` into the sandbox), and is an idempotent update-in-place on redeploys.
 

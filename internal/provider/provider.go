@@ -51,12 +51,47 @@ type envelope struct {
 type DeployFunc func(req *payload.DeployRequest) (agentID string, err error)
 
 type infoResponse struct {
-	Ok          bool     `json:"ok"`
-	Name        string   `json:"name"`
-	Version     string   `json:"version"`
-	Description string   `json:"description"`
-	Protocol    string   `json:"protocol"`
-	Ops         []string `json:"ops"`
+	Ok           bool     `json:"ok"`
+	Name         string   `json:"name"`
+	Version      string   `json:"version"`
+	Description  string   `json:"description"`
+	Protocol     string   `json:"protocol"`
+	Ops          []string `json:"ops"`
+	ConfigSchema any      `json:"config_schema,omitempty"`
+}
+
+// configSchema is the additive, static JSON-Schema-ish object advertised in
+// the info response (docs/CONTRACT.md §4) for provider_config. Buzz Desktop
+// (block/buzz@8bb43d51) renders each property as a free-text create-agent
+// input (title/description/default; `required` gates the create button;
+// coerceConfigValues booleanizes the string "true" — hence string enum
+// types here, never boolean); older desktops ignore this field entirely.
+//
+// keep_workspace_pat and buzz_version are deliberately NOT advertised here
+// — they stay expert-only, documented in docs/CONTRACT.md.
+var configSchema = map[string]any{
+	"type": "object",
+	"properties": map[string]any{
+		"profile": map[string]any{
+			"type":        "string",
+			"title":       "Databricks CLI profile",
+			"description": "Databricks CLI profile selection; empty = the build's baked default.",
+		},
+		"inference_auth": map[string]any{
+			"type":    "string",
+			"title":   "Inference auth",
+			"default": "env",
+			"description": "env (default): you supply DATABRICKS_HOST/DATABRICKS_TOKEN in the agent's " +
+				"environment variables. sandbox: zero-token — the agent reuses the sandbox's built-in " +
+				"per-user credential and can act AS YOU across the whole workspace (opt-in security tradeoff).",
+		},
+		"idle_timeout": map[string]any{
+			"type":        "string",
+			"title":       "Idle timeout",
+			"description": "Duration like 30m or 2h; empty = no autostop (default).",
+		},
+	},
+	"required": []string{},
 }
 
 type errorResponse struct {
@@ -106,12 +141,13 @@ func route(data []byte, deploy DeployFunc) any {
 	switch env.Op {
 	case opInfo:
 		return infoResponse{
-			Ok:          true,
-			Name:        Name,
-			Version:     version.Version,
-			Description: Description,
-			Protocol:    Protocol,
-			Ops:         supportedOps,
+			Ok:           true,
+			Name:         Name,
+			Version:      version.Version,
+			Description:  Description,
+			Protocol:     Protocol,
+			Ops:          supportedOps,
+			ConfigSchema: configSchema,
 		}
 	case opDeploy:
 		return handleDeploy(data, deploy)

@@ -124,6 +124,15 @@ case "$1" in
         } >> "$LOG"
 
         case "$tag" in
+          auth-probe)
+            if [ "${FAKE_AUTH_PROBE_EXIT:-0}" != "0" ]; then
+              if [ -n "${FAKE_AUTH_PROBE_CAUSE:-}" ]; then
+                echo "BUZZ_PROBE_CAUSE=${FAKE_AUTH_PROBE_CAUSE}"
+              fi
+              exit "${FAKE_AUTH_PROBE_EXIT}"
+            fi
+            exit 0
+            ;;
           verify-exec)
             if [ "${FAKE_VERIFY_EXEC_EXIT:-0}" != "0" ]; then
               exit "${FAKE_VERIFY_EXEC_EXIT}"
@@ -327,6 +336,7 @@ type reqOpts struct {
 	buzzVersion      string
 	envVars          map[string]string
 	authTag          string
+	inferenceAuth    string
 }
 
 func buildReq(o reqOpts) *payload.DeployRequest {
@@ -353,6 +363,7 @@ func buildReq(o reqOpts) *payload.DeployRequest {
 			IdleTimeout:      o.idleTimeout,
 			KeepWorkspacePAT: o.keepWorkspacePAT,
 			BuzzVersion:      o.buzzVersion,
+			InferenceAuth:    o.inferenceAuth,
 		},
 	}
 }

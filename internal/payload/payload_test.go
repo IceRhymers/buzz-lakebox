@@ -222,6 +222,54 @@ func TestValidate_EnvVarsKeyNames(t *testing.T) {
 	}
 }
 
+// TestValidate_InferenceAuth covers provider_config.inference_auth: the
+// allowed values ""/"env"/"sandbox" must validate, and anything else
+// (including a case variant like "SANDBOX") must be rejected — matching is
+// exact-case only, deliberately, so a typo never silently falls back to a
+// different auth mode.
+func TestValidate_InferenceAuth(t *testing.T) {
+	baseAgentJSON := `"agent":{"relay_url":"wss://r","private_key_nsec":"nsec1x","auth_tag":"t","agent_command":"buzz-agent"}`
+
+	valid := []string{"", "env", "sandbox"}
+	for _, value := range valid {
+		t.Run(fmt.Sprintf("valid/%q", value), func(t *testing.T) {
+			body := fmt.Sprintf(`{%s,"provider_config":{"inference_auth":%q}}`, baseAgentJSON, value)
+			req, err := ParseDeployRequest([]byte(body))
+			if err != nil {
+				t.Fatalf("ParseDeployRequest error: %v", err)
+			}
+			if req.ProviderConfig.InferenceAuth != value {
+				t.Fatalf("ProviderConfig.InferenceAuth = %q, want %q", req.ProviderConfig.InferenceAuth, value)
+			}
+			if err := req.Validate(); err != nil {
+				t.Fatalf("Validate() should accept inference_auth %q, got: %v", value, err)
+			}
+			wantSandbox := value == "sandbox"
+			if got := req.ProviderConfig.SandboxInferenceAuth(); got != wantSandbox {
+				t.Fatalf("SandboxInferenceAuth() = %v, want %v for inference_auth %q", got, wantSandbox, value)
+			}
+		})
+	}
+
+	rejected := []string{"oauth", "SANDBOX", "Env", "sandbox "}
+	for _, value := range rejected {
+		t.Run(fmt.Sprintf("rejected/%q", value), func(t *testing.T) {
+			body := fmt.Sprintf(`{%s,"provider_config":{"inference_auth":%q}}`, baseAgentJSON, value)
+			req, err := ParseDeployRequest([]byte(body))
+			if err != nil {
+				t.Fatalf("ParseDeployRequest error: %v", err)
+			}
+			err = req.Validate()
+			if err == nil {
+				t.Fatalf("Validate() should reject inference_auth %q", value)
+			}
+			if !strings.Contains(err.Error(), "provider_config.inference_auth") {
+				t.Fatalf("error should name provider_config.inference_auth, got: %v", err)
+			}
+		})
+	}
+}
+
 // TestValidate_EnvVarsAllValidKeysStillPasses is a regression check: a
 // payload with only valid env_vars keys must still validate cleanly.
 func TestValidate_EnvVarsAllValidKeysStillPasses(t *testing.T) {

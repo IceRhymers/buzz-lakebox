@@ -66,17 +66,23 @@ Source: `desktop/src-tauri/src/commands/agents_deploy.rs` — `deploy_payload_js
 
 ### `provider_config`
 
-Validated by the desktop before it reaches us (`validate_provider_config`, backend.rs:390-421): flat object, ≤20 fields, ≤64 KB, scalar values only, no secret-like key names (`secret|password|token|key|credential` as word segments). Our keys (`profile`, `idle_timeout`, `keep_workspace_pat`, `buzz_version`) all pass.
+Validated by the desktop before it reaches us (`validate_provider_config`, backend.rs:390-421): flat object, ≤20 fields, ≤64 KB, scalar values only, no secret-like key names (`secret|password|token|key|credential` as word segments). Our keys (`profile`, `idle_timeout`, `keep_workspace_pat`, `buzz_version`, `inference_auth`) all pass — `inference_auth`'s own segments (`inference`, `auth`) don't match the filter, which is exactly why the knob is named that and never `*token*`.
+
+- `inference_auth` — string enum `""` \| `"env"` \| `"sandbox"`, default `""` (treated as `"env"`). `"env"`: current behavior — the provider resets the sandbox's baked creator-identity PAT to a stub and the owner supplies `DATABRICKS_HOST`/`DATABRICKS_TOKEN` via `agent.env_vars`. `"sandbox"`: zero-token — the provider skips the PAT reset/re-assert, keeps the baked `~/.databrickscfg`, and derives `DATABRICKS_HOST`/`DATABRICKS_TOKEN` from it at every launch (only-if-unset, so explicit `env_vars` still win). `"sandbox"` supersedes `keep_workspace_pat` when both are set on the same deploy — they're redundant, not conflicting: both keep the baked cfg in place.
 
 ## 4. Response shapes
 
 ### `info`
 
-Passed through to the frontend **unvalidated** (agent_providers.rs returns `invoke_provider`'s value directly). Convention (must not set `ok:false`):
+Passed through to the frontend **unvalidated** (agent_providers.rs returns `invoke_provider`'s value directly) — but not inert. As of `block/buzz` @ `8bb43d51` (pin this citation; re-verify if buzz moves), Buzz Desktop reads an additive `config_schema` field and renders it as create-agent inputs: `desktop/src/shared/api/types.ts:437` (`BackendProviderProbeResult`) declares the shape; `WhereToRunSection.tsx` → `ProviderConfigFields.tsx` walks `config_schema.properties` and renders one free-text input per property, seeded from `title`/`description`/`default`; `config_schema.required` gates the create-agent button; `coerceConfigValues` type-coerces the entered strings back (e.g. `"true"` → bool) before they're stored on the agent record. Those stored values are resent as `provider_config` on **every** redeploy. Older desktops that predate this field simply ignore it — it's additive and does not change wire compatibility.
+
+Convention (must not set `ok:false`):
 
 ```json
-{"ok":true,"name":"Databricks Lakebox","version":"<semver>","description":"...","protocol":"v1","ops":["info","deploy"]}
+{"ok":true,"name":"Databricks Lakebox","version":"<semver>","description":"...","protocol":"v1","ops":["info","deploy"],"config_schema":{"type":"object","properties":{"profile":{"type":"string","title":"Databricks CLI profile","description":"Databricks CLI profile selection; empty = the build's baked default."},"inference_auth":{"type":"string","title":"Inference auth","default":"env","description":"env (default): you supply DATABRICKS_HOST/DATABRICKS_TOKEN in the agent's environment variables. sandbox: zero-token — the agent reuses the sandbox's built-in per-user credential and can act AS YOU across the whole workspace (opt-in security tradeoff)."},"idle_timeout":{"type":"string","title":"Idle timeout","description":"Duration like 30m or 2h; empty = no autostop (default)."}},"required":[]}}
 ```
+
+We advertise only `profile`, `inference_auth`, and `idle_timeout` in `config_schema.properties`. `keep_workspace_pat` and `buzz_version` stay expert-only — documented here in CONTRACT.md, not schema-advertised — since they're footguns better set deliberately in a hand-written payload than exposed as a free-text field in the desktop UI.
 
 ### `deploy` success (backend.rs:373-376)
 

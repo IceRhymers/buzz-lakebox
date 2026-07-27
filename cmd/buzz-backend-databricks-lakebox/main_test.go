@@ -69,6 +69,87 @@ func TestUndeploy_YesRequiresExplicitID(t *testing.T) {
 //
 // This one reaches exec by design, so the shim is what keeps it off the
 // network — see databricksShim.
+// TestDeploy_SandboxInferenceAuth_WarnsOnStderr pins the operator-path
+// warning (docs/PLAN.md zero-token design item 5): inference_auth:
+// "sandbox" reverses least-privilege, so `deploy --payload-file` must
+// warn loudly on stderr. The deploy itself still fails (the shim always
+// fails), which is fine — the warning must print before any exec is
+// attempted.
+func TestDeploy_SandboxInferenceAuth_WarnsOnStderr(t *testing.T) {
+	databricksShim(t)
+
+	dir := t.TempDir()
+	payloadPath := filepath.Join(dir, "payload.json")
+	payloadJSON := `{
+		"agent": {
+			"name": "reviewer",
+			"relay_url": "wss://relay.example.com",
+			"private_key_nsec": "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5",
+			"auth_tag": "tag",
+			"agent_command": "buzz-agent"
+		},
+		"provider_config": {"inference_auth": "sandbox"}
+	}`
+	if err := os.WriteFile(payloadPath, []byte(payloadJSON), 0o600); err != nil {
+		t.Fatalf("write payload file: %v", err)
+	}
+
+	cmd := newRootCmd()
+	var out, errOut bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errOut)
+	cmd.SetArgs([]string{"deploy", "--payload-file", payloadPath})
+
+	// deploy's RunE always returns nil (errors are rendered into the
+	// {"ok":false,...} stdout JSON instead), so no error assertion here.
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("deploy command itself errored: %v", err)
+	}
+
+	if !strings.Contains(errOut.String(), "inference_auth=sandbox") {
+		t.Fatalf("expected a sandbox-mode stderr warning, got stderr: %q", errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "creator-identity") {
+		t.Fatalf("expected the warning to name the creator-identity tradeoff, got: %q", errOut.String())
+	}
+}
+
+// TestDeploy_EnvModeDefault_NoStderrWarning is the falsifier for the test
+// above: with no inference_auth set (today's default), the operator path
+// must print nothing extra on stderr.
+func TestDeploy_EnvModeDefault_NoStderrWarning(t *testing.T) {
+	databricksShim(t)
+
+	dir := t.TempDir()
+	payloadPath := filepath.Join(dir, "payload.json")
+	payloadJSON := `{
+		"agent": {
+			"name": "reviewer",
+			"relay_url": "wss://relay.example.com",
+			"private_key_nsec": "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5",
+			"auth_tag": "tag",
+			"agent_command": "buzz-agent"
+		}
+	}`
+	if err := os.WriteFile(payloadPath, []byte(payloadJSON), 0o600); err != nil {
+		t.Fatalf("write payload file: %v", err)
+	}
+
+	cmd := newRootCmd()
+	var out, errOut bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errOut)
+	cmd.SetArgs([]string{"deploy", "--payload-file", payloadPath})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("deploy command itself errored: %v", err)
+	}
+
+	if strings.Contains(errOut.String(), "inference_auth=sandbox") {
+		t.Fatalf("env-mode (default) deploy must not print the sandbox-mode warning, got stderr: %q", errOut.String())
+	}
+}
+
 func TestUndeploy_YesWithExplicitIDPassesTheGuard(t *testing.T) {
 	databricksShim(t)
 

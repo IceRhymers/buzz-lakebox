@@ -61,6 +61,23 @@ type ProviderConfig struct {
 	IdleTimeout      string `json:"idle_timeout"`
 	KeepWorkspacePAT bool   `json:"keep_workspace_pat"`
 	BuzzVersion      string `json:"buzz_version"`
+	// InferenceAuth selects how the sandboxed agent authenticates to the
+	// workspace AI Gateway. Allowed values: "" and "env" (default: the
+	// agent uses DATABRICKS_HOST/DATABRICKS_TOKEN supplied via
+	// agent.env_vars, today's behavior) or "sandbox" (zero-token: the
+	// agent instead derives its credential at launch time from the
+	// sandbox's own baked ~/.databrickscfg, so no token ever needs to be
+	// minted or transmitted). The key is named "inference_auth" rather
+	// than something containing token/key/secret/password/credential
+	// deliberately, so it passes the desktop's secret-word config filter.
+	InferenceAuth string `json:"inference_auth"`
+}
+
+// SandboxInferenceAuth reports whether provider_config opts the deploy into
+// zero-token inference auth (InferenceAuth == "sandbox"); see the field's
+// doc comment above.
+func (c ProviderConfig) SandboxInferenceAuth() bool {
+	return c.InferenceAuth == "sandbox"
 }
 
 // ParseDeployRequest unmarshals a raw deploy request body (the "agent" and
@@ -108,8 +125,28 @@ func (a Agent) Validate() error {
 	return nil
 }
 
-// Validate validates the full deploy request (currently delegates to the
-// agent sub-object; provider_config has no required fields).
+// validInferenceAuthValues are the only accepted provider_config.inference_auth
+// values. Matching is exact-case; "SANDBOX" or similar variants are rejected
+// rather than silently normalized, so callers can't be surprised by a typo
+// quietly falling back to a different auth mode.
+var validInferenceAuthValues = map[string]bool{
+	"":        true,
+	"env":     true,
+	"sandbox": true,
+}
+
+// Validate validates the full deploy request: the agent sub-object plus the
+// provider_config fields this provider itself constrains. It never returns a
+// value derived from secrets in the error text.
 func (r DeployRequest) Validate() error {
-	return r.Agent.Validate()
+	if err := r.Agent.Validate(); err != nil {
+		return err
+	}
+	if !validInferenceAuthValues[r.ProviderConfig.InferenceAuth] {
+		return fmt.Errorf(
+			"provider_config.inference_auth %q is not supported; allowed values are \"\", \"env\", \"sandbox\"",
+			r.ProviderConfig.InferenceAuth,
+		)
+	}
+	return nil
 }

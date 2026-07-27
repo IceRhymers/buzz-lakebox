@@ -67,7 +67,7 @@ func newLaunchHarness(t *testing.T) *launchHarness {
 	}
 
 	scriptPath := filepath.Join(backend, "launch.sh")
-	if err := os.WriteFile(scriptPath, []byte(RenderLaunchScript(false)), 0o700); err != nil {
+	if err := os.WriteFile(scriptPath, []byte(RenderLaunchScript(false, false)), 0o700); err != nil {
 		t.Fatalf("write launch.sh: %v", err)
 	}
 

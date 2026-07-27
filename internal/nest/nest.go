@@ -43,10 +43,19 @@ func derefOrDefault(s *string, def string) string {
 	return *s
 }
 
+// PATStubMarker is the first line of PATStub, hoisted into its own
+// exported const so a later deploy-time auth probe (internal/deployflow)
+// can grep an in-sandbox ~/.databrickscfg for this exact text to detect
+// "this sandbox was already deployed in env mode and its baked PAT is
+// gone" without keeping a second copy of the literal that could drift
+// from PATStub itself.
+const PATStubMarker = `# Databricks CLI config managed by buzz-backend-databricks-lakebox.`
+
 // PATStub is the comment-only ~/.databrickscfg content that neutralizes
 // the baked creator-identity PAT (docs/PLAN.md §4.4 step 4 / §5): no
-// profiles, no credentials.
-const PATStub = `# Databricks CLI config managed by buzz-backend-databricks-lakebox.
+// profiles, no credentials. Built from PATStubMarker by compile-time
+// concatenation so the two can never drift apart.
+const PATStub = PATStubMarker + `
 #
 # The baked creator-identity PAT has been intentionally removed by this
 # provider (docs/PLAN.md §4.4 step 4, §5): the sandbox's in-image
@@ -85,12 +94,91 @@ const AliveCheckSnippet = `buzz_acp_alive() {
   return 1
 }`
 
+// SandboxAuthSnippet derives DATABRICKS_HOST/DATABRICKS_TOKEN at launch
+// time from the sandbox's baked creator-identity ~/.databrickscfg, for
+// provider_config.inference_auth="sandbox" (docs/PLAN.md zero-token
+// design, option A). RenderEnv appends it, verbatim and with no payload
+// interpolation, after the sorted env_vars block. Both launch.sh (step 9)
+// and install.BuildVerifyCommand's handshake `.`-source the rendered env
+// content, the latter under `set -a` — so this text has to survive both
+// sourcing contexts unconditionally. That drives every rule below:
+//
+//   - It is a no-op unless DATABRICKS_TOKEN is unset/empty AND
+//     ~/.databrickscfg is readable, so env_vars-supplied credentials (or
+//     a value some other mechanism already exported) always win —
+//     derivation is a fallback, never an override.
+//   - [DEFAULT]-section-scoped extraction only: a small awk state machine
+//     tracks whether the current line is inside "[DEFAULT]" and resets on
+//     any other "[section]" line, so profiles before/after DEFAULT (or a
+//     DEFAULT block that isn't first) can't leak their host/token in.
+//     "key = value" and "key=value" spacing are both tolerated (optional
+//     tabs/spaces around "="); the value is taken verbatim (docs/M05
+//     precedent: host used as-is) with no scheme normalization or
+//     trimming beyond the delimiter's own surrounding whitespace.
+//   - R3(a): every command substitution below ends `2>/dev/null || true`,
+//     AND the awk program itself always `exit 0`s from its END block —
+//     belt and suspenders — so a parse failure can never hand a non-zero
+//     status to the sourcing `set -eu` shell.
+//   - R3(b): control flow is if/fi only; there is no top-level `&&` chain
+//     standing in for it (the `&&` inside the outer `if [ ... ] && [ ... ];
+//     then` is the condition of that if, which `set -e` always exempts,
+//     not a trailing list). The snippet's last line is a bare `:`, so
+//     whatever the last `if` decided, the `.` builtin's reported status
+//     (the status of the last command run) is always 0 — sourcing can
+//     never die here even when this is the last content in the file.
+//   - R3(c): every scratch variable is `buzz_`-prefixed and explicitly
+//     `unset` before the final `:`. install.BuildVerifyCommand sources
+//     this content under `set -a`, which auto-exports every variable
+//     assigned afterward; without the unset, buzz_awk_extract/buzz_host/
+//     buzz_token would leak into buzz-agent's own handshake environment.
+const SandboxAuthSnippet = `# Zero-token inference auth (provider_config.inference_auth="sandbox"):
+# derive DATABRICKS_HOST/DATABRICKS_TOKEN from the sandbox's baked
+# creator-identity ~/.databrickscfg, only if not already set above by
+# env_vars. This block is a fallback, never an override: env_vars are
+# rendered first and this only fires when DATABRICKS_TOKEN is still unset.
+if [ -z "${DATABRICKS_TOKEN:-}" ] && [ -r "$HOME/.databrickscfg" ]; then
+  buzz_awk_extract='
+    BEGIN { insec = 0; found = 0 }
+    /^\[/ {
+      insec = ($0 == "[DEFAULT]") ? 1 : 0
+      next
+    }
+    insec && !found {
+      line = $0
+      sub(/^[ \t]+/, "", line)
+      if (line ~ ("^" want "[ \t]*=")) {
+        sub(("^" want "[ \t]*=[ \t]*"), "", line)
+        print line
+        found = 1
+      }
+    }
+    END { exit 0 }
+  '
+  buzz_host=$(awk -v want=host "$buzz_awk_extract" "$HOME/.databrickscfg" 2>/dev/null || true)
+  buzz_token=$(awk -v want=token "$buzz_awk_extract" "$HOME/.databrickscfg" 2>/dev/null || true)
+
+  if [ -z "${DATABRICKS_HOST:-}" ] && [ -n "$buzz_host" ]; then
+    export DATABRICKS_HOST="$buzz_host"
+  fi
+  if [ -n "$buzz_token" ]; then
+    export DATABRICKS_TOKEN="$buzz_token"
+  fi
+fi
+unset buzz_awk_extract buzz_host buzz_token
+:
+`
+
 // RenderEnv renders the $HOME/.buzz-backend/env content for agent: one
 // `export KEY='value'` line per field (docs/PLAN.md §4.4 step 7 field
 // list), in a fixed order, with merged env_vars emitted LAST (sorted by
 // key for determinism) so they win over the fixed inference defaults on
 // `source` (agent env_vars carry DATABRICKS_HOST/DATABRICKS_TOKEN).
-func RenderEnv(agent payload.Agent) string {
+//
+// sandboxInferenceAuth mirrors provider_config.inference_auth=="sandbox":
+// when true, SandboxAuthSnippet is appended AFTER the env_vars block, so
+// it can only ever fill in credentials env_vars didn't already supply.
+// When false, output is byte-identical to the pre-zero-token behavior.
+func RenderEnv(agent payload.Agent, sandboxInferenceAuth bool) string {
 	var b strings.Builder
 	// emit writes KEY unquoted/raw (only VALUE is shellquote'd) into a file
 	// that RenderLaunchScript's `. "$HOME/.buzz-backend/env"` line
@@ -184,6 +272,11 @@ func RenderEnv(agent payload.Agent) string {
 		emit(k, agent.EnvVars[k])
 	}
 
+	if sandboxInferenceAuth {
+		b.WriteString("\n")
+		b.WriteString(SandboxAuthSnippet)
+	}
+
 	return b.String()
 }
 
@@ -201,18 +294,30 @@ func RenderEnv(agent payload.Agent) string {
 // launch.sh runs on every deploy AND every future `start`/supervisor
 // relaunch — unconditionally re-asserting would clobber the owner's kept
 // PAT on the very first relaunch after deploy, defeating the opt-out.
-func RenderLaunchScript(keepWorkspacePAT bool) string {
+//
+// sandboxInferenceAuth mirrors provider_config.inference_auth=="sandbox"
+// and ALSO skips the stub, for the same underlying reason: zero-token
+// mode needs the sandbox's baked creator-identity ~/.databrickscfg intact
+// so SandboxAuthSnippet (rendered into the env file by RenderEnv, sourced
+// a few lines below) has something to derive DATABRICKS_HOST/
+// DATABRICKS_TOKEN from at every launch. inference_auth:"sandbox"
+// therefore supersedes keep_workspace_pat: either flag alone is enough to
+// keep the cfg, and setting both is redundant but harmless.
+func RenderLaunchScript(keepWorkspacePAT, sandboxInferenceAuth bool) string {
 	var b strings.Builder
 	b.WriteString("#!/bin/sh\n")
 	b.WriteString("set -eu\n\n")
 
-	if !keepWorkspacePAT {
+	if !keepWorkspacePAT && !sandboxInferenceAuth {
 		b.WriteString("# Re-assert the PAT stub on every launch (deploy, `start`, and any future\n")
 		b.WriteString("# supervisor all funnel through this script) — covers the unverified\n")
 		b.WriteString("# \"does sandbox start restore the baked PAT file?\" case by construction.\n")
 		b.WriteString("# Skipped entirely when provider_config.keep_workspace_pat=true, so the\n")
 		b.WriteString("# owner's retained PAT survives every relaunch, not just the initial\n")
-		b.WriteString("# deploy (BUG 3 fix: this used to run unconditionally here).\n")
+		b.WriteString("# deploy (BUG 3 fix: this used to run unconditionally here). Also\n")
+		b.WriteString("# skipped when provider_config.inference_auth=\"sandbox\": that mode\n")
+		b.WriteString("# needs the baked cfg intact for SandboxAuthSnippet to derive\n")
+		b.WriteString("# credentials from, and it supersedes keep_workspace_pat.\n")
 		b.WriteString("umask 077\n")
 		b.WriteString(`cat > "$HOME/.databrickscfg" <<'BUZZ_PAT_STUB_EOF'` + "\n")
 		b.WriteString(PATStub)

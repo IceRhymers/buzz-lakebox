@@ -30,6 +30,25 @@ const (
 // error or any argv, on any path.
 var markerSecrets = []string{markerNsec, markerAuthTag, markerToken, markerAPIKey, markerPassword}
 
+// markerDapiToken is a bare Databricks PAT shape ("dapi" + hex) standing
+// in for the sandbox inference-auth credential (provider_config
+// .inference_auth: "sandbox"), which is derived in-sandbox from the
+// baked ~/.databrickscfg and deliberately never rides the payload
+// (PLAN.md pre-mortem #3). Because it never rides the payload, it is NOT
+// added to markerSecrets — TestDeploy_MarkerSecretsDoTravelOverStdin
+// asserts every entry in that slice reaches the sandbox over stdin,
+// which is exactly the property this token does not have. Only
+// redact.Log's dapiPrefixPattern floor protects a leak of this shape.
+// Assembled at runtime so the token-shaped literal never appears
+// contiguously in source — the Databricks pre-commit secret scanner
+// (correctly) refuses to commit anything matching a real PAT shape,
+// and these fixtures exist precisely to look like one.
+var markerDapiToken = "dapi" + strings.Repeat("0123456789abcdef", 2)
+
+// dapiOnlySecrets is checked in TestDeploy_MarkerSecretsNeverLeakOnAnyPath
+// alongside markerSecrets, but kept separate for the reason above.
+var dapiOnlySecrets = []string{markerDapiToken}
+
 func markerRequest() *reqOpts {
 	return &reqOpts{
 		nsec:    markerNsec,
@@ -87,20 +106,28 @@ func TestDeploy_MarkerSecretsNeverLeakOnAnyPath(t *testing.T) {
 			// verify errors, so plant a marker there too — a log tail
 			// carrying a secret must be scrubbed like any other text.
 			if _, ok := sc.env["FAKE_ACP_LOG"]; !ok && sc.name != "happy path" {
-				t.Setenv("FAKE_ACP_LOG", healthyLog+"context: token="+markerToken+"\n")
+				// The dapi-shaped token is appended bare, without a
+				// KEY= assignment around it — mirroring a
+				// sandbox-derived credential that leaks into acp.log
+				// on its own, a shape secretAssignmentPattern cannot
+				// catch and only dapiPrefixPattern can.
+				t.Setenv("FAKE_ACP_LOG", healthyLog+"context: token="+markerToken+"\nderived credential "+markerDapiToken+"\n")
 			}
 
 			_, err := h.dep.Deploy(buildReq(opts))
 
 			if err != nil {
 				assertNoMarkers(t, "returned error", err.Error())
+				assertSecretsAbsent(t, "returned error", err.Error(), dapiOnlySecrets)
 			}
 			for _, e := range h.events() {
 				switch e.kind {
 				case "CLI":
 					assertNoMarkers(t, "databricks CLI argv", e.cliLine)
+					assertSecretsAbsent(t, "databricks CLI argv", e.cliLine, dapiOnlySecrets)
 				case "SSH":
 					assertNoMarkers(t, fmt.Sprintf("argv of ssh step %q", e.sshTag), e.args(t))
+					assertSecretsAbsent(t, fmt.Sprintf("argv of ssh step %q", e.sshTag), e.args(t), dapiOnlySecrets)
 				}
 			}
 		})
@@ -158,7 +185,12 @@ func TestLifecycle_MarkerSecretsNeverLeak(t *testing.T) {
 
 func assertNoMarkers(t *testing.T, where, text string) {
 	t.Helper()
-	for _, secret := range markerSecrets {
+	assertSecretsAbsent(t, where, text, markerSecrets)
+}
+
+func assertSecretsAbsent(t *testing.T, where, text string, secrets []string) {
+	t.Helper()
+	for _, secret := range secrets {
 		if strings.Contains(text, secret) {
 			t.Fatalf("marker secret %q leaked into %s: %s", secret, where, text)
 		}

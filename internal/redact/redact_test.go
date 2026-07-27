@@ -57,6 +57,62 @@ func TestRedact_NsecPrefixScrub_StopsAtWhitespaceOrQuote(t *testing.T) {
 	}
 }
 
+// fakeDapi tokens for the dapi-scrub tests, assembled at runtime so the
+// token-shaped literal never appears contiguously in source (the
+// Databricks pre-commit secret scanner flags real-PAT shapes, which is
+// exactly the shape these fixtures must have).
+var (
+	fakeDapiA = "dapi" + strings.Repeat("0123456789abcdef", 2)
+	fakeDapiB = "dapi" + strings.Repeat("fedcba9876543210", 2)
+)
+
+func TestRedact_DapiPrefixScrub(t *testing.T) {
+	got := Redact("saw token "+fakeDapiA+" mid-sentence", nil)
+	if strings.Contains(got, "dapi0123456789") {
+		t.Fatalf("dapi token survived redaction: %q", got)
+	}
+	if !strings.Contains(got, Placeholder) {
+		t.Fatalf("expected placeholder in output: %q", got)
+	}
+}
+
+func TestRedact_DapiPrefixScrub_QuotedForms(t *testing.T) {
+	got := Redact(`"`+fakeDapiA+`" and '`+fakeDapiB+`', done`, nil)
+	if strings.Contains(got, "dapi") {
+		t.Fatalf("dapi fragments survived redaction: %q", got)
+	}
+	if !strings.Contains(got, `"`+Placeholder+`"`) || !strings.Contains(got, `'`+Placeholder+`'`) {
+		t.Fatalf("expected quotes preserved around placeholder: %q", got)
+	}
+	if !strings.Contains(got, "done") {
+		t.Fatalf("expected surrounding text preserved: %q", got)
+	}
+}
+
+func TestRedact_DapiPrefixScrub_NegativeCases(t *testing.T) {
+	// The bare word "dapi" (no hex tail) must survive.
+	if got := Redact("the prefix is dapi and nothing else", nil); got != "the prefix is dapi and nothing else" {
+		t.Fatalf("Redact should not touch bare \"dapi\", got %q", got)
+	}
+	// "deadbeef" is only 8 hex chars — below the 16-char floor — so this
+	// must also survive untouched.
+	if got := Redact("value is dapideadbeef here", nil); got != "value is dapideadbeef here" {
+		t.Fatalf("Redact should not touch short-hex dapideadbeef, got %q", got)
+	}
+}
+
+func TestRedact_DapiPrefixScrub_SuffixConsumed(t *testing.T) {
+	// A suffixed token form (e.g. a trailing "-3" disambiguator) must be
+	// fully consumed, not left as a fragment after the placeholder.
+	got := Redact("token="+fakeDapiA+"-3 trailing", nil)
+	if strings.Contains(got, "dapi") || strings.Contains(got, "-3") {
+		t.Fatalf("suffixed dapi token left a fragment: %q", got)
+	}
+	if !strings.Contains(got, "trailing") {
+		t.Fatalf("expected surrounding text preserved: %q", got)
+	}
+}
+
 func TestRedact_EmptyInput(t *testing.T) {
 	if got := Redact("", []string{"whatever"}); got != "" {
 		t.Fatalf("Redact(\"\") = %q, want empty", got)
@@ -159,6 +215,32 @@ func TestLog_ScrubsBareNsecWithoutAnAssignment(t *testing.T) {
 	got := Log("panic: key nsec1abcdefghijklmnop was rejected")
 	if strings.Contains(got, "nsec1abcdefghijklmnop") {
 		t.Fatalf("Log() left a bare nsec in the output: %s", got)
+	}
+}
+
+// TestLog_ScrubsBareDapiWithoutAnAssignment covers the sandbox
+// inference-auth leak path: a derived Databricks PAT that never rode an
+// assignment (e.g. echoed mid-sentence in acp.log) must still be
+// scrubbed by the always-on dapiPrefixPattern floor.
+func TestLog_ScrubsBareDapiWithoutAnAssignment(t *testing.T) {
+	got := Log("panic: token " + fakeDapiA + " was rejected")
+	if strings.Contains(got, "dapi0123456789") {
+		t.Fatalf("Log() left a bare dapi token in the output: %s", got)
+	}
+}
+
+// TestLog_ScrubsDapiAssignment asserts the DATABRICKS_TOKEN=dapi... value
+// is gone from Log() output — the assignment-shaped path
+// (secretAssignmentPattern) already scrubs it before dapiPrefixPattern
+// ever runs, but the property under test is that the value doesn't
+// survive by either mechanism.
+func TestLog_ScrubsDapiAssignment(t *testing.T) {
+	got := Log("export DATABRICKS_TOKEN=" + fakeDapiA)
+	if strings.Contains(got, "dapi0123456789") {
+		t.Fatalf("Log() left the dapi token value in the output: %s", got)
+	}
+	if !strings.Contains(got, "DATABRICKS_TOKEN") {
+		t.Fatalf("Log() removed the variable name: %s", got)
 	}
 }
 
