@@ -23,16 +23,30 @@ Cross-checked against `docs/RUNBOOK.md` §9's Deploy block (items 1–4).
 
 ### 1(a) — non-member throwaway key
 
-RUNBOOK §9 item 1 unpacks into five observable sub-clauses. None have
-been run live.
+RUNBOOK §9 item 1's sub-clauses, run live 2026-07-26 with the operator
+`deploy --payload-file` path on profile `fevm-west` and a throwaway key
+minted for the occasion (npub12 `c6lhtwgue3vc`). Fresh-create verify
+failures run §4.3 teardown, so the in-sandbox rows were captured by a
+probe SSH racing the provision window (§9 item 1 documents this); the
+log rows come from the tail the deploy embeds in its error text.
+
+The first attempt (23:21Z, sandbox `expert-motmot-2453`) returned
+`verify.process_dead` for a log that plainly carried the terminal
+relay-denial line: the classifier checked process liveness first, and a
+non-member key kills buzz-acp in ~1 s, so `relay_denied` was unreachable
+in exactly its target scenario. The commit introducing this row fixes
+the ordering in `deployflow.verifyLaunch` (falsifier:
+`TestDeploy_LaunchVerifyFails_TerminalError_DeadProcess_ClassifiesRelayDenied`);
+the rows below are from the rerun after that fix.
 
 | Check | Status | Evidence | Date | Sandbox id |
 |---|---|---|---|---|
-| Deploy fails with `verify.relay_denied` | NOT RUN | none found | — | — |
-| Sandbox named `buzz-<npub12>-<slug>` exists | NOT RUN | none found | — | — |
-| Binaries (incl. `buzz-agent`, ACP-initialize-verified) installed in `$HOME` | NOT RUN | none found | — | — |
-| Env file is `0600` | NOT RUN | none found | — | — |
-| In-sandbox `databricks current-user me` fails (PAT reset) | NOT RUN | none found | — | — |
+| Deploy fails with `verify.relay_denied` | LIVE | `{"ok":false}` `[verify.relay_denied]` in 31 s wall clock (23:26:10→23:26:42Z) | 2026-07-26 | `rested-pufferfish-1626` |
+| Sandbox created for the attempt, then torn down (absent from `sandbox list` once delete settles) | LIVE | id visible in `sandbox list` 2 s after deploy start and named in the error text; `stopping…` immediately after the deploy returned, gone thereafter | 2026-07-26 | `rested-pufferfish-1626` |
+| Binaries (all five, `buzz-agent` ACP-initialize-verified) installed in `$HOME` | LIVE | mid-deploy probe: `bin/` = `buzz, buzz-acp, buzz-agent, buzz-dev-mcp, git-credential-nostr`; the 23:21Z run's embedded log tail shows `agent initialized … "name":"buzz-agent"` | 2026-07-26 | `rested-pufferfish-1626` |
+| Env file is `0600` | LIVE | mid-deploy probe `stat -c %a $HOME/.buzz-backend/env` → `600` | 2026-07-26 | `rested-pufferfish-1626` |
+| In-sandbox `databricks current-user me` fails (PAT reset) | LIVE | mid-deploy probe: exit code 1 | 2026-07-26 | `rested-pufferfish-1626` |
+| acp.log vocabulary; buzz-acp dead at N=10 s | LIVE | 23:21Z error tail carries `buzz-acp starting: relay=wss://…` and `initial relay connect failed with terminal error: Auth failed: restricted: not a relay member`; post-fix, the `relay_denied` code itself only fires on (process dead at N=10 s ∧ terminal-error line), so the 23:26Z error code doubles as the liveness evidence | 2026-07-26 | `expert-motmot-2453`, `rested-pufferfish-1626` |
 
 ### 1(b) — member test key
 
@@ -50,7 +64,7 @@ been run live.
 
 | Check | Status | Evidence | Date | Sandbox id |
 |---|---|---|---|---|
-| Kill network mid-deploy on a fresh create → `{ok:false}` naming the sandbox id, sandbox absent from `sandbox list` afterward | NOT RUN | none found | — | — |
+| Kill the deploy's `install-exec` SSH child on a fresh create → `{ok:false}` naming the sandbox id, sandbox absent from `sandbox list` afterward | LIVE | `pkill -f 'buzz-step:install-exec'` fired 6 s into the deploy (23:29:29Z); deploy returned `[install.exec] … signal: terminated` naming the sandbox in 8.4 s; by 23:29:56Z `sandbox list` showed only the pre-existing live sandbox — teardown deleted it, no manual cleanup | 2026-07-26 | `exemplary-jennet-8274` |
 
 ---
 
@@ -108,15 +122,20 @@ of this probe's outcome.
 
 ## Substitutions
 
-Two places where RUNBOOK §9's procedure narrows PLAN §6 M1, so a future
+Places where RUNBOOK §9's procedure narrows PLAN §6 M1, so a future
 reader knows a `LIVE` row there means the proxy passed, not the literal
 clause:
 
-- PLAN 1(a) says buzz-acp "exits 1"; §9 substitutes "no non-zombie
-  `pgrep` match at N=10s" — a detached process's exit code is not
-  observable to the operator.
-- PLAN §4.4 step 5 symlinks five binaries; §9 checks two (`buzz-acp`,
-  `buzz-agent`).
+- PLAN 1(a) says buzz-acp "exits 1"; the operator cannot observe a
+  detached process's exit code, so the proxy is the deploy's own N=10 s
+  process check — post-classifier-fix, `verify.relay_denied` fires only
+  when that check found the process dead AND the log carried the
+  terminal-error line.
+- The 1(a) in-sandbox rows (binaries, env perms, PAT reset) are observed
+  mid-deploy by a probe racing the provision window, because §4.3
+  failure teardown deletes a freshly created sandbox before the deploy
+  returns. There is no post-hoc sandbox to inspect; the teardown itself
+  is one of the row's pass criteria.
 
 ---
 
