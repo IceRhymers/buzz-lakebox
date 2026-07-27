@@ -191,7 +191,7 @@ Match on the code, not the prose.
 | `verify.unreachable` | the sandbox stopped responding right after launch — run `status <sandbox-id>`, then `start <sandbox-id>` |
 | `verify.unparseable` | run `status <sandbox-id>` and `logs <sandbox-id>` to see the agent's real state before redeploying |
 | `verify.process_dead` | run `logs <sandbox-id>` for the crash output; the acp.log tail is included above |
-| `verify.relay_denied` | mint or register a relay-member key for this agent in Buzz Desktop and redeploy — this key is not a member of the target relay |
+| `verify.relay_denied` | mint or register a relay-member key for this agent in Buzz Desktop and redeploy — this key is not a member of the target relay, or the payload's auth_tag is missing/stale (the relay denies a member key with an empty auth tag the same way) |
 | `verify.pool_not_ready` | run `logs <sandbox-id>`; the agent started but never reported a ready pool within the verification window |
 | `autostop.config` | run `databricks sandbox config <sandbox-id> --no-autostop` manually, or redeploy — the agent itself is healthy |
 | `lifecycle.not_deployed` | deploy this sandbox first (from Buzz Desktop, or `deploy --payload-file`) |

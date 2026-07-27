@@ -50,15 +50,33 @@ the rows below are from the rerun after that fix.
 
 ### 1(b) — member test key
 
+Run live 2026-07-27 with the operator `deploy --payload-file` path and
+the "Throwaway Buzz" member test agent (pubkey `fa7b9bf5…`), minted in
+Buzz Desktop the same morning.
+
+Finding on the way in: the first attempt carried `auth_tag: ""` and the
+relay denied it (`verify.relay_denied`) even though the key IS a member
+— Buzz Desktop had deployed the same key successfully minutes earlier
+(sandbox `permissive-shrimp-4596`, `agent_pool_ready agents=24`). The
+auth tag is part of relay AUTH, not optional metadata: on the wire, a
+member key with an empty tag is indistinguishable from a non-member.
+RUNBOOK §7's `verify.relay_denied` remedy now says so. This does not
+weaken the 1(a) rows — those keys were genuinely non-members — but a
+`relay_denied` alone does not prove non-membership.
+
 | Check | Status | Evidence | Date | Sandbox id |
 |---|---|---|---|---|
-| `{ok:true, agent_id}` in < 180 s, `status` shows `acp_running: true` | LIVE (partial) | README/PLAN "live-verified 2026-07-25"; commit 5abe10b smoke test on sandbox viable-pika-4294 (acp_running=true). 180s bound, agent_pool_ready, and N=10s liveness not recorded. | 2026-07-25 | `viable-pika-4294` |
+| `{ok:true, agent_id}` in < 180 s | LIVE | `{"ok":true,"agent_id":"included-elver-4997"}` in **31.4 s** wall clock (start 16:34:40Z), fresh create — the prior sandbox was undeployed first, dropping its mapping | 2026-07-27 | `included-elver-4997` |
+| `pgrep -f '[b]uzz-acp'` alive at N=10 s | LIVE | `{ok:true}` is gated on the deploy's own N=10 s process check returning alive; post-hoc `pgrep` returned a live pid | 2026-07-27 | `included-elver-4997` |
+| `acp.log` contains `agent_pool_ready agents=N` | LIVE | `agent_pool_ready agents=1` present | 2026-07-27 | `included-elver-4997` |
+| `acp.log` contains no terminal-error line | LIVE | `grep -c "terminal error"` → 0 | 2026-07-27 | `included-elver-4997` |
+| `status <id>` → `acp_running: true` | LIVE | `{"sandbox_status":"Running","acp_running":true}` | 2026-07-27 | `included-elver-4997` |
 
 ### Item 2 — idempotent redeploy
 
 | Check | Status | Evidence | Date | Sandbox id |
 |---|---|---|---|---|
-| Redeploy same agent → same `agent_id`, no second sandbox, one buzz-acp process afterward | NOT RUN post-fix | commit 5abe10b records this mechanism FAILING live pre-fix (every redeploy orphaned the previous sandbox); only smoke-tested after the state-file fix, never re-run against the §6 item-2 criteria. | — | — |
+| Redeploy same agent → same `agent_id`, no second sandbox, one buzz-acp process afterward | LIVE | Redeploy of the identical payload returned the same `agent_id` in 24.8 s; `sandbox list` unchanged (no second sandbox); `.installed_version` mtime **identical** before/after (`1785170092` — the install skip path ran, no .deb re-download); exactly one buzz-acp process group; `agent_pool_ready` present for both launches. (History: commit 5abe10b records this mechanism failing live pre-state-file-fix — every redeploy orphaned the previous sandbox.) | 2026-07-27 | `included-elver-4997` |
 
 ### Item 3 — induced-failure teardown
 
@@ -141,6 +159,9 @@ clause:
 
 ## Blocked
 
-The member test key does not exist yet, so the M1 1(b)/item-2 rows and
-every M2 Lifecycle row cannot be run until one is minted. Everything
-else in this file is runnable now.
+Nothing in §6 M1 is blocked any longer: the member test key exists
+("Throwaway Buzz", minted 2026-07-27) and the 1(b)/item-2 rows are LIVE.
+The M2 Lifecycle rows need a member-key sandbox to run against — if the
+test agent's sandbox has been undeployed since, redeploy it first (its
+auth_tag lives in Buzz Desktop's local store; deploy payloads must carry
+it, see the 1(b) note).
