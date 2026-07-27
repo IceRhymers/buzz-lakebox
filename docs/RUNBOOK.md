@@ -248,19 +248,38 @@ family is reachable, and prints a JSON summary.
 
 CI covers the flow against a fake `databricks` shim; these are the checks
 that need real infrastructure. Use a **throwaway nostr key** for anything
-that is not the member-key case, and delete the sandbox afterwards.
+that is not the member-key case.
 
 **Deploy (PLAN §6 M1)**
 
 1. **Non-member throwaway key, fresh create** — PLAN §6 M1 1(a)
+
+   A fresh-create verify failure runs §4.3 failure teardown (secret shred,
+   then sandbox delete), so there is no sandbox left to inspect after the
+   deploy returns. The in-sandbox checks below are therefore observed
+   **during** the deploy: run the deploy in the background, wait for its
+   sandbox id to appear in `databricks sandbox list`, then probe over SSH
+   once the env file exists (the window between env-write and teardown is
+   roughly 15 s).
+
    - `deploy` returns `{"ok": false}` with code `verify.relay_denied`
-   - a sandbox named `buzz-<npub12>-<slug>` exists in `databricks sandbox list`
-   - in-sandbox `$HOME/.buzz-backend/bin/{buzz-acp,buzz-agent}` present, and deploy's `install-exec` step reported the `buzz-agent` ACP-`initialize` handshake verified
-   - `stat -c %a $HOME/.buzz-backend/env` → `600`
-   - `databricks sandbox ssh <id> -- databricks current-user me` **fails** (PAT reset)
-   - `acp.log` contains `buzz-acp starting: relay=`
-   - `acp.log` contains `initial relay connect failed with terminal error`
-   - buzz-acp exited within ~10 s: no non-zombie match for `pgrep -f '[b]uzz-acp'` at N=10 s
+   - a sandbox was created for the attempt (the error text names its id)
+     and is **absent** from `databricks sandbox list` once teardown's
+     delete settles — nothing to clean up manually
+   - mid-deploy: `$HOME/.buzz-backend/bin/` holds all five symlinked
+     binaries (`buzz-acp`, `buzz`, `buzz-agent`, `buzz-dev-mcp`,
+     `git-credential-nostr`); the deploy proceeding past `install-exec`
+     to launch is the evidence the `buzz-agent` ACP-`initialize`
+     handshake verified
+   - mid-deploy: `stat -c %a $HOME/.buzz-backend/env` → `600`
+   - mid-deploy: in-sandbox `databricks current-user me` **fails** (PAT reset)
+   - `acp.log` contains `buzz-acp starting: relay=` and
+     `initial relay connect failed with terminal error` — both readable
+     from the log tail the deploy embeds in its error text
+   - buzz-acp exited within ~10 s: the deploy's own N=10 s process check
+     is what routes the failure to `verify.relay_denied` (a dead process
+     plus the terminal-error line), so the error code doubles as this
+     check's pass signal
 
 2. **Member test key, fresh create** — 1(b)
    - `{"ok": true, "agent_id": …}` in < 180 s — **record the wall-clock number**

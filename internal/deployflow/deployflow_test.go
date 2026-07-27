@@ -604,6 +604,42 @@ func TestDeploy_LaunchVerifyFails_TerminalError_ReusedSandbox_KillsNoDelete(t *t
 	assertNotContains(t, seq, "CLI:config")
 }
 
+// TestDeploy_LaunchVerifyFails_TerminalError_DeadProcess_ClassifiesRelayDenied
+// pins the real-world non-member signature: buzz-acp exits ~1s after the
+// relay denial (docs/M05_PROBE_RESULTS.md §3), so at N=10s the process is
+// dead AND the log carries the terminal-error line. That must classify as
+// verify.relay_denied, not the generic verify.process_dead — the prior
+// liveness-first ordering made relay_denied unreachable in exactly the
+// scenario it was built for (found live: sandbox expert-motmot-2453,
+// 2026-07-26).
+func TestDeploy_LaunchVerifyFails_TerminalError_DeadProcess_ClassifiesRelayDenied(t *testing.T) {
+	h := newHarness(t)
+	t.Setenv("FAKE_VERSION", "1.9.0")
+	t.Setenv("FAKE_VERIFY_OUTPUT", agentInfoOutput)
+	t.Setenv("FAKE_LIST_JSON", "[]")
+	t.Setenv("FAKE_CREATE_ID", "sandbox-relay-denied")
+	t.Setenv("FAKE_CREATE_STATUS", "Running")
+	t.Setenv("FAKE_PGREP_EXIT", "1")
+	t.Setenv("FAKE_ACP_LOG", "buzz-acp starting: relay=wss://x pubkey=abc\nWARN buzz_acp::relay: initial relay connect failed with terminal error: Auth failed: restricted: not a relay member\n")
+
+	req := buildReq(reqOpts{})
+	_, err := h.dep.Deploy(req)
+	if err == nil {
+		t.Fatal("expected launch verification to fail on the terminal-error line")
+	}
+	if !strings.Contains(err.Error(), "verify.relay_denied") {
+		t.Fatalf("dead process + terminal-error log must classify as verify.relay_denied, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "verify.process_dead") {
+		t.Fatalf("must not fall through to the generic process_dead diagnosis, got: %v", err)
+	}
+
+	// Fresh create + verify failure: full teardown, including delete.
+	seq := callSequence(h.events())
+	assertOrder(t, seq, []string{"CLI:create", "SSH:verify-check", "SSH:teardown-shred", "CLI:delete"})
+	assertNotContains(t, seq, "CLI:config")
+}
+
 // TestDeploy_ConfigFails_FreshCreate_NoTeardown_AgentHealthy pins BUG 6:
 // a step-11 (setAutostopPolicy) failure happens strictly AFTER launch
 // verification already succeeded, so the agent is healthy — deploy must

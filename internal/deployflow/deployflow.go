@@ -549,6 +549,17 @@ func (d *Deployer) verifyLaunch(ctx context.Context, profile, sandboxID string) 
 	}
 	logOut = remoteText(logOut)
 	if rc != 0 {
+		// A dead process whose log carries the terminal relay error IS
+		// the non-member signature — buzz-acp exits ~1s after the denial
+		// (docs/M05_PROBE_RESULTS.md §3), so by N=10s it is always dead.
+		// Checking process liveness alone here would make relay_denied
+		// unreachable in exactly the scenario it classifies.
+		if strings.Contains(logOut, terminalErrorLine) {
+			return failf(CodeVerifyRelayDenied,
+				"verify: relay connection failed (%q); this nostr key is very likely not a member of the target relay",
+				terminalErrorLine,
+			)
+		}
 		return failf(CodeVerifyProcessDead, "verify: buzz-acp process not found %s after launch (acp.log: %s)", d.verifyDelay(), strings.TrimSpace(logOut))
 	}
 
