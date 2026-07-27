@@ -130,7 +130,7 @@ var remedies = map[Code]string{
 	CodeVerifySSH:         "the sandbox stopped responding right after launch — run `status <sandbox-id>`, then `start <sandbox-id>`",
 	CodeVerifyUnparseable: "run `status <sandbox-id>` and `logs <sandbox-id>` to see the agent's real state before redeploying",
 	CodeVerifyProcessDead: "run `logs <sandbox-id>` for the crash output; the acp.log tail is included above",
-	CodeVerifyRelayDenied: "mint or register a relay-member key for this agent in Buzz Desktop and redeploy — this key is not a member of the target relay",
+	CodeVerifyRelayDenied: "mint or register a relay-member key for this agent in Buzz Desktop and redeploy — this key is not a member of the target relay, or the payload's auth_tag is missing/stale (the relay denies a member key with an empty auth tag the same way)",
 	CodeVerifyNotReady:    "run `logs <sandbox-id>`; the agent started but never reported a ready pool within the verification window",
 
 	CodeAutostopConfig: "run `databricks sandbox config <sandbox-id> --no-autostop` manually, or redeploy — the agent itself is healthy",
