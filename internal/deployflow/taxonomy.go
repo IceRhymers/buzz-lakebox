@@ -48,7 +48,12 @@ const (
 	CodeSandboxDelete Code = "sandbox.delete"
 
 	// In-sandbox provisioning (docs/PLAN.md §4.4 steps 4-9).
-	CodePATReset      Code = "provision.pat_reset"
+	CodePATReset Code = "provision.pat_reset"
+	// CodeSandboxAuth is provision.sandbox_auth (not preflight.*): it fires
+	// against an already-established sandbox, in the step-4 slot the PAT
+	// reset would otherwise occupy, when provider_config.inference_auth is
+	// "sandbox" (docs/PLAN.md zero-token design).
+	CodeSandboxAuth   Code = "provision.sandbox_auth"
 	CodeInstallScript Code = "install.script"
 	CodeInstallWrite  Code = "install.write"
 	CodeInstallExec   Code = "install.exec"
@@ -87,7 +92,7 @@ var AllCodes = []Code{
 	CodeValidation, CodeCLIVersionUnknown, CodeCLIVersionOld, CodeProfileUnresolved, CodeSandboxRegister,
 	CodeIdentityDerive, CodeIdentityAmbiguous, CodeStateRead, CodeStateWrite,
 	CodeSandboxList, CodeSandboxCreate, CodeSandboxStart, CodeSandboxWait, CodeSandboxStatus, CodeSandboxStop, CodeSandboxDelete,
-	CodePATReset, CodeInstallScript, CodeInstallWrite, CodeInstallExec, CodeRuntimeVerify,
+	CodePATReset, CodeSandboxAuth, CodeInstallScript, CodeInstallWrite, CodeInstallExec, CodeRuntimeVerify,
 	CodeEnvWrite, CodePrelaunchKill, CodeLaunchWrite, CodeLaunchExec,
 	CodeVerifySSH, CodeVerifyUnparseable, CodeVerifyProcessDead, CodeVerifyRelayDenied, CodeVerifyNotReady,
 	CodeAutostopConfig,
@@ -118,6 +123,7 @@ var remedies = map[Code]string{
 	CodeSandboxDelete: "delete it manually with `databricks sandbox delete <id> --auto-approve` — an undeleted sandbox keeps billing",
 
 	CodePATReset:      "retry; if it persists the sandbox may be unreachable over SSH — check `databricks sandbox ssh <id> -- true`",
+	CodeSandboxAuth:   "the error text names which of three causes the auth probe hit: (a) stub marker present — this sandbox was previously deployed in env mode and its baked PAT is unrestorable; `databricks sandbox delete <id> --auto-approve` then redeploy fresh in sandbox mode; (b) ~/.databrickscfg missing/unparseable — inspect it with `databricks sandbox ssh <id> -- cat ~/.databrickscfg`; (c) derived credential rejected — retry (may be transient), or fall back to `inference_auth: \"env\"` for this agent",
 	CodeInstallScript: "pass a known `provider_config.buzz_version` (the error lists the pinned versions this build ships sha256s for)",
 	CodeInstallWrite:  "check sandbox SSH reachability with `databricks sandbox ssh <id> -- true`",
 	CodeInstallExec:   "read the install output above: a sha256 mismatch means the pinned release changed; a fetch failure means the sandbox lost egress to GitHub",

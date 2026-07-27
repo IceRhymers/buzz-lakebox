@@ -54,7 +54,7 @@ func TestRenderEnv_GoldenFields(t *testing.T) {
 		},
 	}
 
-	env := RenderEnv(agent)
+	env := RenderEnv(agent, false)
 
 	wantLines := []string{
 		`export BUZZ_PRIVATE_KEY='nsec1abc'`,
@@ -112,7 +112,7 @@ func TestRenderEnv_GoldenFields(t *testing.T) {
 // exporting a `0` whose semantics upstream owns.
 func TestRenderEnv_ZeroTimeouts_Omitted(t *testing.T) {
 	agent := payload.Agent{AgentCommand: "buzz-agent"}
-	env := RenderEnv(agent)
+	env := RenderEnv(agent, false)
 	if strings.Contains(env, "BUZZ_ACP_IDLE_TIMEOUT") || strings.Contains(env, "BUZZ_ACP_MAX_TURN_DURATION") {
 		t.Fatalf("zero timeouts must be omitted entirely, got:\n%s", env)
 	}
@@ -120,7 +120,7 @@ func TestRenderEnv_ZeroTimeouts_Omitted(t *testing.T) {
 
 func TestRenderEnv_EmptyAllowlist_OmitsEnvVar(t *testing.T) {
 	agent := payload.Agent{AgentCommand: "buzz-agent"}
-	env := RenderEnv(agent)
+	env := RenderEnv(agent, false)
 	if strings.Contains(env, "BUZZ_ACP_RESPOND_TO_ALLOWLIST") {
 		t.Fatalf("expected BUZZ_ACP_RESPOND_TO_ALLOWLIST to be omitted entirely when the allowlist is empty (the desktop only sets it in allowlist mode), got:\n%s", env)
 	}
@@ -128,7 +128,7 @@ func TestRenderEnv_EmptyAllowlist_OmitsEnvVar(t *testing.T) {
 
 func TestRenderEnv_ProviderDefaultsWhenEmpty(t *testing.T) {
 	agent := payload.Agent{AgentCommand: "buzz-agent"}
-	env := RenderEnv(agent)
+	env := RenderEnv(agent, false)
 	if !strings.Contains(env, `export BUZZ_AGENT_PROVIDER='databricks_v2'`) {
 		t.Fatalf("expected default provider databricks_v2, got:\n%s", env)
 	}
@@ -137,7 +137,7 @@ func TestRenderEnv_ProviderDefaultsWhenEmpty(t *testing.T) {
 func TestRenderEnv_ExplicitProviderWins(t *testing.T) {
 	provider := "databricks"
 	agent := payload.Agent{AgentCommand: "buzz-agent", Provider: &provider}
-	env := RenderEnv(agent)
+	env := RenderEnv(agent, false)
 	if !strings.Contains(env, `export BUZZ_AGENT_PROVIDER='databricks'`) {
 		t.Fatalf("expected explicit provider to be used, got:\n%s", env)
 	}
@@ -148,7 +148,7 @@ func TestRenderEnv_QuotingEmbeddedQuotesAndNewlines(t *testing.T) {
 		AgentCommand: "buzz-agent",
 		SystemPrompt: "Line one.\nSay 'hello' and \"goodbye\".\nLine three.",
 	}
-	env := RenderEnv(agent)
+	env := RenderEnv(agent, false)
 
 	// The rendered assignment must be shell-safe: verify by sourcing the
 	// *entire* rendered env (since the quoted value itself contains
@@ -167,9 +167,9 @@ func TestRenderEnv_Deterministic(t *testing.T) {
 		AgentCommand: "buzz-agent",
 		EnvVars:      map[string]string{"Z_VAR": "z", "A_VAR": "a", "M_VAR": "m"},
 	}
-	first := RenderEnv(agent)
+	first := RenderEnv(agent, false)
 	for i := 0; i < 5; i++ {
-		if got := RenderEnv(agent); got != first {
+		if got := RenderEnv(agent, false); got != first {
 			t.Fatalf("RenderEnv is not deterministic across calls")
 		}
 	}
@@ -179,8 +179,48 @@ func TestRenderEnv_Deterministic(t *testing.T) {
 	}
 }
 
+// TestRenderEnv_SandboxMode_AppendsSnippetAfterEnvVars is the sandbox-mode
+// golden: SandboxAuthSnippet must appear, verbatim, after the last
+// env_vars line — so env_vars-supplied DATABRICKS_HOST/DATABRICKS_TOKEN
+// are already exported (and thus win via the snippet's only-if-unset
+// checks) by the time the snippet runs.
+func TestRenderEnv_SandboxMode_AppendsSnippetAfterEnvVars(t *testing.T) {
+	agent := payload.Agent{
+		AgentCommand: "buzz-agent",
+		EnvVars:      map[string]string{"Z_VAR": "z", "A_VAR": "a"},
+	}
+
+	env := RenderEnv(agent, true)
+
+	if !strings.Contains(env, SandboxAuthSnippet) {
+		t.Fatalf("sandbox mode must append SandboxAuthSnippet verbatim, got:\n%s", env)
+	}
+	lastEnvVar := strings.LastIndex(env, "export Z_VAR=")
+	snippetAt := strings.Index(env, SandboxAuthSnippet)
+	if lastEnvVar < 0 {
+		t.Fatal("expected env_vars to be rendered")
+	}
+	if snippetAt < lastEnvVar {
+		t.Fatalf("SandboxAuthSnippet must appear after the env_vars block; snippet at %d, last env_var at %d", snippetAt, lastEnvVar)
+	}
+}
+
+// TestRenderEnv_NonSandboxMode_ByteIdenticalToBaseline pins that
+// sandboxInferenceAuth=false never changes RenderEnv's output — the
+// zero-token feature must be fully opt-in.
+func TestRenderEnv_NonSandboxMode_ByteIdenticalToBaseline(t *testing.T) {
+	agent := payload.Agent{
+		AgentCommand: "buzz-agent",
+		EnvVars:      map[string]string{"DATABRICKS_HOST": "https://example.databricks.com"},
+	}
+	env := RenderEnv(agent, false)
+	if strings.Contains(env, "SandboxAuthSnippet") || strings.Contains(env, "buzz_awk_extract") {
+		t.Fatalf("sandboxInferenceAuth=false must never render the snippet, got:\n%s", env)
+	}
+}
+
 func TestRenderLaunchScript_GoldenInvariants(t *testing.T) {
-	script := RenderLaunchScript(false)
+	script := RenderLaunchScript(false, false)
 
 	if !strings.Contains(script, "set -eu") {
 		t.Fatal("launch.sh must set -eu")
@@ -220,7 +260,7 @@ func TestRenderLaunchScript_KeepWorkspacePAT_OmitsStub(t *testing.T) {
 	// supervisor relaunch, so unconditionally re-asserting the PAT stub
 	// defeated provider_config.keep_workspace_pat=true by clobbering the
 	// kept PAT on the very next relaunch.
-	script := RenderLaunchScript(true)
+	script := RenderLaunchScript(true, false)
 
 	if strings.Contains(script, `cat > "$HOME/.databrickscfg"`) {
 		t.Fatalf("launch.sh (keep_workspace_pat=true) must NOT re-assert the PAT stub, got:\n%s", script)
@@ -242,7 +282,7 @@ func TestRenderLaunchScript_NoSecrets(t *testing.T) {
 	// no secret value can ever appear in it structurally — this test
 	// pins that invariant, for both keep_workspace_pat variants.
 	for _, keep := range []bool{false, true} {
-		script := RenderLaunchScript(keep)
+		script := RenderLaunchScript(keep, false)
 		for _, marker := range []string{"nsec1", "BUZZ_PRIVATE_KEY=", "DATABRICKS_TOKEN="} {
 			if strings.Contains(script, marker) {
 				t.Fatalf("launch.sh (keepWorkspacePAT=%v) unexpectedly contains %q", keep, marker)
@@ -266,6 +306,51 @@ func TestPATStub_CommentOnly(t *testing.T) {
 	}
 }
 
+// TestPATStubMarker_IsPATStubFirstLine pins that PATStubMarker and PATStub
+// cannot drift apart: PATStub is built from PATStubMarker by compile-time
+// concatenation, so PATStub must start with the marker followed by a
+// newline, and the marker itself must be exactly PATStub's first line.
+func TestPATStubMarker_IsPATStubFirstLine(t *testing.T) {
+	if !strings.HasPrefix(PATStub, PATStubMarker+"\n") {
+		t.Fatalf("PATStub must start with PATStubMarker; PATStubMarker=%q, PATStub=%q", PATStubMarker, PATStub)
+	}
+	firstLine := strings.SplitN(PATStub, "\n", 2)[0]
+	if firstLine != PATStubMarker {
+		t.Fatalf("PATStub's first line = %q, want PATStubMarker %q", firstLine, PATStubMarker)
+	}
+}
+
+// TestRenderLaunchScript_StubOmittedMatrix is the 2x2 keepWorkspacePAT x
+// sandboxInferenceAuth matrix (R): the PAT-stub heredoc must be written
+// ONLY when both flags are false; either flag alone (or both) must skip
+// it, since inference_auth:"sandbox" needs the baked cfg intact just as
+// much as keep_workspace_pat:true does.
+func TestRenderLaunchScript_StubOmittedMatrix(t *testing.T) {
+	cases := []struct {
+		keepPAT, sandbox bool
+		wantStub         bool
+	}{
+		{keepPAT: false, sandbox: false, wantStub: true},
+		{keepPAT: true, sandbox: false, wantStub: false},
+		{keepPAT: false, sandbox: true, wantStub: false},
+		{keepPAT: true, sandbox: true, wantStub: false},
+	}
+	for _, tc := range cases {
+		script := RenderLaunchScript(tc.keepPAT, tc.sandbox)
+		hasStub := strings.Contains(script, `cat > "$HOME/.databrickscfg"`)
+		if hasStub != tc.wantStub {
+			t.Fatalf("RenderLaunchScript(keepPAT=%v, sandbox=%v): stub present=%v, want %v", tc.keepPAT, tc.sandbox, hasStub, tc.wantStub)
+		}
+		// Everything else must still be present regardless of the matrix cell.
+		if !strings.Contains(script, "flock -n 9") {
+			t.Fatalf("RenderLaunchScript(keepPAT=%v, sandbox=%v): must still guard against double-launch via flock", tc.keepPAT, tc.sandbox)
+		}
+		if !strings.Contains(script, `. "$HOME/.buzz-backend/env"`) {
+			t.Fatalf("RenderLaunchScript(keepPAT=%v, sandbox=%v): must still source the env file", tc.keepPAT, tc.sandbox)
+		}
+	}
+}
+
 // evalEnvVar sources the entire rendered env text through /bin/sh and
 // echoes the resulting value of the named variable, to verify
 // shellQuote's escaping is actually safe rather than merely
@@ -283,7 +368,7 @@ func evalEnvVar(t *testing.T, env, key string) string {
 // production — both found by the executable proofs in
 // launch_exec_test.go.
 func TestRenderLaunchScript_LivenessGuardInvariants(t *testing.T) {
-	script := RenderLaunchScript(false)
+	script := RenderLaunchScript(false, false)
 
 	// A zombie buzz-acp must not count as running (see AliveCheckSnippet).
 	if !strings.Contains(script, "buzz_acp_alive") {

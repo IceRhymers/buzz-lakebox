@@ -20,6 +20,7 @@ import (
 	"github.com/IceRhymers/buzz-lakebox/internal/nest"
 	"github.com/IceRhymers/buzz-lakebox/internal/payload"
 	"github.com/IceRhymers/buzz-lakebox/internal/redact"
+	"github.com/IceRhymers/buzz-lakebox/internal/shellquote"
 	"github.com/IceRhymers/buzz-lakebox/internal/sshx"
 	"github.com/IceRhymers/buzz-lakebox/internal/state"
 	"github.com/IceRhymers/buzz-lakebox/internal/version"
@@ -246,10 +247,23 @@ func (d *Deployer) deploy(req *payload.DeployRequest) (string, error) {
 	// *postVerifyFailure means launch verification already succeeded
 	// (BUG 6 fix): the agent is healthy, so destructive teardown must be
 	// skipped entirely — only a genuinely unhealthy/unverified deploy
-	// gets torn down.
+	// gets torn down. A *preMutationFailure (R2: the zero-token auth
+	// probe) means nothing has been written to the sandbox THIS
+	// invocation: a reused sandbox is left completely alone (it may carry
+	// a healthy agent from a prior deploy), while a freshly created one is
+	// still deleted — via a scoped delete, not full teardown, since there
+	// is nothing to shred.
 	if err := d.provision(ctx, profile, sandboxID, freshlyCreated, req); err != nil {
 		var pvf *postVerifyFailure
-		if !errors.As(err, &pvf) {
+		var pmf *preMutationFailure
+		switch {
+		case errors.As(err, &pvf):
+			// Healthy agent; never tear down.
+		case errors.As(err, &pmf):
+			if freshlyCreated {
+				d.deleteFreshSandbox(profile, sandboxID)
+			}
+		default:
 			d.teardown(profile, sandboxID, freshlyCreated)
 		}
 		return "", d.wrap(sandboxID, version, err)
@@ -389,15 +403,49 @@ type postVerifyFailure struct {
 func (e *postVerifyFailure) Error() string { return e.err.Error() }
 func (e *postVerifyFailure) Unwrap() error { return e.err }
 
+// preMutationFailure marks an error that occurred BEFORE any in-sandbox
+// mutation this invocation performed (today, only the zero-token auth
+// probe — R2 of the zero-token design) — mirrors postVerifyFailure
+// above, at the opposite end of provisioning. The probe only reads: it
+// greps for the PAT-stub marker, sources a mktemp-materialized copy of
+// nest.SandboxAuthSnippet, and runs `databricks current-user me`; it
+// never writes to nest.EnvFilePath or anywhere else in the sandbox
+// (Critic implementation note 1). deploy() must therefore never run
+// destructive teardown against a REUSED sandbox for this failure: the
+// sandbox may carry a perfectly healthy env-mode agent from a previous
+// deploy, and teardown's shred+pkill would destroy its env file and kill
+// it over a merely-failed env→sandbox switch — violating teardown's own
+// "written this invocation" contract (see teardown's doc comment below).
+// A FRESHLY CREATED sandbox is still deleted (via deleteFreshSandbox,
+// never shredded — nothing was written to it): it has zero value with a
+// broken baked credential and would otherwise bill forever.
+type preMutationFailure struct {
+	err error
+}
+
+func (e *preMutationFailure) Error() string { return e.err.Error() }
+func (e *preMutationFailure) Unwrap() error { return e.err }
+
 // provision runs docs/PLAN.md §4.4 steps 4-11 against an established
 // (Running) sandbox.
 func (d *Deployer) provision(ctx context.Context, profile, sandboxID string, freshlyCreated bool, req *payload.DeployRequest) error {
 	agent := req.Agent
-	envContent := nest.RenderEnv(agent)
+	sandboxAuth := req.ProviderConfig.SandboxInferenceAuth()
+	envContent := nest.RenderEnv(agent, sandboxAuth)
 
-	// Step 4: PAT reset — the first in-sandbox action of every deploy,
-	// unless the owner opted out.
-	if !req.ProviderConfig.KeepWorkspacePAT {
+	// Step 4: either the PAT reset (default/env mode; the first in-sandbox
+	// action of every deploy, unless the owner opted out) or, in zero-token
+	// sandbox mode, the auth probe in its place — sandbox mode needs the
+	// sandbox's baked creator-identity ~/.databrickscfg intact, so the PAT
+	// reset must never run at all for it (inference_auth:"sandbox"
+	// supersedes keep_workspace_pat the same way RenderLaunchScript's stub
+	// skip does).
+	switch {
+	case sandboxAuth:
+		if err := d.authProbe(ctx, profile, sandboxID, agent.EnvVars); err != nil {
+			return err
+		}
+	case !req.ProviderConfig.KeepWorkspacePAT:
 		if _, err := d.SSH.RunWithStdin(ctx, profile, sandboxID,
 			step("pat-reset", "set -eu; umask 077; cat > \"$HOME/.databrickscfg\""),
 			strings.NewReader(nest.PATStub),
@@ -438,7 +486,7 @@ func (d *Deployer) provision(ctx context.Context, profile, sandboxID string, fre
 	// Step 9: write + run launch.sh.
 	if _, err := d.SSH.RunWithStdin(ctx, profile, sandboxID,
 		step("launch-write", fmt.Sprintf(`set -eu; umask 077; cat > %s && chmod 700 %s`, dquote(nest.LaunchScriptPath), dquote(nest.LaunchScriptPath))),
-		strings.NewReader(nest.RenderLaunchScript(req.ProviderConfig.KeepWorkspacePAT)),
+		strings.NewReader(nest.RenderLaunchScript(req.ProviderConfig.KeepWorkspacePAT, sandboxAuth)),
 	); err != nil {
 		return failf(CodeLaunchWrite, "write launch.sh: %w", err)
 	}
@@ -468,6 +516,147 @@ func (d *Deployer) provision(ctx context.Context, profile, sandboxID string, fre
 	}
 
 	return nil
+}
+
+// authProbeCauseMarkerPrefix is the line authProbeScript echoes to stdout
+// right before exiting non-zero, so the Go side can tell apart the three
+// causes a zero-token auth probe can fail for (docs/PLAN.md zero-token
+// design). Kept distinct from parsePgrepCheck's BUZZ_PGREP_RC marker
+// (different probe, different vocabulary).
+const authProbeCauseMarkerPrefix = "BUZZ_PROBE_CAUSE="
+
+// authProbe implements the zero-token deploy-time auth probe (R1): it
+// exercises the SAME derivation snippet the launch env will use, then
+// validates the derived credential — never the CLI's own independent
+// ~/.databrickscfg reading — with `databricks current-user me`. It is a
+// preMutationFailure on any failure (R2): the probe never writes to
+// nest.EnvFilePath or anywhere else in the sandbox (Critic note 1), only
+// ever reading and running a mktemp-materialized copy of its own stdin.
+//
+// The SSH round trip shares provision()'s ctx, which is deploy()'s own
+// ctx bounded by deployTimeoutOrDefault() (Critic note 5) — identical to
+// every neighboring in-sandbox step in this flow; there is no separate,
+// tighter timeout to add here.
+func (d *Deployer) authProbe(ctx context.Context, profile, sandboxID string, envVars map[string]string) error {
+	out, err := d.SSH.RunWithStdin(ctx, profile, sandboxID,
+		step("auth-probe", authProbeScript()),
+		strings.NewReader(nest.SandboxAuthSnippet),
+	)
+	if err == nil {
+		return nil
+	}
+	cause := authProbeCause(out)
+	msg := authProbeCauseMessage(cause, envVars)
+	return &preMutationFailure{err: failf(CodeSandboxAuth,
+		"zero-token auth probe failed: %s (probe output: %s)",
+		msg, remoteText(strings.TrimSpace(out)),
+	)}
+}
+
+// authProbeScript is the static (no payload interpolation beyond the
+// trusted nest.PATStubMarker constant) remote script the auth probe ships
+// over RunWithStdin's stdin-as-cmd-text channel — the snippet itself
+// travels as this call's actual stdin, per authProbe above. In order:
+//
+//  1. grep the provider's own stub marker in ~/.databrickscfg — present
+//     means this sandbox was already deployed in env mode and its baked
+//     PAT is gone (cause "stub");
+//  2. else materialize the piped-in snippet to a mktemp file, source it,
+//     then rm it — NEVER nest.EnvFilePath (Critic note 1) — and require
+//     both DATABRICKS_HOST and DATABRICKS_TOKEN to come out non-empty
+//     (cause "parse" otherwise): this is the exact parser launch.sh will
+//     use, so a parse failure here is a parse failure there too;
+//  3. else run `databricks current-user me` with those derived values
+//     already exported into this very shell's environment — the CLI
+//     prefers env over cfg, so this validates the DERIVED credential
+//     itself, not the CLI's own independent cfg parse (cause "credential"
+//     otherwise).
+//
+// Each failure branch echoes a BUZZ_PROBE_CAUSE=<cause> marker line
+// before exiting non-zero, so authProbeCause can disambiguate them
+// Go-side.
+func authProbeScript() string {
+	return fmt.Sprintf(`set -eu
+if grep -qF %s "$HOME/.databrickscfg" 2>/dev/null; then
+  echo "%sstub"
+  exit 1
+fi
+BUZZ_PROBE_TMP=$(mktemp)
+cat > "$BUZZ_PROBE_TMP"
+# shellcheck disable=SC1090
+. "$BUZZ_PROBE_TMP"
+rm -f "$BUZZ_PROBE_TMP"
+if [ -z "${DATABRICKS_HOST:-}" ] || [ -z "${DATABRICKS_TOKEN:-}" ]; then
+  echo "%sparse"
+  exit 1
+fi
+if ! databricks current-user me >/dev/null 2>&1; then
+  echo "%scredential"
+  exit 1
+fi
+`, shellquote.Single(nest.PATStubMarker), authProbeCauseMarkerPrefix, authProbeCauseMarkerPrefix, authProbeCauseMarkerPrefix)
+}
+
+// authProbeCause scans out (as authProbe received it — stdout captured
+// regardless of the remote command's exit code) for the FIRST
+// BUZZ_PROBE_CAUSE=<cause> line and returns <cause>, or "" when none is
+// found (e.g. the ssh transport itself failed before the script ever
+// ran, rather than the script's own logic failing).
+func authProbeCause(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, authProbeCauseMarkerPrefix) {
+			return strings.TrimPrefix(trimmed, authProbeCauseMarkerPrefix)
+		}
+	}
+	return ""
+}
+
+// authProbeCauseMessage renders a human diagnosis for one of the probe's
+// three disambiguated causes (docs/PLAN.md zero-token design; Critic
+// notes 2 + 3). envVars is the agent's own env_vars map, checked for
+// cause "stub" so the diagnosis can note that explicit env_vars
+// credentials would have taken precedence over derivation anyway.
+func authProbeCauseMessage(cause string, envVars map[string]string) string {
+	switch cause {
+	case "stub":
+		msg := "sandbox was previously deployed in env mode; its baked PAT is unrestorable — delete the sandbox and redeploy fresh in sandbox mode"
+		if envVars["DATABRICKS_HOST"] != "" || envVars["DATABRICKS_TOKEN"] != "" {
+			msg += "; note: your env_vars-supplied credentials would take precedence anyway"
+		}
+		return msg
+	case "parse":
+		return "~/.databrickscfg missing or unparseable by the derivation snippet"
+	case "credential":
+		// Hedged (Critic note 2): `databricks current-user me` can also
+		// fail on a transient network/gateway error, not only an
+		// invalid/expired PAT; the CLI's own error text reaches the
+		// operator via the probe output appended by authProbe.
+		return "derived credential rejected: the baked PAT is invalid, expired, or the workspace was unreachable"
+	default:
+		return "auth probe failed before it could report which of its three causes applied"
+	}
+}
+
+// deleteFreshSandbox implements the freshly-created half of R2's
+// pre-mutation failure semantics: when the auth probe fails against a
+// sandbox created THIS invocation, nothing has been written to it (the
+// probe never touches nest.EnvFilePath — see preMutationFailure's doc
+// comment), so there is nothing to shred; only the sandbox itself, which
+// has zero value with a broken baked credential and would otherwise bill
+// forever, needs reclaiming. Deliberately narrower than teardown: no
+// shred step, no pkill branch — see teardown's own doc comment for why
+// running its "written this invocation" shred here would be wrong.
+//
+// Uses its own independent context, for the same BUG-4 reason teardown
+// does (a deploy-deadline-expired ctx must not silently no-op cleanup).
+func (d *Deployer) deleteFreshSandbox(profile, sandboxID string) {
+	if sandboxID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), teardownTimeout)
+	defer cancel()
+	_ = d.CLI.SandboxDelete(ctx, profile, sandboxID)
 }
 
 // installAndVerify runs docs/PLAN.md §4.4 step 5: fetch/verify/extract the
@@ -647,6 +836,12 @@ func (d *Deployer) setAutostopPolicy(ctx context.Context, profile, sandboxID str
 // — errors here are swallowed since the caller already has the real
 // failure to report, and teardown itself failing must not mask it
 // (docs/PLAN.md §4.3: "a human can recover if teardown itself fails").
+//
+// deploy() never calls this for a *preMutationFailure (the zero-token
+// auth probe): that failure mode wrote nothing "this invocation" for
+// EITHER shred or kill to be about — see preMutationFailure's doc comment
+// and deleteFreshSandbox, its own narrower (shred-free, freshly-created-
+// only) cleanup path.
 //
 // teardown uses its OWN independent context (BUG 4 fix), rather than the
 // caller's deploy ctx: when a provisioning step fails BECAUSE the deploy

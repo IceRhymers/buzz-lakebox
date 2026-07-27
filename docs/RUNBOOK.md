@@ -180,6 +180,7 @@ Match on the code, not the prose.
 | `sandbox.stop` | retry, or stop it directly with `databricks sandbox stop <id>` |
 | `sandbox.delete` | delete it manually with `databricks sandbox delete <id> --auto-approve` — an undeleted sandbox keeps billing |
 | `provision.pat_reset` | retry; if it persists the sandbox may be unreachable over SSH — check `databricks sandbox ssh <id> -- true` |
+| `provision.sandbox_auth` | sandbox-mode only (`inference_auth: "sandbox"`); three disambiguated causes — see [Zero-token inference auth](#zero-token-inference-auth-inference_auth-sandbox) below for the full remedy per cause |
 | `install.script` | pass a known `provider_config.buzz_version` (the error lists the pinned versions this build ships sha256s for) |
 | `install.write` | check sandbox SSH reachability with `databricks sandbox ssh <id> -- true` |
 | `install.exec` | read the install output above: a sha256 mismatch means the pinned release changed; a fetch failure means the sandbox lost egress to GitHub |
@@ -331,3 +332,72 @@ This is the one acceptance CI cannot express — it depends on the image's
 baked credential. CI does prove the two decisions behind it: with the
 opt-out, the provider neither writes the stub during deploy nor
 re-asserts it from `launch.sh` on any later relaunch.
+
+---
+
+## Zero-token inference auth (inference_auth: "sandbox")
+
+Setting `provider_config.inference_auth` to `"sandbox"` opts an agent into
+zero-token inference: instead of resetting the sandbox's baked
+creator-identity PAT to a stub, the provider leaves `~/.databrickscfg`
+alone and derives `DATABRICKS_HOST`/`DATABRICKS_TOKEN` from it.
+
+**How derivation works.** The env file the provider writes at deploy time
+carries a static POSIX-sh snippet, appended after any explicit
+`env_vars`: if `DATABRICKS_TOKEN` is unset and `~/.databrickscfg` is
+readable, it awk-parses the `[DEFAULT]` section for `host`/`token` and
+exports each **only if currently unset** — so explicit `env_vars` always
+win. This snippet re-runs on **every** launch, not just the first:
+`launch.sh` sources the env file both at deploy time and on every
+operator `start`, so a PAT rotated by the platform between a sandbox stop
+and start is picked up automatically, by construction — there is nothing
+to re-derive manually.
+
+**Unknown baked-PAT lifetime.** How long the sandbox image's baked PAT
+stays valid is not documented upstream and hasn't been characterized here
+beyond what a single stop/start cycle shows (see `docs/ACCEPTANCE.md`'s
+rotation-tolerance row for what was actually observed live). Treat it as
+an unknown, not a guarantee.
+
+**Deploy-time probe and its three causes.** Because sandbox mode skips
+the PAT reset, deploy instead runs an auth probe that exercises the same
+derivation snippet the launch env will use, then validates the derived
+credential with `databricks current-user me`. A probe failure surfaces as
+`[provision.sandbox_auth]` with one of three disambiguated causes:
+
+- **(a) stub marker present** — `~/.databrickscfg` still carries the
+  provider's own stub marker, meaning this sandbox was previously
+  deployed in **env mode**: the baked PAT it once had is already gone and
+  unrestorable. Remedy: `databricks sandbox delete <id>`, then redeploy
+  fresh in sandbox mode. (If `env_vars`-supplied
+  `DATABRICKS_HOST`/`DATABRICKS_TOKEN` are present in the payload, they'd
+  take precedence over derivation anyway — the stub is still the blocker
+  for the *derived* path.)
+- **(b) cfg missing or unparseable** — the derivation snippet itself
+  couldn't extract both a host and a token from `~/.databrickscfg`
+  (missing file, missing `[DEFAULT]` section, or a format the awk parser
+  doesn't tolerate). Remedy: inspect the cfg directly —
+  `databricks sandbox ssh <id> -- cat ~/.databrickscfg` — and compare
+  against the parser's tolerances (section-scoped, whitespace-tolerant,
+  values taken verbatim).
+- **(c) derived credential rejected** — the snippet produced a host and
+  token, but `databricks current-user me` failed using them. The baked
+  PAT is invalid, expired, or the workspace was unreachable (this can
+  also be a transient network/gateway error — the CLI's own error text is
+  included in the remedy). Remedy: retry if it looks transient;
+  otherwise the baked credential needs the platform to refresh it, or
+  fall back to env mode for this agent.
+
+A probe failure never tears down a sandbox that was already running a
+healthy agent — only a **freshly created** sandbox with a broken baked
+PAT gets deleted (it has zero value and would otherwise bill forever). A
+reused sandbox's existing agent and env file survive a failed switch
+attempt untouched.
+
+**Triage: agent alive but silent.** If `status` shows the agent running
+in sandbox mode but it never responds to mentions, check `logs` for a
+401/403 from the AI Gateway. That's silent mid-life PAT expiry — the
+baked credential died after deploy succeeded, with nothing in between to
+detect it. This is the **accepted residual risk** of zero-token mode:
+remedy is to redeploy (which re-runs the probe against the current cfg)
+or switch the agent back to env mode.

@@ -25,6 +25,19 @@ const minSecretLen = 4
 // nsec strings that leak into logs).
 var nsecPrefixPattern = regexp.MustCompile(`nsec1[^\s"']*`)
 
+// dapiPrefixPattern scrubs a bare Databricks PAT ("dapi" + hex) from its
+// prefix up to the next whitespace or quote character, mirroring
+// nsecPrefixPattern. It exists for the sandbox inference-auth mode: the
+// token there is derived in-sandbox from the baked ~/.databrickscfg
+// (provider_config.inference_auth: "sandbox") and never rides the
+// payload, so payload-keyed Redact() has no known-secret value to catch
+// it with — this is the only defense for a bare dapi token that leaks
+// into acp.log or other remote output. The >=16 hex-char requirement
+// after the prefix avoids scrubbing ordinary prose that merely contains
+// the word "dapi"; consuming to the next whitespace/quote catches
+// suffixed token forms the same way nsecPrefixPattern does.
+var dapiPrefixPattern = regexp.MustCompile(`(?i)\bdapi[0-9a-f]{16,}[^\s"']*`)
+
 // secretAssignmentPattern scrubs credential-shaped `NAME=value` /
 // `NAME: value` pairs out of remote output. It exists for the paths
 // where there is no payload to derive known secrets from — the operator
@@ -56,7 +69,8 @@ func Log(s string) string {
 		return s
 	}
 	s = secretAssignmentPattern.ReplaceAllString(s, "${1}${2}"+Placeholder)
-	return nsecPrefixPattern.ReplaceAllString(s, Placeholder)
+	s = nsecPrefixPattern.ReplaceAllString(s, Placeholder)
+	return dapiPrefixPattern.ReplaceAllString(s, Placeholder)
 }
 
 // Redact replaces every occurrence of each secret in secrets (deduplicated,
@@ -79,6 +93,7 @@ func Redact(s string, secrets []string) string {
 	}
 
 	s = nsecPrefixPattern.ReplaceAllString(s, Placeholder)
+	s = dapiPrefixPattern.ReplaceAllString(s, Placeholder)
 
 	return s
 }

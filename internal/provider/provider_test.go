@@ -49,6 +49,30 @@ func TestInfo_FrozenShape(t *testing.T) {
 		"description": "Deploys Buzz agents into Databricks Lakebox sandboxes",
 		"protocol":    "v1",
 		"ops":         []any{"info", "deploy"},
+		"config_schema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"profile": map[string]any{
+					"type":        "string",
+					"title":       "Databricks CLI profile",
+					"description": "Databricks CLI profile selection; empty = the build's baked default.",
+				},
+				"inference_auth": map[string]any{
+					"type":    "string",
+					"title":   "Inference auth",
+					"default": "env",
+					"description": "env (default): you supply DATABRICKS_HOST/DATABRICKS_TOKEN in the agent's " +
+						"environment variables. sandbox: zero-token — the agent reuses the sandbox's built-in " +
+						"per-user credential and can act AS YOU across the whole workspace (opt-in security tradeoff).",
+				},
+				"idle_timeout": map[string]any{
+					"type":        "string",
+					"title":       "Idle timeout",
+					"description": "Duration like 30m or 2h; empty = no autostop (default).",
+				},
+			},
+			"required": []string{},
+		},
 	}
 	for k, wv := range want {
 		gv, ok := m[k]

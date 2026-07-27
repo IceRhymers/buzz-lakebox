@@ -124,6 +124,24 @@ Per RUNBOOK §8.
 
 ---
 
+## Zero-token inference auth (issue #10)
+
+Per the zero-token plan's Live verification checklist
+(`.omc/plans/zero-token-inference.md`). Tracking issue:
+https://github.com/IceRhymers/buzz-lakebox/issues/10 — do not close until
+every row below is LIVE.
+
+| Check | Status | Evidence | Date | Sandbox id |
+|---|---|---|---|---|
+| 1. Zero-token happy path: fresh sandbox deploy with `inference_auth: "sandbox"` and no `DATABRICKS_TOKEN`/`DATABRICKS_HOST` env vars → deploy succeeds, derived env shows host/token set in-sandbox, @mention answered via the workspace AI Gateway | NOT RUN | none found | — | — |
+| 2. Rotation tolerance: `sandbox stop` then operator `start` on a sandbox-mode agent → agent relaunches and still answers; baked cfg observed across the cycle | NOT RUN | none found | — | — |
+| 3. Env-mode regression: default-config deploy (no `inference_auth`) → in-sandbox cfg is the stub, `current-user me` fails, agent with `env_vars` token still answers | NOT RUN | none found | — | — |
+| 4. Precedence: sandbox mode WITH `env_vars` DATABRICKS_HOST/TOKEN supplied → those values survive env-file sourcing unchanged (derivation is a no-op) | NOT RUN | none found | — | — |
+| 5. Stub-clobbered reuse: redeploy an env-mode sandbox with `inference_auth: "sandbox"` → fails with `[provision.sandbox_auth]` (cause (a), stub marker) and the delete-and-redeploy remedy; old env-mode agent's env file and process survive the failed switch; remedy then succeeds | NOT RUN | none found | — | — |
+| 6. Redaction spot-check: force a failure that could echo a derived `dapi…` token into acp.log or remote output → rendered output shows `[REDACTED]`, never a bare token | NOT RUN | none found | — | — |
+
+---
+
 ## Pre-merge undeploy probe
 
 | Check | Status | Evidence | Date | Sandbox id |

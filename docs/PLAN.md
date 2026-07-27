@@ -152,6 +152,8 @@ Downtime tolerance: buzz-acp is stateless and replays unprocessed @mentions via 
 
 **Provider-side least privilege.** Runs on the owner's machine with the owner's chosen profile; needs only the sandbox command family + `current-user me`. The machine-level SSH key is shared across all sandboxes (lane C gap #6) — documented, not fixable at our layer. `provider_config` is validated secret-free by buzz itself (lane A §3b).
 
+**`inference_auth: "sandbox"` (opt-in, issue #10).** This mode intentionally retains the creator-identity credential the PAT reset above exists to remove: for as long as the baked cfg is valid, the agent can act as the owner across the whole workspace, not just call the AI Gateway. Compensating controls: the value is enum-validated and off by default (`""`/`"env"` keeps today's PAT-reset behavior unchanged); a deploy-time probe exercises the derivation snippet itself and fails loud with a disambiguated `provision.sandbox_auth` rather than deploying a silently broken agent; the bare-`dapi` redaction pattern added alongside this change scrubs a derived token from anything logged; and derivation is only-if-unset, so an owner who does supply `env_vars` `DATABRICKS_HOST`/`DATABRICKS_TOKEN` is never silently overridden by the baked credential.
+
 ---
 
 ## 6. Milestones

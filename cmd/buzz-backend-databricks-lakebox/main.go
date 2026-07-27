@@ -347,6 +347,16 @@ func newDeployCmd(profile *string) *cobra.Command {
 				req.ProviderConfig.Profile = *profile
 			}
 
+			// Zero-token opt-in reverses least-privilege (the agent keeps
+			// creator-identity workspace access), so the operator path
+			// warns loudly on stderr. Provider mode's frozen stdout JSON
+			// (and its own stderr, which carries nothing extra) is
+			// unaffected — this warning is operator-CLI-only.
+			if req.ProviderConfig.SandboxInferenceAuth() {
+				_, _ = fmt.Fprintln(cmd.ErrOrStderr(),
+					"warning: inference_auth=sandbox: the agent retains creator-identity workspace access (see README: Inference auth)")
+			}
+
 			deployer := newDeployer()
 			agentID, derr := deployer.Deploy(req)
 			return printDeployResult(cmd, agentID, derr)
