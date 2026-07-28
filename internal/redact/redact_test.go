@@ -324,3 +324,40 @@ func TestLog_EmptyInput(t *testing.T) {
 		t.Fatalf("Log(\"\") = %q", got)
 	}
 }
+
+// TestLog_ScrubsBareAnthropicKey covers the Claude runtime's credential in
+// the shape secretAssignmentPattern cannot catch: a bare key in prose
+// rather than a NAME=value pair. This is reachable — the adapter's stderr
+// flows into acp.log (buzz-acp inherits its child's stderr, launch.sh
+// folds buzz-acp's own stderr into the log), and the operator `logs` and
+// `status` paths have no payload to build a known-secret list from, so
+// redact.Log is their only scrub.
+func TestLog_ScrubsBareAnthropicKey(t *testing.T) {
+	cases := []string{
+		"x-api-key: sk-ant-api03-AbCdEf0123456789XyZ",
+		`{"error":"invalid key sk-ant-api03-AbCdEf0123456789XyZ"}`,
+		"at Auth.check (sk-ant-api03-AbCdEf0123456789XyZ)",
+	}
+	for _, in := range cases {
+		got := Log(in)
+		if strings.Contains(got, "sk-ant-api03") {
+			t.Errorf("Log(%q) leaked an Anthropic key: %q", in, got)
+		}
+		if !strings.Contains(got, Placeholder) {
+			t.Errorf("Log(%q) should have substituted the placeholder, got %q", in, got)
+		}
+	}
+}
+
+// TestLog_KeepsAnthropicLookalikes keeps the pattern narrow enough not to
+// eat ordinary prose or a truncated/masked key that carries no secret.
+func TestLog_KeepsAnthropicLookalikes(t *testing.T) {
+	for _, in := range []string{
+		"set ANTHROPIC_BASE_URL to the gateway",
+		"sk-ant-short",
+	} {
+		if got := Log(in); got != in {
+			t.Errorf("Log(%q) should be unchanged, got %q", in, got)
+		}
+	}
+}

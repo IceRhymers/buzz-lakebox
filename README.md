@@ -4,7 +4,7 @@ A [Buzz](https://github.com/block/buzz) agent-backend provider that runs agent s
 
 ## How it works
 
-Buzz Desktop discovers `buzz-backend-<id>` executables on `PATH` (`BackendKind::Provider`) and hands them a one-shot JSON payload over stdin. This repo builds **`buzz-backend-databricks-lakebox`**: on `deploy` it provisions a Databricks Sandbox, installs the Buzz harness into the sandbox's persistent `$HOME`, ships the agent's identity/env over SSH stdin, and launches `buzz-acp` as a detached background process. The agent then talks to the Buzz relay outbound-only over WSS — no inbound connectivity to the sandbox is required for sessions.
+Buzz Desktop discovers `buzz-backend-<id>` executables on `PATH` (`BackendKind::Provider`) and hands them a one-shot JSON payload over stdin. This repo builds **`buzz-backend-databricks-lakebox`**: on `deploy` it provisions a Databricks Sandbox, installs the Buzz harness into the sandbox's persistent `$HOME`, ships the agent's identity/env over SSH stdin, and launches `buzz-acp` as a detached background process. Two agent runtimes are supported: **`buzz-agent`** (ships in the pinned Buzz `.deb`) and **Claude Code** (`agent_command: claude-code`, installed as the `@agentclientprotocol/claude-agent-acp` ACP adapter), both taking inference from the workspace AI Gateway. The agent then talks to the Buzz relay outbound-only over WSS — no inbound connectivity to the sandbox is required for sessions.
 
 ```
 Buzz Desktop ──stdin JSON {op:"deploy",...}──> buzz-backend-databricks-lakebox

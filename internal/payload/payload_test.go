@@ -150,8 +150,12 @@ func TestValidate_UnsupportedRuntimeRejected(t *testing.T) {
 		if err == nil {
 			t.Fatalf("Validate() should reject agent_command %q", runtime)
 		}
-		if !strings.Contains(err.Error(), "v0.1") {
-			t.Fatalf("error for agent_command %q should point at v0.1 roadmap, got: %v", runtime, err)
+		// Points at issue #3 (codex) — the only runtime still outstanding.
+		// #1 (buzz-agent) and #2 (claude) are both implemented, so the old
+		// "see the v0.1 roadmap" wording would now send an operator to a
+		// closed issue.
+		if !strings.Contains(err.Error(), "issues/3") {
+			t.Fatalf("error for agent_command %q should point at the codex issue, got: %v", runtime, err)
 		}
 	}
 }

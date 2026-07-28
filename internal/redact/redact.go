@@ -38,6 +38,20 @@ var nsecPrefixPattern = regexp.MustCompile(`nsec1[^\s"']*`)
 // suffixed token forms the same way nsecPrefixPattern does.
 var dapiPrefixPattern = regexp.MustCompile(`(?i)\bdapi[0-9a-f]{16,}[^\s"']*`)
 
+// antPrefixPattern scrubs a bare Anthropic API key ("sk-ant-" + token)
+// from its prefix up to the next whitespace or quote character, mirroring
+// dapiPrefixPattern and for the same structural reason.
+//
+// It exists for the Claude runtime. secretAssignmentPattern already covers
+// the `ANTHROPIC_API_KEY=…` / `ANTHROPIC_AUTH_TOKEN=…` assignment shapes,
+// but not a bare key appearing in prose — an HTTP debug line, an
+// `x-api-key: sk-ant-…` header dump, a stack trace. That reaches an
+// operator's terminal for real: buzz-acp spawns the agent with inherited
+// stderr and launch.sh folds buzz-acp's own stderr into acp.log, which the
+// operator `logs`/`status` subcommands tail. Those paths have no payload to
+// build a known-secret list from, so redact.Log is their only scrub.
+var antPrefixPattern = regexp.MustCompile(`\bsk-ant-[A-Za-z0-9_-]{16,}`)
+
 // secretAssignmentPattern scrubs credential-shaped `NAME=value` /
 // `NAME: value` pairs out of remote output. It exists for the paths
 // where there is no payload to derive known secrets from — the operator
@@ -70,6 +84,7 @@ func Log(s string) string {
 	}
 	s = secretAssignmentPattern.ReplaceAllString(s, "${1}${2}"+Placeholder)
 	s = nsecPrefixPattern.ReplaceAllString(s, Placeholder)
+	s = antPrefixPattern.ReplaceAllString(s, Placeholder)
 	return dapiPrefixPattern.ReplaceAllString(s, Placeholder)
 }
 
@@ -93,6 +108,12 @@ func Redact(s string, secrets []string) string {
 	}
 
 	s = nsecPrefixPattern.ReplaceAllString(s, Placeholder)
+	// Same defense-in-depth role the neighboring prefix patterns play, for
+	// the Claude runtime's credential. Redact is the OUTER scrub on the
+	// deploy path, and not every error string reaching it has been through
+	// redact.Log first — so omitting it here would leave a bare sk-ant-
+	// token dependent on a single upstream call site.
+	s = antPrefixPattern.ReplaceAllString(s, Placeholder)
 	s = dapiPrefixPattern.ReplaceAllString(s, Placeholder)
 
 	return s

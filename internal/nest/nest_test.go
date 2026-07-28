@@ -54,7 +54,7 @@ func TestRenderEnv_GoldenFields(t *testing.T) {
 		},
 	}
 
-	env := RenderEnv(agent, false)
+	env := RenderEnv(agent, payload.RuntimeBuzzAgent, false)
 
 	wantLines := []string{
 		`export BUZZ_PRIVATE_KEY='nsec1abc'`,
@@ -112,7 +112,7 @@ func TestRenderEnv_GoldenFields(t *testing.T) {
 // exporting a `0` whose semantics upstream owns.
 func TestRenderEnv_ZeroTimeouts_Omitted(t *testing.T) {
 	agent := payload.Agent{AgentCommand: "buzz-agent"}
-	env := RenderEnv(agent, false)
+	env := RenderEnv(agent, payload.RuntimeBuzzAgent, false)
 	if strings.Contains(env, "BUZZ_ACP_IDLE_TIMEOUT") || strings.Contains(env, "BUZZ_ACP_MAX_TURN_DURATION") {
 		t.Fatalf("zero timeouts must be omitted entirely, got:\n%s", env)
 	}
@@ -120,7 +120,7 @@ func TestRenderEnv_ZeroTimeouts_Omitted(t *testing.T) {
 
 func TestRenderEnv_EmptyAllowlist_OmitsEnvVar(t *testing.T) {
 	agent := payload.Agent{AgentCommand: "buzz-agent"}
-	env := RenderEnv(agent, false)
+	env := RenderEnv(agent, payload.RuntimeBuzzAgent, false)
 	if strings.Contains(env, "BUZZ_ACP_RESPOND_TO_ALLOWLIST") {
 		t.Fatalf("expected BUZZ_ACP_RESPOND_TO_ALLOWLIST to be omitted entirely when the allowlist is empty (the desktop only sets it in allowlist mode), got:\n%s", env)
 	}
@@ -128,7 +128,7 @@ func TestRenderEnv_EmptyAllowlist_OmitsEnvVar(t *testing.T) {
 
 func TestRenderEnv_ProviderDefaultsWhenEmpty(t *testing.T) {
 	agent := payload.Agent{AgentCommand: "buzz-agent"}
-	env := RenderEnv(agent, false)
+	env := RenderEnv(agent, payload.RuntimeBuzzAgent, false)
 	if !strings.Contains(env, `export BUZZ_AGENT_PROVIDER='databricks_v2'`) {
 		t.Fatalf("expected default provider databricks_v2, got:\n%s", env)
 	}
@@ -137,7 +137,7 @@ func TestRenderEnv_ProviderDefaultsWhenEmpty(t *testing.T) {
 func TestRenderEnv_ExplicitProviderWins(t *testing.T) {
 	provider := "databricks"
 	agent := payload.Agent{AgentCommand: "buzz-agent", Provider: &provider}
-	env := RenderEnv(agent, false)
+	env := RenderEnv(agent, payload.RuntimeBuzzAgent, false)
 	if !strings.Contains(env, `export BUZZ_AGENT_PROVIDER='databricks'`) {
 		t.Fatalf("expected explicit provider to be used, got:\n%s", env)
 	}
@@ -148,7 +148,7 @@ func TestRenderEnv_QuotingEmbeddedQuotesAndNewlines(t *testing.T) {
 		AgentCommand: "buzz-agent",
 		SystemPrompt: "Line one.\nSay 'hello' and \"goodbye\".\nLine three.",
 	}
-	env := RenderEnv(agent, false)
+	env := RenderEnv(agent, payload.RuntimeBuzzAgent, false)
 
 	// The rendered assignment must be shell-safe: verify by sourcing the
 	// *entire* rendered env (since the quoted value itself contains
@@ -167,9 +167,9 @@ func TestRenderEnv_Deterministic(t *testing.T) {
 		AgentCommand: "buzz-agent",
 		EnvVars:      map[string]string{"Z_VAR": "z", "A_VAR": "a", "M_VAR": "m"},
 	}
-	first := RenderEnv(agent, false)
+	first := RenderEnv(agent, payload.RuntimeBuzzAgent, false)
 	for i := 0; i < 5; i++ {
-		if got := RenderEnv(agent, false); got != first {
+		if got := RenderEnv(agent, payload.RuntimeBuzzAgent, false); got != first {
 			t.Fatalf("RenderEnv is not deterministic across calls")
 		}
 	}
@@ -190,7 +190,7 @@ func TestRenderEnv_SandboxMode_AppendsSnippetAfterEnvVars(t *testing.T) {
 		EnvVars:      map[string]string{"Z_VAR": "z", "A_VAR": "a"},
 	}
 
-	env := RenderEnv(agent, true)
+	env := RenderEnv(agent, payload.RuntimeBuzzAgent, true)
 
 	if !strings.Contains(env, SandboxAuthSnippet) {
 		t.Fatalf("sandbox mode must append SandboxAuthSnippet verbatim, got:\n%s", env)
@@ -213,14 +213,14 @@ func TestRenderEnv_NonSandboxMode_ByteIdenticalToBaseline(t *testing.T) {
 		AgentCommand: "buzz-agent",
 		EnvVars:      map[string]string{"DATABRICKS_HOST": "https://example.databricks.com"},
 	}
-	env := RenderEnv(agent, false)
+	env := RenderEnv(agent, payload.RuntimeBuzzAgent, false)
 	if strings.Contains(env, "SandboxAuthSnippet") || strings.Contains(env, "buzz_awk_extract") {
 		t.Fatalf("sandboxInferenceAuth=false must never render the snippet, got:\n%s", env)
 	}
 }
 
 func TestRenderLaunchScript_GoldenInvariants(t *testing.T) {
-	script := RenderLaunchScript(false, false)
+	script := RenderLaunchScript(false, false, "")
 
 	if !strings.Contains(script, "set -eu") {
 		t.Fatal("launch.sh must set -eu")
@@ -260,7 +260,7 @@ func TestRenderLaunchScript_KeepWorkspacePAT_OmitsStub(t *testing.T) {
 	// supervisor relaunch, so unconditionally re-asserting the PAT stub
 	// defeated provider_config.keep_workspace_pat=true by clobbering the
 	// kept PAT on the very next relaunch.
-	script := RenderLaunchScript(true, false)
+	script := RenderLaunchScript(true, false, "")
 
 	if strings.Contains(script, `cat > "$HOME/.databrickscfg"`) {
 		t.Fatalf("launch.sh (keep_workspace_pat=true) must NOT re-assert the PAT stub, got:\n%s", script)
@@ -282,7 +282,7 @@ func TestRenderLaunchScript_NoSecrets(t *testing.T) {
 	// no secret value can ever appear in it structurally — this test
 	// pins that invariant, for both keep_workspace_pat variants.
 	for _, keep := range []bool{false, true} {
-		script := RenderLaunchScript(keep, false)
+		script := RenderLaunchScript(keep, false, "")
 		for _, marker := range []string{"nsec1", "BUZZ_PRIVATE_KEY=", "DATABRICKS_TOKEN="} {
 			if strings.Contains(script, marker) {
 				t.Fatalf("launch.sh (keepWorkspacePAT=%v) unexpectedly contains %q", keep, marker)
@@ -336,7 +336,7 @@ func TestRenderLaunchScript_StubOmittedMatrix(t *testing.T) {
 		{keepPAT: true, sandbox: true, wantStub: false},
 	}
 	for _, tc := range cases {
-		script := RenderLaunchScript(tc.keepPAT, tc.sandbox)
+		script := RenderLaunchScript(tc.keepPAT, tc.sandbox, "")
 		hasStub := strings.Contains(script, `cat > "$HOME/.databrickscfg"`)
 		if hasStub != tc.wantStub {
 			t.Fatalf("RenderLaunchScript(keepPAT=%v, sandbox=%v): stub present=%v, want %v", tc.keepPAT, tc.sandbox, hasStub, tc.wantStub)
@@ -368,7 +368,7 @@ func evalEnvVar(t *testing.T, env, key string) string {
 // production — both found by the executable proofs in
 // launch_exec_test.go.
 func TestRenderLaunchScript_LivenessGuardInvariants(t *testing.T) {
-	script := RenderLaunchScript(false, false)
+	script := RenderLaunchScript(false, false, "")
 
 	// A zombie buzz-acp must not count as running (see AliveCheckSnippet).
 	if !strings.Contains(script, "buzz_acp_alive") {
