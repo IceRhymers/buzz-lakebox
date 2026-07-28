@@ -29,6 +29,11 @@ const (
 // (docs/PLAN.md §4.4 step 7).
 const DefaultBuzzAgentProvider = "databricks_v2"
 
+// LaunchEpochPrefix prefixes the per-launch delimiter RenderLaunchScript
+// writes into acp.log, exported so internal/deployflow's verification can
+// find it without duplicating the literal.
+const LaunchEpochPrefix = "buzz-backend launch: "
+
 func derefOrEmpty(s *string) string {
 	if s == nil {
 		return ""
@@ -178,7 +183,12 @@ unset buzz_awk_extract buzz_host buzz_token
 // when true, SandboxAuthSnippet is appended AFTER the env_vars block, so
 // it can only ever fill in credentials env_vars didn't already supply.
 // When false, output is byte-identical to the pre-zero-token behavior.
-func RenderEnv(agent payload.Agent, sandboxInferenceAuth bool) string {
+//
+// rt selects the agent runtime. For payload.RuntimeBuzzAgent the output is
+// byte-identical to the pre-Claude behavior; for payload.RuntimeClaude the
+// buzz-agent-specific tool and inference wiring is omitted and
+// ClaudeEnvSnippet is appended last. See the per-variable rationale inline.
+func RenderEnv(agent payload.Agent, rt payload.Runtime, sandboxInferenceAuth bool) string {
 	var b strings.Builder
 	// emit writes KEY unquoted/raw (only VALUE is shellquote'd) into a file
 	// that RenderLaunchScript's `. "$HOME/.buzz-backend/env"` line
@@ -199,7 +209,11 @@ func RenderEnv(agent payload.Agent, sandboxInferenceAuth bool) string {
 	emit("BUZZ_PRIVATE_KEY", agent.PrivateKeyNsec)
 	emit("BUZZ_AUTH_TAG", agent.AuthTag)
 	emit("BUZZ_RELAY_URL", agent.RelayURL)
-	emit("BUZZ_ACP_AGENT_COMMAND", agent.AgentCommand)
+	// Canonical spawn command, never the raw payload alias: the four
+	// accepted Claude aliases all resolve to "claude-agent-acp", which is
+	// the single name internal/install symlinks into the PATH-prepended
+	// bin dir and the name buzz-acp spawns.
+	emit("BUZZ_ACP_AGENT_COMMAND", rt.SpawnCommand())
 	// buzz-acp splits BUZZ_ACP_AGENT_ARGS on COMMAS, not spaces
 	// (block/buzz crates/buzz-acp/README.md: "comma-separated";
 	// crates/buzz-acp/src/config.rs value_delimiter = ','; the desktop
@@ -207,7 +221,20 @@ func RenderEnv(agent payload.Agent, sandboxInferenceAuth bool) string {
 	emit("BUZZ_ACP_AGENT_ARGS", strings.Join(agent.AgentArgs, ","))
 	emit("BUZZ_ACP_AGENTS", strconv.Itoa(agent.Parallelism))
 	emit("BUZZ_ACP_SYSTEM_PROMPT", agent.SystemPrompt)
-	emit("BUZZ_ACP_MODEL", derefOrEmpty(agent.Model))
+	// Model selection is runtime-specific. buzz-acp applies BUZZ_ACP_MODEL
+	// as a per-session model switch; for the Claude runtime the desktop
+	// deliberately emits no model variable at all (discovery.rs claude
+	// entry: model_env_var None, supports_acp_model_switching false),
+	// because a gateway model id is never in the adapter's advertised
+	// catalog — buzz-acp would warn and emit an unsupported_model observer
+	// frame on EVERY session, relayed to the desktop. Live probing found
+	// the same thing from the other direction: passing a real gateway id
+	// via ANTHROPIC_MODEL made the SDK rewrite it to a canonical Anthropic
+	// id the gateway does not serve, hard-failing every turn. The
+	// adapter's own default works, so emit nothing and let it choose.
+	if rt != payload.RuntimeClaude {
+		emit("BUZZ_ACP_MODEL", derefOrEmpty(agent.Model))
+	}
 	emit("BUZZ_ACP_RESPOND_TO", agent.RespondTo)
 	// Only emit BUZZ_ACP_RESPOND_TO_ALLOWLIST in allowlist mode: the
 	// desktop sets it only when the list is non-empty and removes it
@@ -243,8 +270,23 @@ func RenderEnv(agent payload.Agent, sandboxInferenceAuth bool) string {
 	// prepend. Desktop parity: block/buzz runtime.rs:1723-1739 +
 	// discovery.rs buzz-agent entry (mcp_command "buzz-dev-mcp",
 	// mcp_hooks true → MCP_HOOK_SERVERS "*").
-	emit("BUZZ_ACP_MCP_COMMAND", "buzz-dev-mcp")
-	emit("MCP_HOOK_SERVERS", "*")
+	//
+	// Claude is the exception, and it is a real deviation from the
+	// buzz-agent reasoning above rather than an oversight: Claude Code
+	// ships its own built-in tools (including a shell), so it does not
+	// need buzz-dev-mcp to be able to act. Desktop parity agrees — the
+	// claude discovery entry sets mcp_command None and mcp_hooks false.
+	// Verified live: a session with mcpServers:[] answered normally, so
+	// the buzz-agent silent-agent failure does not reproduce here.
+	// MCP_HOOK_SERVERS is buzz-agent's own variable (read by the agent,
+	// not by buzz-acp) and is meaningless to the adapter.
+	//
+	// Escape hatch: env_vars render after this block, so an owner who
+	// wants buzz tooling can still set BUZZ_ACP_MCP_COMMAND=buzz-dev-mcp.
+	if rt != payload.RuntimeClaude {
+		emit("BUZZ_ACP_MCP_COMMAND", "buzz-dev-mcp")
+		emit("MCP_HOOK_SERVERS", "*")
+	}
 	// Observer frames are the desktop's ONLY health signal for a
 	// provider-deployed agent (block/buzz runtime.rs:1934).
 	emit("BUZZ_ACP_RELAY_OBSERVER", "true")
@@ -260,8 +302,24 @@ func RenderEnv(agent payload.Agent, sandboxInferenceAuth bool) string {
 	// DefaultBuzzAgentProvider when the payload's provider is empty;
 	// DATABRICKS_HOST/DATABRICKS_TOKEN arrive via env_vars below and
 	// override nothing here since those keys aren't set above.
-	emit("BUZZ_AGENT_PROVIDER", derefOrDefault(agent.Provider, DefaultBuzzAgentProvider))
-	emit("DATABRICKS_MODEL", derefOrEmpty(agent.Model))
+	//
+	// Both are buzz-agent's own configuration and mean nothing to the
+	// Claude adapter, which takes its endpoint from ANTHROPIC_BASE_URL
+	// (see ClaudeEnvSnippet, appended after everything below).
+	if rt != payload.RuntimeClaude {
+		emit("BUZZ_AGENT_PROVIDER", derefOrDefault(agent.Provider, DefaultBuzzAgentProvider))
+		emit("DATABRICKS_MODEL", derefOrEmpty(agent.Model))
+	} else {
+		// Pinned for parity with buzz-acp's own default, following the
+		// same "pin defaults so an upstream change can't silently
+		// diverge sandbox agents from desktop ones" doctrine used above.
+		//
+		// This is NOT a security control, and must not be mistaken for
+		// one: buzz-acp auto-approves every session/request_permission
+		// with allow_once regardless of this setting, so changing it to
+		// "default" would add JSON-RPC round trips and restrict nothing.
+		emit("BUZZ_ACP_PERMISSION_MODE", "bypass-permissions")
+	}
 
 	keys := make([]string, 0, len(agent.EnvVars))
 	for k := range agent.EnvVars {
@@ -275,6 +333,16 @@ func RenderEnv(agent payload.Agent, sandboxInferenceAuth bool) string {
 	if sandboxInferenceAuth {
 		b.WriteString("\n")
 		b.WriteString(SandboxAuthSnippet)
+	}
+
+	// LAST, unconditionally after both the env_vars block and (when
+	// present) SandboxAuthSnippet — those are the two places
+	// DATABRICKS_HOST/DATABRICKS_TOKEN can come from, and this snippet
+	// derives from whichever won. Ordering is the whole reason one
+	// identical text serves both inference_auth modes.
+	if rt == payload.RuntimeClaude {
+		b.WriteString("\n")
+		b.WriteString(ClaudeEnvSnippet)
 	}
 
 	return b.String()
@@ -303,7 +371,19 @@ func RenderEnv(agent payload.Agent, sandboxInferenceAuth bool) string {
 // DATABRICKS_TOKEN from at every launch. inference_auth:"sandbox"
 // therefore supersedes keep_workspace_pat: either flag alone is enough to
 // keep the cfg, and setting both is redundant but harmless.
-func RenderLaunchScript(keepWorkspacePAT, sandboxInferenceAuth bool) string {
+// launchID stamps this specific launch into acp.log immediately before
+// buzz-acp is spawned, so deploy verification can tell THIS launch's
+// readiness line apart from a previous one's. acp.log is opened in append
+// mode and never truncated (deliberately — losing an agent's crash history
+// to a redeploy would be worse), so without a per-launch delimiter the
+// verifier's `tail -c` can match a readiness line that a previous deploy
+// wrote. An empty launchID omits the stamp entirely, preserving the
+// pre-existing rendering byte-for-byte.
+//
+// It is written by the same shell that spawns buzz-acp and only AFTER the
+// double-launch guards have passed, so its presence means "this run really
+// did start an agent" — not merely "this run happened".
+func RenderLaunchScript(keepWorkspacePAT, sandboxInferenceAuth bool, launchID string) string {
 	var b strings.Builder
 	b.WriteString("#!/bin/sh\n")
 	b.WriteString("set -eu\n\n")
@@ -355,6 +435,14 @@ func RenderLaunchScript(keepWorkspacePAT, sandboxInferenceAuth bool) string {
 	b.WriteString(`  echo "buzz-acp already running; not relaunching" >&2` + "\n")
 	b.WriteString("  exit 0\n")
 	b.WriteString("fi\n\n")
+
+	if launchID != "" {
+		b.WriteString("# Stamp this launch into acp.log so deploy verification can distinguish\n")
+		b.WriteString("# this run's readiness line from a previous deploy's (the log is\n")
+		b.WriteString("# append-only). Written after the guards above, so it appears only\n")
+		b.WriteString("# when this run actually goes on to spawn an agent.\n")
+		b.WriteString(`printf '%s\n' ` + shellquote.Single(LaunchEpochPrefix+launchID) + ` >> "$HOME/.buzz-backend/acp.log"` + "\n")
+	}
 
 	// 9>&- closes the lock fd in the launched child. Without it the agent
 	// — and every worker it spawns — inherits the open descriptor and so

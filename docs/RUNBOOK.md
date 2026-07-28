@@ -184,9 +184,14 @@ Match on the code, not the prose.
 | `install.script` | pass a known `provider_config.buzz_version` (the error lists the pinned versions this build ships sha256s for) |
 | `install.write` | check sandbox SSH reachability with `databricks sandbox ssh <id> -- true` |
 | `install.exec` | read the install output above: a sha256 mismatch means the pinned release changed; a fetch failure means the sandbox lost egress to GitHub |
-| `install.runtime_verify` | the installed buzz-agent could not complete an ACP initialize handshake — check `logs` and the inference env (BUZZ_AGENT_PROVIDER / DATABRICKS_HOST / DATABRICKS_TOKEN) |
+| `install.adapter_script` | pass a known `provider_config.claude_adapter_version` (the error lists the adapter versions this build ships a pinned package-lock.json for) |
+| `install.adapter_write` | check sandbox SSH reachability with `databricks sandbox ssh <id> -- true` |
+| `install.adapter_exec` | read the npm output above: an integrity mismatch means the registry served different bytes than the pinned lockfile — do NOT retry, report it; anything else is usually lost sandbox egress to registry.npmjs.org, which is safe to retry |
+| `install.runtime_verify` | the installed agent runtime could not complete an ACP initialize handshake — check `logs` and the inference env for that runtime (buzz-agent: BUZZ_AGENT_PROVIDER / DATABRICKS_HOST / DATABRICKS_TOKEN; claude: ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN / DATABRICKS_HOST) |
+| `install.claude_inference` | the agent installed and handshook, but could not reach the AI Gateway: confirm the workspace serves `{host}/ai-gateway/anthropic/v1/messages` and that the credential is accepted there — in `inference_auth: "env"` check env_vars DATABRICKS_HOST/DATABRICKS_TOKEN, in `"sandbox"` mode retry or fall back to env mode for this agent |
 | `provision.env_write` | check sandbox SSH reachability and that $HOME is writable in the sandbox |
 | `launch.prelaunch_kill` | check sandbox SSH reachability with `databricks sandbox ssh <id> -- true` |
+| `launch.stale_agent` | a previous buzz-acp was still shutting down and did not exit — run `status <sandbox-id>` to confirm, then `stop <sandbox-id>` followed by a redeploy; if it persists the old process is wedged and the sandbox needs a restart |
 | `launch.write` | check sandbox SSH reachability and that $HOME is writable in the sandbox |
 | `launch.exec` | run `logs <sandbox-id>` for the agent's own output, then `start <sandbox-id>` to retry the launch |
 | `verify.unreachable` | the sandbox stopped responding right after launch — run `status <sandbox-id>`, then `start <sandbox-id>` |
@@ -214,6 +219,34 @@ agent's `pubkey=…`) are left intact. If you need a genuinely raw log,
 read it in place: `databricks sandbox ssh <id> -- cat '$HOME/.buzz-backend/acp.log'`.
 
 ---
+
+## 7b. Claude Code runtime
+
+Deploy an agent on this runtime with `agent_command: "claude-code"` (aliases: `claude-agent-acp`, `claude-code-acp`, `claudecode`). It is installed as an npm ACP adapter, not from the Buzz `.deb`.
+
+**`install.adapter_exec` — adapter install failed.** Read the npm output in the error. An *integrity mismatch* means the registry served different bytes than the committed lockfile pins: **do not retry**, report it. Anything else is usually lost sandbox egress to `registry.npmjs.org`, which is safe to retry. A cold install takes ~6 s and ~570 MB, so a long hang is a network problem, not a slow install.
+
+**`install.runtime_verify` on a claude deploy — adapter not spawnable.** buzz-acp spawns the agent by bare name, so the adapter must be at `$HOME/.buzz-backend/bin/claude-agent-acp`. Check it:
+
+```sh
+databricks sandbox ssh <id> -p <profile> -- 'ls -l $HOME/.buzz-backend/bin/claude-agent-acp && $HOME/.buzz-backend/bin/claude-agent-acp --help >/dev/null 2>&1; echo rc=$?'
+```
+
+**`install.claude_inference` with cause "unset" — no endpoint, and deliberately no token.** This is the fail-closed path doing its job, not a bug: with no `DATABRICKS_HOST` the provider emits **neither** `ANTHROPIC_BASE_URL` nor `ANTHROPIC_AUTH_TOKEN`, because Claude Code falls back to `https://api.anthropic.com` when the base URL is unset and the sandbox has open egress there — so emitting the token alone would send a live workspace PAT to a third party. Fix the payload: supply `env_vars.DATABRICKS_HOST` (with `DATABRICKS_TOKEN`), or set `provider_config.inference_auth: "sandbox"`, or supply `ANTHROPIC_BASE_URL` **and** `ANTHROPIC_AUTH_TOKEN` together.
+
+**`install.claude_inference` with cause "auth" — the credential was refused (401/403).** In `env` mode the supplied `DATABRICKS_TOKEN` is not authorized for the gateway (it needs CAN QUERY on the endpoints). In `sandbox` mode the sandbox's baked credential was rejected — fall back to `env` mode for that agent. Note the probe deliberately does **not** fail on other statuses: any answer other than 401/403 already proves the endpoint is reachable and the credential accepted.
+
+**`launch.stale_agent` — a previous buzz-acp would not exit.** The provider SIGTERMs the old agent and waits up to 15 s (buzz-acp drains its pool on shutdown), then escalates to SIGKILL. Reaching this code means one survived both. Run `status <id>`, then `stop <id>` and redeploy; if it persists the process is wedged and the sandbox needs a restart. The provider refuses to launch over it on purpose: `launch.sh` will not relaunch while an agent is alive, and `acp.log` is append-only, so proceeding would let the *previous* deploy's readiness line verify this one while the old runtime kept serving with the old environment.
+
+**Model selection is not configurable on this runtime.** `agent.model` is ignored. A Databricks gateway model id (`databricks-claude-*`) gets rewritten by the Anthropic SDK into a canonical id the gateway does not serve, which fails every turn — so the provider emits no model variable and the adapter uses its own default.
+
+**Resource and disk notes.** Each adapter process is ~115 MB RSS at idle, so `parallelism: N` costs roughly `N × 115 MB` on the sandbox's 8 GiB before session working set. Claude Code also writes conversation transcripts under `~/.claude/`. If a long-lived `--no-autostop` sandbox runs low on space:
+
+```sh
+databricks sandbox ssh <id> -p <profile> -- 'du -sh ~/.claude ~/.buzz-backend; df -h $HOME | tail -1'
+```
+
+Switching an agent *away* from the claude runtime deliberately leaves `~/.buzz-backend/npm-claude` (~570 MB), `~/.claude`, and the `bin/claude-agent-acp` symlink in place — they are harmless and re-used if the agent switches back. Delete them by hand if you need the space.
 
 ## 8. Fresh-machine walkthrough
 

@@ -140,10 +140,47 @@ ln -sf "$SRC" "$BIN_DIR/%s"
 // so pin the most compatible request, not the newest.
 const InitializeFrame = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}`
 
-// AgentInfoMarker is the substring expected in buzz-agent's response to
+// AgentInfoMarker is the substring expected in the agent's response to
 // InitializeFrame on success (docs/M05_PROBE_RESULTS.md §6: "expect the
 // agentInfo result").
+//
+// It is shared by EVERY runtime, which was not a given: the ACP spec makes
+// agentInfo optional, and buzz-acp itself tolerates its absence (reads
+// agentInfo or serverInfo, then defaults to "unknown"). Probed live against
+// claude-agent-acp@0.63.0 (docs/M2_CLAUDE_PROBE_RESULTS.md P5), whose reply
+// carries `"agentInfo":{"name":"@agentclientprotocol/claude-agent-acp",...}`
+// — so no per-runtime marker is needed and VerifySpec carries only a path.
 const AgentInfoMarker = "agentInfo"
+
+// VerifySpec is the per-runtime part of the verification handshake. It is
+// deliberately just the binary: the frame (InitializeFrame) and the success
+// marker (AgentInfoMarker) are shared across runtimes.
+type VerifySpec struct {
+	// Bin is a TRUSTED, static "$HOME"-relative literal naming the
+	// executable to hand the initialize frame to. Never payload data —
+	// it is validated against verifyEnvFileCharset for the same reason
+	// envFile is.
+	Bin string
+}
+
+// VerifySpecFor returns the verification spec for a runtime, keyed by the
+// canonical spawn command (payload.Runtime.SpawnCommand()). Taking a string
+// rather than payload.Runtime keeps internal/install free of a dependency on
+// internal/payload, matching how the rest of this package is decoupled.
+//
+// An unknown spawn command yields an empty Bin, which BuildVerifyCommand
+// rejects — an unroutable runtime must fail loudly rather than silently
+// verify the wrong binary.
+func VerifySpecFor(spawnCommand string) VerifySpec {
+	switch spawnCommand {
+	case "buzz-agent":
+		return VerifySpec{Bin: BinDir + "/buzz-agent"}
+	case AdapterBinName:
+		return VerifySpec{Bin: BinDir + "/" + AdapterBinName}
+	default:
+		return VerifySpec{}
+	}
+}
 
 // BuildVerifyCommand renders the COMBINED verify script run as a single
 // sshx.RunWithStdin round trip (BUG 1 fix): it reads the agent's env
@@ -168,23 +205,50 @@ const AgentInfoMarker = "agentInfo"
 // whitespace, ...) is rejected with an error, so a future caller
 // mistake can never smuggle shell syntax through this trusted-literal
 // path.
-func BuildVerifyCommand(envFile string, timeoutSeconds int) (string, error) {
+// spec selects the runtime binary to hand the frame to and is validated
+// against the same charset allowlist as envFile, for the same reason.
+//
+// The pipeline's exit status IS the verdict, unchanged from the buzz-agent
+// era: claude-agent-acp exits 0 on stdin EOF in ~355ms, so `timeout` does
+// not fire and no exit-code special-casing is needed
+// (docs/M2_CLAUDE_PROBE_RESULTS.md P5). stderr is folded into the pipeline
+// so adapter startup diagnostics survive: sshx returns stdout only on the
+// SUCCESS path, which is exactly the path installAndVerify scans the marker
+// on — without 2>&1 a agent that answers wrongly tells us nothing about why.
+// It is bounded server-side with `tail -c` so a chatty runtime cannot push
+// an unbounded blob across the SSH boundary into an error string.
+func BuildVerifyCommand(envFile string, timeoutSeconds int, spec VerifySpec) (string, error) {
 	if !verifyEnvFileCharset.MatchString(envFile) {
 		return "", fmt.Errorf("verify env file path %q contains characters outside the allowed set [A-Za-z0-9_$/.-]; BuildVerifyCommand accepts trusted static literals only", envFile)
+	}
+	if spec.Bin == "" {
+		return "", fmt.Errorf("verify spec has no binary; BuildVerifyCommand cannot verify an unknown runtime")
+	}
+	if !verifyEnvFileCharset.MatchString(spec.Bin) {
+		return "", fmt.Errorf("verify binary path %q contains characters outside the allowed set [A-Za-z0-9_$/.-]; BuildVerifyCommand accepts trusted static literals only", spec.Bin)
 	}
 	return fmt.Sprintf(`set -eu
 umask 077
 ENVF="%s"
-trap 'rm -f "$ENVF"' EXIT
+OUTF="$ENVF.out"
+trap 'rm -f "$ENVF" "$OUTF"' EXIT
 cat > "$ENVF"
 chmod 600 "$ENVF"
 set -a
 # shellcheck disable=SC1090
 . "$ENVF"
 set +a
-printf '%%s\n' %s | timeout %d "$HOME/.buzz-backend/bin/buzz-agent"
-`, envFile, shellquote.Single(InitializeFrame), timeoutSeconds), nil
+rc=0
+printf '%%s\n' %s | timeout %d "%s" > "$OUTF" 2>&1 || rc=$?
+tail -c %d "$OUTF"
+exit $rc
+`, envFile, shellquote.Single(InitializeFrame), timeoutSeconds, spec.Bin, maxVerifyOutputBytes), nil
 }
+
+// maxVerifyOutputBytes bounds the merged stdout+stderr the verify handshake
+// may return across the SSH boundary. The initialize reply is ~700 bytes;
+// this leaves room for a genuine diagnostic while capping a runaway log.
+const maxVerifyOutputBytes = 4096
 
 // verifyEnvFileCharset is the allowlist for BuildVerifyCommand's envFile
 // parameter: path characters plus '$' (for the required "$HOME" prefix),

@@ -89,7 +89,7 @@ func TestBuildInstallScript_ChecksumVerification(t *testing.T) {
 }
 
 func TestBuildVerifyCommand_CombinedScript(t *testing.T) {
-	cmd, err := BuildVerifyCommand(`$HOME/.buzz-backend/.env.verify`, 10)
+	cmd, err := BuildVerifyCommand(`$HOME/.buzz-backend/.env.verify`, 10, VerifySpecFor("buzz-agent"))
 	if err != nil {
 		t.Fatalf("BuildVerifyCommand error for the canonical trusted path: %v", err)
 	}
@@ -112,8 +112,8 @@ func TestBuildVerifyCommand_CombinedScript(t *testing.T) {
 	if !strings.Contains(cmd, `cat > "$ENVF"`) {
 		t.Fatal("verify command should write its own stdin into the env file (single combined round trip)")
 	}
-	if !strings.Contains(cmd, `trap 'rm -f "$ENVF"' EXIT`) {
-		t.Fatal("verify command should clean up the real (expanded-path) env file on exit via trap")
+	if !strings.Contains(cmd, `trap 'rm -f "$ENVF" "$OUTF"' EXIT`) {
+		t.Fatal("verify command should clean up the real (expanded-path) env file AND the captured output file on exit via trap")
 	}
 	if !strings.Contains(cmd, "buzz-agent") {
 		t.Fatal("verify command should invoke buzz-agent")
@@ -139,7 +139,7 @@ func TestBuildVerifyCommand_RejectsHostilePaths(t *testing.T) {
 		"",                                   // empty
 	}
 	for _, path := range hostile {
-		if cmd, err := BuildVerifyCommand(path, 10); err == nil {
+		if cmd, err := BuildVerifyCommand(path, 10, VerifySpecFor("buzz-agent")); err == nil {
 			t.Fatalf("BuildVerifyCommand(%q) should have been rejected, got script: %q", path, cmd)
 		}
 	}

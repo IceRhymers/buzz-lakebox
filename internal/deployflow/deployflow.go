@@ -80,6 +80,11 @@ type Deployer struct {
 	// VerifyDelay is N in docs/PLAN.md §4.4 step 10 (default 10s).
 	VerifyDelay time.Duration
 
+	// NewLaunchID returns the per-deploy identifier stamped into acp.log
+	// so step 10 can scope its readiness check to THIS launch. Injectable
+	// so tests get deterministic rendered output; nil uses random bytes.
+	NewLaunchID func() string
+
 	// WaitRunningTimeout/PollInterval bound polling a sandbox to Running
 	// after create/start.
 	WaitRunningTimeout time.Duration
@@ -431,7 +436,12 @@ func (e *preMutationFailure) Unwrap() error { return e.err }
 func (d *Deployer) provision(ctx context.Context, profile, sandboxID string, freshlyCreated bool, req *payload.DeployRequest) error {
 	agent := req.Agent
 	sandboxAuth := req.ProviderConfig.SandboxInferenceAuth()
-	envContent := nest.RenderEnv(agent, sandboxAuth)
+	// Resolved once and threaded through the whole flow. Validate() has
+	// already rejected an unknown agent_command, so the lookup cannot fail
+	// here; default to buzz-agent rather than panicking if a future caller
+	// reaches provision() without validating.
+	rt := runtimeOf(agent)
+	envContent := nest.RenderEnv(agent, rt, sandboxAuth)
 
 	// Step 4: either the PAT reset (default/env mode; the first in-sandbox
 	// action of every deploy, unless the owner opted out) or, in zero-token
@@ -459,7 +469,7 @@ func (d *Deployer) provision(ctx context.Context, profile, sandboxID string, fre
 	// launch.sh (step 9) `mkdir -p`s the full nest working-dir set, so the
 	// former standalone "nest working dirs" SSH round trip (step 6) was a
 	// redundant extra round trip and has been removed (C5 cleanup).
-	if err := d.installAndVerify(ctx, profile, sandboxID, req.ProviderConfig.BuzzVersion, envContent); err != nil {
+	if err := d.installAndVerify(ctx, profile, sandboxID, rt, req.ProviderConfig, envContent); err != nil {
 		return err
 	}
 
@@ -479,14 +489,34 @@ func (d *Deployer) provision(ctx context.Context, profile, sandboxID string, fre
 	// invoking shell and abort the happy path with a non-zero exit. The
 	// bracket idiom's regex still matches the real "buzz-acp" process
 	// name but the argv text "[b]uzz-acp" does not match itself.
-	if _, err := d.SSH.Run(ctx, profile, sandboxID, step("prelaunch-kill", `pkill -f '[b]uzz-acp' 2>/dev/null; true`)); err != nil {
+	//
+	// The kill is followed by a bounded WAIT for the process to actually
+	// go away, because SIGTERM starts a graceful drain rather than an
+	// immediate exit: buzz-acp shuts down each pooled agent in turn,
+	// waiting on every child. Returning before that finishes used to lose
+	// a race with step 9 — launch.sh exits early when a buzz-acp is still
+	// alive ("already running; not relaunching"), and acp.log is appended
+	// to rather than truncated, so step 10 would then read the PREVIOUS
+	// deploy's readiness line and pass. The result was a deploy reporting
+	// ok:true while the old runtime kept serving with the old environment
+	// — worst on exactly the redeploy that switches runtime or rotates a
+	// credential, which is the case that most needs to take effect.
+	out, err := d.SSH.Run(ctx, profile, sandboxID, step("prelaunch-kill", prelaunchKillScript()))
+	if err != nil {
 		return failf(CodePrelaunchKill, "kill existing buzz-acp process group: %w", err)
 	}
+	if strings.Contains(out, prelaunchStillAliveMarker) {
+		return failf(CodeStaleAgent,
+			"a previous buzz-acp did not exit within %ds of SIGTERM; refusing to launch over it: %s",
+			prelaunchKillWaitSeconds, remoteText(strings.TrimSpace(out)))
+	}
 
-	// Step 9: write + run launch.sh.
+	// Step 9: write + run launch.sh, stamped with a per-deploy launch id so
+	// step 10 can tell this launch's readiness line from a previous one's.
+	launchID := d.newLaunchID()
 	if _, err := d.SSH.RunWithStdin(ctx, profile, sandboxID,
 		step("launch-write", fmt.Sprintf(`set -eu; umask 077; cat > %s && chmod 700 %s`, dquote(nest.LaunchScriptPath), dquote(nest.LaunchScriptPath))),
-		strings.NewReader(nest.RenderLaunchScript(req.ProviderConfig.KeepWorkspacePAT, sandboxAuth)),
+		strings.NewReader(nest.RenderLaunchScript(req.ProviderConfig.KeepWorkspacePAT, sandboxAuth, launchID)),
 	); err != nil {
 		return failf(CodeLaunchWrite, "write launch.sh: %w", err)
 	}
@@ -496,7 +526,7 @@ func (d *Deployer) provision(ctx context.Context, profile, sandboxID string, fre
 
 	// Step 10: verify after N=VerifyDelay, then (only on success) set
 	// the autostop policy.
-	if err := d.verifyLaunch(ctx, profile, sandboxID); err != nil {
+	if err := d.verifyLaunch(ctx, profile, sandboxID, launchID); err != nil {
 		return err
 	}
 
@@ -603,10 +633,18 @@ fi
 // found (e.g. the ssh transport itself failed before the script ever
 // ran, rather than the script's own logic failing).
 func authProbeCause(out string) string {
+	return probeCause(out, authProbeCauseMarkerPrefix)
+}
+
+// probeCause scans out for the FIRST <prefix><cause> line and returns
+// <cause>, or "" when none is found. Shared by every in-sandbox probe that
+// disambiguates its own failure modes by echoing a marker before exiting
+// non-zero, so they all parse their causes the same way.
+func probeCause(out, prefix string) string {
 	for _, line := range strings.Split(out, "\n") {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, authProbeCauseMarkerPrefix) {
-			return strings.TrimPrefix(trimmed, authProbeCauseMarkerPrefix)
+		if strings.HasPrefix(trimmed, prefix) {
+			return strings.TrimPrefix(trimmed, prefix)
 		}
 	}
 	return ""
@@ -673,8 +711,13 @@ func (d *Deployer) deleteFreshSandbox(profile, sandboxID string) {
 // $HOME) while the exec step single-quoted it (not expanding), so
 // sourcing always failed under `set -eu` and the exec's own trap never
 // removed the real file either.
-func (d *Deployer) installAndVerify(ctx context.Context, profile, sandboxID, buzzVersion, envContent string) error {
-	script, err := install.BuildInstallScript(buzzVersion)
+// The .deb install is unconditional for EVERY runtime: buzz-acp itself
+// ships in it, and launch.sh runs it by absolute path. Runtimes that also
+// need an ACP adapter (currently only Claude) get an additional pair of
+// round trips after it, and a gateway reachability probe after the
+// handshake.
+func (d *Deployer) installAndVerify(ctx context.Context, profile, sandboxID string, rt payload.Runtime, cfg payload.ProviderConfig, envContent string) error {
+	script, err := install.BuildInstallScript(cfg.BuzzVersion)
 	if err != nil {
 		return failf(CodeInstallScript, "install: %w", err)
 	}
@@ -690,10 +733,18 @@ func (d *Deployer) installAndVerify(ctx context.Context, profile, sandboxID, buz
 		return failf(CodeInstallExec, "install: %w", err)
 	}
 
+	if rt == payload.RuntimeClaude {
+		if err := d.installClaudeAdapter(ctx, profile, sandboxID, cfg.ClaudeAdapterVersion); err != nil {
+			return err
+		}
+	}
+
 	// Runtime verification: ACP initialize handshake with the agent env
 	// sourced (docs/M05_PROBE_RESULTS.md §6), env content shipped via
-	// stdin only.
-	verifyCmd, err := install.BuildVerifyCommand(verifyEnvFilePath, installVerifyTimeoutSeconds)
+	// stdin only. The binary differs per runtime; the frame and the
+	// success marker do not.
+	spec := install.VerifySpecFor(rt.SpawnCommand())
+	verifyCmd, err := install.BuildVerifyCommand(verifyEnvFilePath, installVerifyTimeoutSeconds, spec)
 	if err != nil {
 		return failf(CodeRuntimeVerify, "install verification: %w", err)
 	}
@@ -702,12 +753,77 @@ func (d *Deployer) installAndVerify(ctx context.Context, profile, sandboxID, buz
 		strings.NewReader(envContent),
 	)
 	if err != nil {
-		return failf(CodeRuntimeVerify, "install verification: buzz-agent ACP initialize handshake failed: %w", err)
+		return failf(CodeRuntimeVerify, "install verification: %s ACP initialize handshake failed: %w", rt.SpawnCommand(), err)
 	}
 	if !strings.Contains(out, install.AgentInfoMarker) {
-		return failf(CodeRuntimeVerify, "install verification: buzz-agent ACP initialize response did not contain %q: %s", install.AgentInfoMarker, remoteText(strings.TrimSpace(out)))
+		return failf(CodeRuntimeVerify, "install verification: %s ACP initialize response did not contain %q: %s", rt.SpawnCommand(), install.AgentInfoMarker, remoteText(strings.TrimSpace(out)))
+	}
+
+	if rt == payload.RuntimeClaude {
+		if err := d.claudeInferenceProbe(ctx, profile, sandboxID, envContent); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// installClaudeAdapter installs the npm ACP adapter the Claude runtime
+// spawns, as its own write+exec pair so a failure is attributable to the
+// adapter rather than to the .deb.
+func (d *Deployer) installClaudeAdapter(ctx context.Context, profile, sandboxID, adapterVersion string) error {
+	script, err := install.BuildAdapterInstallScript(adapterVersion)
+	if err != nil {
+		return failf(CodeAdapterScript, "claude adapter install: %w", err)
+	}
+	const adapterScriptPath = "$HOME/.buzz-backend/install-adapter.sh"
+	if _, err := d.SSH.RunWithStdin(ctx, profile, sandboxID,
+		step("adapter-write", fmt.Sprintf(`set -eu; umask 077; mkdir -p "$HOME/.buzz-backend"; cat > %s`, dquote(adapterScriptPath))),
+		strings.NewReader(script),
+	); err != nil {
+		return failf(CodeAdapterWrite, "claude adapter install: write install script: %w", err)
+	}
+	if _, err := d.SSH.Run(ctx, profile, sandboxID, step("adapter-exec", fmt.Sprintf(`sh %s`, dquote(adapterScriptPath)))); err != nil {
+		return failf(CodeAdapterExec, "claude adapter install: %w", err)
+	}
+	return nil
+}
+
+// claudeInferenceProbe closes the gap between "the agent process answers
+// ACP" and docs/PLAN.md §1's promise that a successful deploy means an
+// agent that can run a session. The initialize handshake never touches the
+// LLM, so without this probe a wrong endpoint, a credential the gateway
+// rejects, or a workspace that does not serve the anthropic route all
+// deploy "healthy" and fail at the first real mention.
+//
+// It deliberately does NOT reuse authProbe's `databricks current-user me`
+// check. That call needs workspace-identity permissions, but the README
+// recommends a least-privilege service-principal token scoped to CAN QUERY
+// on gateway endpoints — which would fail it while being perfectly valid
+// for inference. The probe has to exercise the endpoint that actually has
+// to work.
+//
+// The env content travels over stdin, is sourced, and is removed by a trap,
+// exactly like the verify handshake; no secret is ever interpolated into
+// the command string or argv.
+func (d *Deployer) claudeInferenceProbe(ctx context.Context, profile, sandboxID, envContent string) error {
+	// Mirrors authProbe's shape deliberately: the script signals failure by
+	// exiting non-zero, so the error is the NORMAL failure path and the
+	// cause marker must be parsed from the output it still returned —
+	// returning early on err would make every diagnosis below dead code.
+	out, err := d.SSH.RunWithStdin(ctx, profile, sandboxID,
+		step("claude-inference-probe", claudeInferenceProbeScript()),
+		strings.NewReader(envContent),
+	)
+	if err == nil {
+		return nil
+	}
+	cause := probeCause(out, claudeProbeCauseMarkerPrefix)
+	if cause == "" {
+		// No marker: the transport itself failed before the script ran.
+		return failf(CodeClaudeInference, "claude inference probe: %w", err)
+	}
+	return failf(CodeClaudeInference, "claude inference probe: %s (probe output: %s)",
+		claudeProbeCauseMessage(cause, out), remoteText(strings.TrimSpace(out)))
 }
 
 // verifyLaunch implements docs/PLAN.md §4.4 step 10's pass signal, waiting
@@ -720,10 +836,15 @@ func (d *Deployer) installAndVerify(ctx context.Context, profile, sandboxID, buz
 // exit code is captured and echoed rather than relied on as this call's
 // own exit code, and the log is bounded to the last 4KB server-side via
 // `tail -c` so it can never blow up an error message (BUG 5).
-func (d *Deployer) verifyLaunch(ctx context.Context, profile, sandboxID string) error {
+// launchID identifies the launch this call is verifying. When non-empty,
+// the readiness signal must appear AFTER that launch's delimiter in
+// acp.log — the log is append-only, so an earlier deploy's readiness line
+// is otherwise indistinguishable from this one's and would let a launch
+// that never actually happened verify as healthy.
+func (d *Deployer) verifyLaunch(ctx context.Context, profile, sandboxID, launchID string) error {
 	d.sleep(d.verifyDelay())
 
-	out, err := d.SSH.Run(ctx, profile, sandboxID, step("verify-check", acpLivenessProbe()))
+	out, err := d.SSH.Run(ctx, profile, sandboxID, step("verify-check", acpLivenessProbeFor(launchID)))
 	if err != nil {
 		return failf(CodeVerifySSH, "verify: could not check buzz-acp process/log: %w", err)
 	}
@@ -757,6 +878,20 @@ func (d *Deployer) verifyLaunch(ctx context.Context, profile, sandboxID string) 
 			"verify: relay connection failed (%q); this nostr key is very likely not a member of the target relay",
 			terminalErrorLine,
 		)
+	}
+	// logOut is ALREADY scoped to this launch when launchID is set:
+	// acpLivenessProbeFor selects the post-marker region server-side, where
+	// the whole log is available. An empty log here therefore means the
+	// marker was never written — i.e. launch.sh decided not to spawn (a
+	// previous agent was still holding the guard), which is exactly the
+	// stale-agent case this scoping exists to catch.
+	// Empty here means the marker itself is absent (awk keeps the marker
+	// line, so a launch that stamped always yields at least that) — i.e.
+	// launch.sh reached its guards and declined to spawn.
+	if launchID != "" && strings.TrimSpace(logOut) == "" {
+		return failf(CodeVerifyNotReady,
+			"verify: acp.log carries no output for this deploy's launch within %s — launch.sh did not start an agent (a previous one may still have been shutting down)",
+			d.verifyDelay())
 	}
 	if !strings.Contains(logOut, agentPoolReadyMarker) {
 		return failf(CodeVerifyNotReady, "verify: acp.log did not contain %q within %s; log: %s", agentPoolReadyMarker, d.verifyDelay(), strings.TrimSpace(logOut))
@@ -881,8 +1016,52 @@ func (d *Deployer) teardown(profile, sandboxID string, freshlyCreated bool) {
 // because a dead agent must still produce a readable log tail rather
 // than a failed SSH call.
 func acpLivenessProbe() string {
+	return acpLivenessProbeFor("")
+}
+
+// acpLivenessProbeFor is acpLivenessProbe scoped to one launch.
+//
+// When launchID is empty the log is the last 4KB, unchanged — that is what
+// Status and Start use, since neither has a launch of its own to scope to.
+//
+// When launchID is set, the log region is selected SERVER-SIDE, from the
+// last occurrence of that launch's marker, before the 4KB bound is applied.
+// Doing it here rather than in Go is what keeps the check from becoming
+// strictly more fragile than the one it replaces: the marker is written
+// just before the agent spawns, so it is always OLDER than the readiness
+// line it scopes. Truncating first and then looking for the marker would
+// mean a chatty startup (several pooled agents, each logging) could push
+// the marker out of the window while the readiness line remained — failing
+// a perfectly healthy deploy. awk sees the whole file, so only the
+// post-marker region is ever subject to the byte bound.
+//
+// launchID is a hex string generated by newLaunchID and is never payload
+// data. It is shell-quoted into the awk -v assignment regardless, so the
+// safety here rests on shellquote plus the value's provenance — NOT on any
+// validation, which no caller performs.
+func acpLivenessProbeFor(launchID string) string {
+	logCmd := `tail -c 4096 "$HOME/.buzz-backend/acp.log" 2>/dev/null || true`
+	if launchID != "" {
+		marker := nest.LaunchEpochPrefix + launchID
+		// Buffer from the last marker occurrence, print at EOF. Always
+		// exits 0 so a missing marker (an agent that never launched)
+		// yields empty output rather than a non-zero status the caller
+		// would misread as a transport failure.
+		//
+		// The marker LINE ITSELF is kept in the buffer rather than
+		// skipped. That is what lets the caller distinguish "this launch
+		// stamped but has not logged anything yet" (buffer holds just the
+		// marker) from "this launch never happened" (buffer empty) —
+		// dropping it would collapse both into empty output and produce a
+		// confidently wrong diagnosis for a launch that did occur.
+		logCmd = fmt.Sprintf(
+			`awk -v m=%s 'index($0, m) { buf = $0 "\n"; found = 1; next } found { buf = buf $0 "\n" } END { printf "%%s", buf; exit 0 }' `+
+				`"$HOME/.buzz-backend/acp.log" 2>/dev/null | tail -c 4096 || true`,
+			shellquote.Single(marker),
+		)
+	}
 	return nest.AliveCheckSnippet + "\n" +
-		`buzz_acp_alive; echo "BUZZ_PGREP_RC=$?"; tail -c 4096 "$HOME/.buzz-backend/acp.log" 2>/dev/null || true`
+		`buzz_acp_alive; echo "BUZZ_PGREP_RC=$?"; ` + logCmd
 }
 
 // secretShredCommand removes every secret-bearing file this provider
@@ -892,10 +1071,20 @@ func acpLivenessProbe() string {
 // the other. Always exits 0 — a missing file is the expected case on
 // most paths and must not fail the caller's own error reporting.
 func secretShredCommand() string {
-	return fmt.Sprintf(
-		`shred -u %s 2>/dev/null || rm -f %s 2>/dev/null; shred -u %s 2>/dev/null || rm -f %s 2>/dev/null; true`,
-		dquote(nest.EnvFilePath), dquote(nest.EnvFilePath), dquote(verifyEnvFilePath), dquote(verifyEnvFilePath),
-	)
+	// verifyEnvFilePath+".out" is the verify handshake's captured
+	// stdout+stderr. It is produced with the agent's full env exported
+	// under `set -a`, so a runtime that echoes its environment on startup
+	// puts secrets in it. BuildVerifyCommand traps it on exit, but a
+	// transport drop mid-command leaves it behind — and this function's
+	// contract is to reclaim every secret-bearing file the provider
+	// writes, not only the ones whose own cleanup usually works.
+	paths := []string{nest.EnvFilePath, verifyEnvFilePath, verifyEnvFilePath + ".out"}
+	var b strings.Builder
+	for _, p := range paths {
+		fmt.Fprintf(&b, `shred -u %s 2>/dev/null || rm -f %s 2>/dev/null; `, dquote(p), dquote(p))
+	}
+	b.WriteString("true")
+	return b.String()
 }
 
 // step prepends an inert shell comment tagging cmd with a short

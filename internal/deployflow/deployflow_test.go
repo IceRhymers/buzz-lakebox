@@ -143,6 +143,21 @@ case "$1" in
           install-exec)
             exit "${FAKE_INSTALL_EXIT:-0}"
             ;;
+          adapter-exec)
+            exit "${FAKE_ADAPTER_EXIT:-0}"
+            ;;
+          prelaunch-kill)
+            printf '%s' "${FAKE_PRELAUNCH_OUTPUT:-}"
+            exit 0
+            ;;
+          claude-inference-probe)
+            if [ -n "${FAKE_CLAUDE_PROBE_CAUSE:-}" ]; then
+              printf 'BUZZ_CLAUDE_PROBE_CAUSE=%s\n' "${FAKE_CLAUDE_PROBE_CAUSE}"
+              printf 'BUZZ_CLAUDE_PROBE_STATUS=%s\n' "${FAKE_CLAUDE_PROBE_STATUS:-401}"
+              exit 1
+            fi
+            exit 0
+            ;;
           launch-exec)
             exit "${FAKE_LAUNCH_EXIT:-0}"
             ;;
@@ -209,6 +224,10 @@ func newHarness(t *testing.T) *harness {
 	ssh := &sshx.Client{Bin: binPath}
 	dep := New(cli, ssh)
 	dep.Sleep = func(time.Duration) {} // no real wall-clock waits in tests
+	// Deterministic launch id so the fake acp.log fixture can carry this
+	// deploy's launch marker (verifyLaunch scopes the readiness search to
+	// the current launch; see testLaunchID / healthyLog).
+	dep.NewLaunchID = func() string { return testLaunchID }
 	dep.WaitRunningTimeout = 5 * time.Second
 	dep.PollInterval = time.Millisecond
 	// Never let tests touch the real ~/.local/state mapping (New() wires
@@ -337,6 +356,9 @@ type reqOpts struct {
 	envVars          map[string]string
 	authTag          string
 	inferenceAuth    string
+	// agentCommand selects the agent runtime; empty means buzz-agent, so
+	// every pre-existing test keeps its original payload unchanged.
+	agentCommand string
 }
 
 func buildReq(o reqOpts) *payload.DeployRequest {
@@ -348,6 +370,10 @@ func buildReq(o reqOpts) *payload.DeployRequest {
 	if authTag == "" {
 		authTag = "auth-tag-marker-value"
 	}
+	agentCommand := o.agentCommand
+	if agentCommand == "" {
+		agentCommand = "buzz-agent"
+	}
 	return &payload.DeployRequest{
 		Op: "deploy",
 		Agent: payload.Agent{
@@ -355,7 +381,7 @@ func buildReq(o reqOpts) *payload.DeployRequest {
 			RelayURL:       "wss://relay.example.com",
 			PrivateKeyNsec: nsec,
 			AuthTag:        authTag,
-			AgentCommand:   "buzz-agent",
+			AgentCommand:   agentCommand,
 			EnvVars:        o.envVars,
 		},
 		ProviderConfig: payload.ProviderConfig{
@@ -381,7 +407,25 @@ func testPrefix(t *testing.T) string {
 	return prefix
 }
 
+// testLaunchID is the fixed per-deploy launch id the test Deployer stamps,
+// standing in for the random one production uses.
+const testLaunchID = "testlaunch01"
+
+// healthyLog is what verify-check returns for a launch that succeeded.
+//
+// Note it carries no launch marker: scoping happens SERVER-SIDE (awk, in
+// acpLivenessProbeFor), so what reaches Go is already only the region after
+// this launch's marker. The fixture therefore represents the scoped region,
+// not the raw file.
 const healthyLog = "buzz-acp starting: relay=wss://x pubkey=abc\nagent_pool_ready agents=1\n"
+
+// staleScopedLog is what verify-check returns when this deploy's launch
+// marker is absent from acp.log — awk finds nothing to scope to and emits
+// nothing. It means launch.sh did not start an agent, which is the
+// stale-agent case: an earlier deploy's readiness line may well still be in
+// the file, but it is not in THIS launch's region, so it cannot satisfy
+// this deploy's verification.
+const staleScopedLog = ""
 const agentInfoOutput = `{"jsonrpc":"2.0","id":1,"result":{"agentInfo":{"name":"buzz-agent","version":"0.1.0"}}}`
 
 func setHappyPathEnv(t *testing.T) {

@@ -108,7 +108,13 @@ func (d *Deployer) Start(profile, sandboxID string) (err error) {
 		return failf(CodeLaunchExec, "run launch.sh: %w", err)
 	}
 
-	if err := d.verifyLaunch(ctx, profile, sandboxID); err != nil {
+	// No launch id: Start deliberately reruns the EXISTING launch.sh rather
+	// than rendering a new one, so the only stamp that script can write is
+	// the one baked in at deploy time. Passing "" scopes verification to
+	// the whole log tail, which is exactly Start's pre-existing behavior —
+	// asserting on the previous deploy's id here would be checking that
+	// nothing changed, not that this relaunch worked.
+	if err := d.verifyLaunch(ctx, profile, sandboxID, ""); err != nil {
 		return err
 	}
 	return nil

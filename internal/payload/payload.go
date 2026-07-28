@@ -9,10 +9,6 @@ import (
 	"regexp"
 )
 
-// SupportedAgentCommand is the only agent_command value v0 of this provider
-// accepts. PLAN.md §4.2 / Decision 4: goose/claude/codex are v0.1 scope.
-const SupportedAgentCommand = "buzz-agent"
-
 // envVarKeyPattern is a valid POSIX shell/environment variable name. Keys
 // that don't match this are rejected by Agent.Validate() because
 // internal/nest's RenderEnv writes the KEY of every env_vars entry raw
@@ -71,6 +67,15 @@ type ProviderConfig struct {
 	// than something containing token/key/secret/password/credential
 	// deliberately, so it passes the desktop's secret-word config filter.
 	InferenceAuth string `json:"inference_auth"`
+
+	// ClaudeAdapterVersion pins the @agentclientprotocol/claude-agent-acp
+	// version installed for the Claude runtime; empty means
+	// install.DefaultAdapterVersion. Expert-only: deliberately NOT
+	// advertised in the provider's config_schema (same posture as
+	// BuzzVersion and KeepWorkspacePAT), so Buzz Desktop's create-agent
+	// dialog stays unchanged. Every segment of the key name avoids the
+	// desktop's secret-word filter (token/key/secret/password/credential).
+	ClaudeAdapterVersion string `json:"claude_adapter_version"`
 }
 
 // SandboxInferenceAuth reports whether provider_config opts the deploy into
@@ -102,11 +107,8 @@ func (a Agent) Validate() error {
 	if a.RelayURL == "" {
 		return fmt.Errorf("agent.relay_url must not be empty")
 	}
-	if a.AgentCommand != SupportedAgentCommand {
-		return fmt.Errorf(
-			"agent_command %q is not supported by this provider yet; v0 only supports %q, see v0.1 roadmap (https://github.com/IceRhymers/buzz-lakebox/issues/1) for goose/claude/codex support",
-			a.AgentCommand, SupportedAgentCommand,
-		)
+	if _, ok := RuntimeFor(a.AgentCommand); !ok {
+		return unsupportedRuntimeError(a.AgentCommand)
 	}
 	// env_vars keys are written raw (unquoted) into a shell-sourced env
 	// file by internal/nest's RenderEnv, so a key that isn't a valid
@@ -148,5 +150,81 @@ func (r DeployRequest) Validate() error {
 			r.ProviderConfig.InferenceAuth,
 		)
 	}
+	if err := r.validateClaudeInferenceSource(); err != nil {
+		return err
+	}
 	return nil
+}
+
+// validateClaudeInferenceSource requires the Claude runtime to have exactly
+// one coherent place to get its inference endpoint from, and is the
+// fail-loud half of the credential-egress defense (the fail-closed half
+// lives in nest.ClaudeEnvSnippet).
+//
+// Why this exists, from a live probe (docs/M2_CLAUDE_PROBE_RESULTS.md):
+// Claude Code falls back to https://api.anthropic.com when
+// ANTHROPIC_BASE_URL is unset, and a Lakebox sandbox has OPEN egress to
+// that host (HTTP 401 in 147ms with a genuine Anthropic error body). So an
+// inference_auth="env" deploy that supplies DATABRICKS_TOKEN but forgets
+// DATABRICKS_HOST would otherwise send a live workspace PAT to a third
+// party in an Authorization header — while every provider-side gate
+// (install verification, launch verification) still reported success,
+// because none of them touch the LLM.
+//
+// This must live on DeployRequest rather than Agent: it is the only level
+// that sees both agent.env_vars and provider_config.inference_auth.
+//
+// Note there is deliberately NO check here for ANTHROPIC_API_KEY coexisting
+// with ANTHROPIC_AUTH_TOKEN. That hazard was hypothesized and then
+// disproven live: the adapter completes turns normally with an
+// ANTHROPIC_API_KEY that is empty, and with one set to a bogus value,
+// alongside ANTHROPIC_AUTH_TOKEN. An API key simply cannot work against
+// this gateway (it sends x-api-key, which the gateway rejects with 401), so
+// it is inert rather than dangerous.
+func (r DeployRequest) validateClaudeInferenceSource() error {
+	rt, ok := RuntimeFor(r.Agent.AgentCommand)
+	if !ok || rt != RuntimeClaude {
+		return nil
+	}
+	// Bring-your-own endpoint requires bring-your-own token, checked here so
+	// it fails at the payload boundary rather than at the deploy-time
+	// inference probe (whose "unset" diagnosis would send the operator to
+	// DATABRICKS_HOST, not to the token they actually omitted).
+	//
+	// The requirement is not arbitrary: an explicit ANTHROPIC_BASE_URL
+	// suppresses the snippet's own derivation, and the snippet deliberately
+	// refuses to attach the workspace credential to an endpoint it did not
+	// choose — so this combination can only ever produce an agent with an
+	// endpoint and no credential.
+	if r.Agent.EnvVars["ANTHROPIC_BASE_URL"] != "" {
+		if r.Agent.EnvVars["ANTHROPIC_AUTH_TOKEN"] == "" {
+			return fmt.Errorf(
+				"agent_command %q sets env_vars.ANTHROPIC_BASE_URL without env_vars.ANTHROPIC_AUTH_TOKEN: "+
+					"an endpoint this provider did not derive is never given the workspace credential, so the agent would have no token. "+
+					"Supply both, or drop ANTHROPIC_BASE_URL to use the workspace AI Gateway",
+				r.Agent.AgentCommand,
+			)
+		}
+		return nil
+	}
+	if r.ProviderConfig.SandboxInferenceAuth() {
+		// Zero-token mode derives DATABRICKS_HOST in-sandbox from the
+		// baked ~/.databrickscfg, so there is nothing more to require.
+		// Checked AFTER the bring-your-own-endpoint rule above, not
+		// before: an explicit ANTHROPIC_BASE_URL suppresses derivation in
+		// this mode too, so short-circuiting here would accept exactly the
+		// endpoint-without-credential deploy that rule exists to reject.
+		return nil
+	}
+	if r.Agent.EnvVars["DATABRICKS_HOST"] != "" {
+		return nil
+	}
+	return fmt.Errorf(
+		"agent_command %q needs an inference endpoint: set env_vars.DATABRICKS_HOST (with DATABRICKS_TOKEN) to use the workspace AI Gateway, "+
+			"or set provider_config.inference_auth=\"sandbox\" to derive both from the sandbox's own credential, "+
+			"or set env_vars.ANTHROPIC_BASE_URL together with env_vars.ANTHROPIC_AUTH_TOKEN to target another endpoint "+
+			"(an endpoint this provider did not derive is never given the workspace credential). "+
+			"Without one of these the agent would fall back to the public Anthropic API and send its token there",
+		r.Agent.AgentCommand,
+	)
 }
