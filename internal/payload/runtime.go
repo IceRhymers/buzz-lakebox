@@ -20,6 +20,19 @@ const (
 	// pointed at the workspace AI Gateway's Anthropic-shaped surface
 	// (docs/M2_CLAUDE_PROBE_RESULTS.md).
 	RuntimeClaude Runtime = "claude"
+
+	// RuntimeCodex is Codex driven through the
+	// @agentclientprotocol/codex-acp ACP adapter, with inference pointed at
+	// the workspace AI Gateway's codex surface
+	// (docs/M3_CODEX_PROBE_RESULTS.md).
+	//
+	// Unlike the other two runtimes, codex takes its endpoint from a TOML
+	// file rather than from environment variables, so the provider renders
+	// a config.toml under a provider-owned CODEX_HOME at launch — see
+	// nest.CodexEnvSnippet. No agent_command maps here yet; the alias rows
+	// are the last thing added, so that everything this runtime needs is
+	// already in place before any payload can route to it.
+	RuntimeCodex Runtime = "codex"
 )
 
 // SupportedAgentCommand is the v0 agent_command value, retained as a named
@@ -60,6 +73,14 @@ var supportedAgentCommands = map[string]Runtime{
 var spawnCommands = map[Runtime]string{
 	RuntimeBuzzAgent: "buzz-agent",
 	RuntimeClaude:    "claude-agent-acp",
+
+	// Never bare "codex": the sandbox image ships /usr/local/bin/codex, a
+	// Databricks `ucode` wrapper that takes no arguments and launches an
+	// interactive TUI rather than speaking ACP on stdio (probe S1). The
+	// adapter's own node_modules/.bin also contains a real `codex`, so the
+	// name is doubly ambiguous. Canonicalizing to "codex-acp" means no
+	// alias can reach either one.
+	RuntimeCodex: "codex-acp",
 }
 
 // RuntimeFor resolves an agent_command to its Runtime. Matching is

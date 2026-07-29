@@ -31,6 +31,33 @@ func TestRuntimeFor_BareClaudeRejected(t *testing.T) {
 	}
 }
 
+// TestRuntimeCodex_SpawnCommandNeverBareCodex pins the canonicalization the
+// codex runtime's safety rests on. The sandbox image ships
+// /usr/local/bin/codex — a Databricks `ucode` wrapper that takes no
+// arguments and launches an interactive TUI (probe S1) — and the adapter's
+// own node_modules/.bin ships a second, real `codex`. Neither speaks ACP on
+// stdio the way buzz-acp needs. Only "codex-acp" may ever be spawned.
+func TestRuntimeCodex_SpawnCommandNeverBareCodex(t *testing.T) {
+	if got := RuntimeCodex.SpawnCommand(); got != "codex-acp" {
+		t.Errorf("RuntimeCodex spawn command = %q, want codex-acp", got)
+	}
+}
+
+// TestRuntimeFor_CodexNotYetRoutable pins this commit's scope: the runtime
+// exists so the machinery beneath it can be built and reviewed, but nothing
+// routes to it yet. The alias rows land last, once the adapter install, env
+// rendering, and inference probe are all in place — so there is never a
+// commit where a payload can select a runtime that is only half-built.
+//
+// This test is expected to be DELETED by the commit that adds the aliases.
+func TestRuntimeFor_CodexNotYetRoutable(t *testing.T) {
+	for _, v := range []string{"codex", "codex-acp", "codex-cli"} {
+		if _, ok := RuntimeFor(v); ok {
+			t.Errorf("%q must not be routable until the codex runtime is fully wired", v)
+		}
+	}
+}
+
 func TestRuntimeFor_ExactCaseOnly(t *testing.T) {
 	for _, v := range []string{"Claude-Code", "CLAUDE-CODE", "Buzz-Agent", " claude-code"} {
 		if _, ok := RuntimeFor(v); ok {
