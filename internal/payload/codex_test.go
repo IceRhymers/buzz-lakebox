@@ -38,8 +38,8 @@ func codexReq(envVars map[string]string, inferenceAuth string) DeployRequest {
 }
 
 // TestValidate_CodexRejectsAdapterEnvVarsInSandboxMode is the payload half of
-// the codex credential-egress defense, and it must cover the adapter's
-// COMPLETE env surface rather than the obvious one or two.
+// the codex credential-egress defense. It must cover every codex-runtime
+// variable that can move a credential, not just the obvious one or two.
 //
 // nest.CodexEnvSnippet's gate operates on a FILE, and agent.env_vars render
 // BEFORE that snippet and are exported into the agent's process — so no
@@ -52,16 +52,20 @@ func codexReq(envVars map[string]string, inferenceAuth string) DeployRequest {
 // config the owner pointed CODEX_HOME at, so it would validate the
 // substituted endpoint rather than catch it.
 func TestValidate_CodexRejectsAdapterEnvVarsInSandboxMode(t *testing.T) {
-	// Every variable @agentclientprotocol/codex-acp@1.1.7 reads (probe S10).
-	// Listed literally rather than ranged over codexAdapterEnvVars, so that
-	// dropping one from the production list fails this test instead of
-	// silently shrinking its own coverage.
+	// The codex-runtime variables that can redirect inference or widen the
+	// session policy. Listed literally rather than ranged over
+	// codexAdapterEnvVars, so that dropping one from the production list
+	// fails this test instead of silently shrinking its own coverage.
 	for _, key := range []string{
 		"DEFAULT_AUTH_REQUEST",
 		"CODEX_HOME",
 		"CODEX_CONFIG",
 		"MODEL_PROVIDER",
 		"CODEX_PATH",
+		"INITIAL_AGENT_MODE",
+		"CODEX_API_KEY",
+		"OPENAI_API_KEY",
+		"APP_SERVER_LOGS",
 	} {
 		t.Run(key+"/sandbox rejected", func(t *testing.T) {
 			err := codexReq(map[string]string{key: "/tmp/mine"}, "sandbox").Validate()
@@ -89,16 +93,26 @@ func TestValidate_CodexRejectsAdapterEnvVarsInSandboxMode(t *testing.T) {
 	}
 }
 
-// TestValidate_CodexAdapterEnvVarsListIsComplete pins the production list
-// against the adapter's actual env surface. If a future adapter version
-// reads a new variable, this is where the omission should be noticed.
-func TestValidate_CodexAdapterEnvVarsListIsComplete(t *testing.T) {
+// TestValidate_CodexAdapterEnvVarsListMatches pins the production list
+// exactly, in both directions, so a future adapter version that adds a
+// credential-moving variable cannot be absorbed silently.
+//
+// It is deliberately NOT named "...IsComplete": the list is purpose-scoped
+// rather than exhaustive, and the loader-class variables that no
+// adapter-derived list could ever contain (NODE_OPTIONS, LD_PRELOAD) are
+// covered by validateOwnerPATEnvVars instead. Claiming completeness here is
+// what produced the original gap.
+func TestValidate_CodexAdapterEnvVarsListMatches(t *testing.T) {
 	want := map[string]bool{
 		"DEFAULT_AUTH_REQUEST": true,
 		"CODEX_HOME":           true,
 		"CODEX_CONFIG":         true,
 		"MODEL_PROVIDER":       true,
 		"CODEX_PATH":           true,
+		"INITIAL_AGENT_MODE":   true,
+		"CODEX_API_KEY":        true,
+		"OPENAI_API_KEY":       true,
+		"APP_SERVER_LOGS":      true,
 	}
 	if len(codexAdapterEnvVars) != len(want) {
 		t.Errorf("codexAdapterEnvVars has %d entries, want %d: %v", len(codexAdapterEnvVars), len(want), codexAdapterEnvVars)

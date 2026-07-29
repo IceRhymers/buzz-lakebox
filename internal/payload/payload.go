@@ -298,12 +298,27 @@ func (r DeployRequest) validateOwnerPATEnvVars() error {
 	return nil
 }
 
-// codexAdapterEnvVars is the COMPLETE set of environment variables
-// @agentclientprotocol/codex-acp@1.1.7 reads, taken from its published
-// bundle (docs/M3_CODEX_PROBE_RESULTS.md S10). Each is an owner-controlled
-// input that can redirect where codex sends its credential, and none is
-// visible to nest.CodexEnvSnippet's file-based gate: agent.env_vars render
-// BEFORE the snippet and are exported into the agent's process.
+// codexAdapterEnvVars are the environment variables the codex RUNTIME (the
+// ACP adapter plus the codex binary it spawns) reads that can redirect
+// inference or widen the session's own policy. None is visible to
+// nest.CodexEnvSnippet's file-based gate: agent.env_vars render BEFORE the
+// snippet and are exported into the agent's process.
+//
+// This is a PURPOSE-SCOPED list, not an exhaustive one, and the distinction
+// is load-bearing. An earlier version of this comment claimed to be the
+// "COMPLETE set of environment variables the adapter reads", sourced from
+// docs/M3_CODEX_PROBE_RESULTS.md S10 — but S10 undercounted (it said six;
+// the bundle reads eleven, several through `env[VAR]` indirection that a
+// literal `process.env.X` scan misses). Worse, completeness was never
+// achievable: NODE_OPTIONS and LD_PRELOAD redirect the credential just as
+// effectively and are not adapter settings at all, so no
+// adapter-derived list could contain them. That whole class is handled by
+// validateOwnerPATEnvVars instead, which is where the real defense lives.
+//
+// Deliberately EXCLUDED after review, because they cannot move a
+// credential: DISABLE_MCP_CONFIG_FILTERING (MCP name dedup),
+// XDG_RUNTIME_DIR, NO_BROWSER (suppresses the ChatGPT auth method, which
+// buzz-acp never exercises).
 //
 // Ordered by severity rather than alphabetically, so a reader meets the
 // worst one first.
@@ -328,6 +343,26 @@ var codexAdapterEnvVars = []string{
 	// a ucode wrapper that takes no arguments, so this also breaks the
 	// runtime outright (probe S1/S10).
 	"CODEX_PATH",
+	// Selects an AgentMode preset. "agent-full-access" sets
+	// approvalPolicy "never" and dangerFullAccess, so every tool call is
+	// executed with no session/request_permission at all — removing the
+	// only trace an exfiltration would otherwise leave, and granting
+	// tool-path network without depending on buzz-acp's injection. S10's
+	// own design consequence #1 says the provider must not set this; the
+	// payload must not be able to either.
+	"INITIAL_AGENT_MODE",
+	// readApiKeyFromEnv()'s fallback on the api-key auth path. buzz-acp
+	// never exercises that path today (probe S5: no authenticate round
+	// trip), so this is latent rather than live — rejected because a
+	// credential-bearing variable should not depend on that staying true.
+	"CODEX_API_KEY",
+	"OPENAI_API_KEY",
+	// The adapter's Logger writes every JSON-RPC frame, plus a Startup
+	// record containing the auth request, to this directory. In-sandbox
+	// only, so nothing crosses a boundary — rejected because an
+	// owner-chosen destination for auth-bearing frames is not something
+	// this provider should be arranging on their behalf.
+	"APP_SERVER_LOGS",
 }
 
 // validateCodexInferenceSource is the codex analogue of

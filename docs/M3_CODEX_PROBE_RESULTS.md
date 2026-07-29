@@ -241,7 +241,17 @@ It also explains S7's mechanism: the adapter forwards `CODEX_CONFIG` as a **sess
 
 ## S10. Adapter source read — the exact mechanism behind S7 and S8 ✅
 
-Read of `@agentclientprotocol/codex-acp@1.1.7`'s published bundle (`npm pack`, `package/dist/index.js`, 1.1 MB). The adapter reads exactly six environment variables: `CODEX_PATH`, `CODEX_CONFIG`, `DEFAULT_AUTH_REQUEST`, `MODEL_PROVIDER`, `INITIAL_AGENT_MODE`, `DISABLE_MCP_CONFIG_FILTERING`.
+Read of `@agentclientprotocol/codex-acp@1.1.7`'s published bundle (`npm pack`, `package/dist/index.js`, 1.1 MB).
+
+> **CORRECTION (added after code review).** This section originally said the adapter reads "exactly six" environment variables. **That was wrong, and the error propagated into the provider's own reject list.** It reads **eleven**:
+>
+> `CODEX_PATH`, `CODEX_CONFIG`, `DEFAULT_AUTH_REQUEST`, `MODEL_PROVIDER`, `INITIAL_AGENT_MODE`, `DISABLE_MCP_CONFIG_FILTERING`, `APP_SERVER_LOGS`, `XDG_RUNTIME_DIR`, `NO_BROWSER`, `CODEX_API_KEY`, `OPENAI_API_KEY`.
+>
+> Two failures produced the undercount, and both are worth recording because they are repeatable mistakes. First, the original scan matched only literal `process.env.X` / `process.env["X"]`; the adapter also reads through an `env` parameter (`env["NO_BROWSER"]`) and through named constants (`env[CODEX_API_KEY_ENV_VAR]`), which that pattern cannot see. Second — and worse — the scan's own output listed **eight**, including `APP_SERVER_LOGS` and `XDG_RUNTIME_DIR`, and the write-up said six anyway. The data was in hand and mis-stated.
+>
+> Security-relevant among the misses: **`INITIAL_AGENT_MODE`** selects an `AgentMode` preset, and `agent-full-access` sets `approvalPolicy: "never"` with `dangerFullAccess` — suppressing every `session/request_permission`, i.e. the only trace an exfiltration would otherwise leave. `CODEX_API_KEY`/`OPENAI_API_KEY` are the `readApiKeyFromEnv()` fallback on the api-key auth path. All are now rejected at the payload boundary.
+>
+> **Do not treat any list derived from this section as exhaustive.** `NODE_OPTIONS` and `LD_PRELOAD` redirect the credential just as effectively and are not adapter settings at all, so no reading of this bundle could ever have contained them. That class is handled by `payload.validateOwnerPATEnvVars`.
 
 **`AgentMode` (`src/AgentMode.ts`) is the real sandbox lever, and `config.toml` never gets a say.** Three presets, each carrying its own approval policy *and* sandbox policy, applied per session:
 
