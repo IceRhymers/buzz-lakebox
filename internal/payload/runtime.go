@@ -83,6 +83,46 @@ var spawnCommands = map[Runtime]string{
 	RuntimeCodex: "codex-acp",
 }
 
+// EnvShape describes which blocks of the rendered agent env file a runtime
+// needs. It exists because the alternative — testing `rt != RuntimeClaude`
+// at each site, which is what this package encoded while exactly two
+// runtimes existed — silently means "buzz-agent OR ANYTHING ADDED LATER".
+// A third runtime added under that spelling inherits buzz-agent's model
+// variable, its stdio MCP server, and its inference config, none of which an
+// ACP adapter can use, and loses the pinned permission mode. That ships
+// green — the .deb installs, the ACP handshake passes, the inference probe
+// passes — and fails at session time, which is the exact silent-agent class
+// nest.go:264-272 and :247-254 record being live-bitten by twice.
+//
+// Naming is deliberately positive ("does this runtime want buzz-agent's
+// wiring?") rather than negative, so the zero value withholds wiring rather
+// than granting it: a runtime someone forgets to classify gets nothing it
+// cannot use. The omission is still a bug, and TestEnvShapes_CoverEveryRuntime
+// fails on it — but it fails safe in the meantime.
+type EnvShape struct {
+	// BuzzAgentWiring emits buzz-agent's own tool and inference
+	// configuration: BUZZ_ACP_MODEL, BUZZ_ACP_MCP_COMMAND,
+	// MCP_HOOK_SERVERS, BUZZ_AGENT_PROVIDER, DATABRICKS_MODEL.
+	BuzzAgentWiring bool
+
+	// PinACPPermissionMode emits BUZZ_ACP_PERMISSION_MODE for runtimes
+	// driven through an ACP adapter. It pins parity with buzz-acp's own
+	// default and is NOT a security control — buzz-acp auto-approves every
+	// session/request_permission regardless of it.
+	PinACPPermissionMode bool
+}
+
+// envShapes must have an entry for every Runtime in spawnCommands;
+// TestEnvShapes_CoverEveryRuntime enforces it.
+var envShapes = map[Runtime]EnvShape{
+	RuntimeBuzzAgent: {BuzzAgentWiring: true},
+	RuntimeClaude:    {PinACPPermissionMode: true},
+	RuntimeCodex:     {PinACPPermissionMode: true},
+}
+
+// EnvShape returns the env-rendering capabilities of r.
+func (r Runtime) EnvShape() EnvShape { return envShapes[r] }
+
 // RuntimeFor resolves an agent_command to its Runtime. Matching is
 // exact-case, mirroring the deliberate no-normalization stance of
 // validInferenceAuthValues: a typo must fail loudly rather than quietly

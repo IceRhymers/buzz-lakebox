@@ -198,6 +198,12 @@ func RenderEnv(agent payload.Agent, rt payload.Runtime, sandboxInferenceAuth boo
 	// This is safe ONLY because agent.EnvVars keys are validated upstream
 	// by payload.Agent.Validate() (^[A-Za-z_][A-Za-z0-9_]*$) before
 	// RenderEnv ever sees them; do not call RenderEnv on unvalidated input.
+	// shape decides which blocks below this runtime needs. Reading it once
+	// here, rather than testing the runtime at each site, is what keeps a
+	// future runtime from silently inheriting buzz-agent's wiring — see
+	// payload.EnvShape.
+	shape := rt.EnvShape()
+
 	emit := func(key, value string) {
 		b.WriteString("export ")
 		b.WriteString(key)
@@ -232,7 +238,13 @@ func RenderEnv(agent payload.Agent, rt payload.Runtime, sandboxInferenceAuth boo
 	// via ANTHROPIC_MODEL made the SDK rewrite it to a canonical Anthropic
 	// id the gateway does not serve, hard-failing every turn. The
 	// adapter's own default works, so emit nothing and let it choose.
-	if rt != payload.RuntimeClaude {
+	//
+	// The same holds for codex and for a different reason worth stating: its
+	// model lives in the generated config.toml (nest.CodexEnvSnippet), so a
+	// BUZZ_ACP_MODEL here would make buzz-acp attempt a per-session switch
+	// to a gateway id absent from codex's catalog — the unsupported_model
+	// frame described above, on every session.
+	if shape.BuzzAgentWiring {
 		emit("BUZZ_ACP_MODEL", derefOrEmpty(agent.Model))
 	}
 	emit("BUZZ_ACP_RESPOND_TO", agent.RespondTo)
@@ -281,9 +293,15 @@ func RenderEnv(agent payload.Agent, rt payload.Runtime, sandboxInferenceAuth boo
 	// MCP_HOOK_SERVERS is buzz-agent's own variable (read by the agent,
 	// not by buzz-acp) and is meaningless to the adapter.
 	//
+	// Codex is excluded for the same reason as Claude — it ships its own
+	// tools, so the buzz-agent silent-agent failure does not apply — and
+	// independently could not use this anyway: codex advertises
+	// mcpCapabilities {acp:false, http:true, sse:false}, i.e. no stdio MCP
+	// at all, and buzz-dev-mcp is stdio (docs/M3_CODEX_PROBE_RESULTS.md S4).
+	//
 	// Escape hatch: env_vars render after this block, so an owner who
 	// wants buzz tooling can still set BUZZ_ACP_MCP_COMMAND=buzz-dev-mcp.
-	if rt != payload.RuntimeClaude {
+	if shape.BuzzAgentWiring {
 		emit("BUZZ_ACP_MCP_COMMAND", "buzz-dev-mcp")
 		emit("MCP_HOOK_SERVERS", "*")
 	}
@@ -303,13 +321,15 @@ func RenderEnv(agent payload.Agent, rt payload.Runtime, sandboxInferenceAuth boo
 	// DATABRICKS_HOST/DATABRICKS_TOKEN arrive via env_vars below and
 	// override nothing here since those keys aren't set above.
 	//
-	// Both are buzz-agent's own configuration and mean nothing to the
-	// Claude adapter, which takes its endpoint from ANTHROPIC_BASE_URL
-	// (see ClaudeEnvSnippet, appended after everything below).
-	if rt != payload.RuntimeClaude {
+	// Both are buzz-agent's own configuration and mean nothing to an ACP
+	// adapter, which takes its endpoint from elsewhere: Claude from
+	// ANTHROPIC_BASE_URL (ClaudeEnvSnippet), codex from the config.toml
+	// under CODEX_HOME (CodexEnvSnippet) — both appended after everything
+	// below.
+	if shape.BuzzAgentWiring {
 		emit("BUZZ_AGENT_PROVIDER", derefOrDefault(agent.Provider, DefaultBuzzAgentProvider))
 		emit("DATABRICKS_MODEL", derefOrEmpty(agent.Model))
-	} else {
+	} else if shape.PinACPPermissionMode {
 		// Pinned for parity with buzz-acp's own default, following the
 		// same "pin defaults so an upstream change can't silently
 		// diverge sandbox agents from desktop ones" doctrine used above.
@@ -340,9 +360,13 @@ func RenderEnv(agent payload.Agent, rt payload.Runtime, sandboxInferenceAuth boo
 	// DATABRICKS_HOST/DATABRICKS_TOKEN can come from, and this snippet
 	// derives from whichever won. Ordering is the whole reason one
 	// identical text serves both inference_auth modes.
-	if rt == payload.RuntimeClaude {
+	switch rt {
+	case payload.RuntimeClaude:
 		b.WriteString("\n")
 		b.WriteString(ClaudeEnvSnippet)
+	case payload.RuntimeCodex:
+		b.WriteString("\n")
+		b.WriteString(CodexEnvSnippet)
 	}
 
 	return b.String()
