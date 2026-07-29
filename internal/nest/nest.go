@@ -108,10 +108,29 @@ const AliveCheckSnippet = `buzz_acp_alive() {
 // content, the latter under `set -a` — so this text has to survive both
 // sourcing contexts unconditionally. That drives every rule below:
 //
-//   - It is a no-op unless DATABRICKS_TOKEN is unset/empty AND
-//     ~/.databrickscfg is readable, so env_vars-supplied credentials (or
-//     a value some other mechanism already exported) always win —
-//     derivation is a fallback, never an override.
+//   - It is a no-op unless BOTH DATABRICKS_TOKEN and DATABRICKS_HOST are
+//     unset/empty AND ~/.databrickscfg is readable, so env_vars-supplied
+//     credentials (or a value some other mechanism already exported)
+//     always win — derivation is a fallback, never an override.
+//
+//     Requiring BOTH is a security property rather than tidiness. An
+//     earlier version gated only on the TOKEN, which let a
+//     payload supply DATABRICKS_HOST alone and inherit the sandbox's
+//     baked creator-identity token — pairing an endpoint the payload
+//     chose with a workspace-owner credential the payload never had to
+//     carry. Both runtime snippets then faithfully wired that pair up,
+//     and the deploy-time inference probe sent the token there itself
+//     before the agent ever ran. Derivation is therefore ALL-OR-NOTHING:
+//     supply neither and the sandbox's own credential is used, or supply
+//     both and this block stands aside entirely. Supplying exactly one
+//     now derives nothing, which surfaces as an "unset" inference-probe
+//     failure — loud, and before the agent launches.
+//
+//     payload.DeployRequest.Validate rejects that combination outright,
+//     so this is the second of two independent defenses; it is the one
+//     that still holds if a future caller reaches RenderEnv without
+//     going through payload validation.
+//
 //   - [DEFAULT]-section-scoped extraction only: a small awk state machine
 //     tracks whether the current line is inside "[DEFAULT]" and resets on
 //     any other "[section]" line, so profiles before/after DEFAULT (or a
@@ -120,10 +139,12 @@ const AliveCheckSnippet = `buzz_acp_alive() {
 //     tabs/spaces around "="); the value is taken verbatim (docs/M05
 //     precedent: host used as-is) with no scheme normalization or
 //     trimming beyond the delimiter's own surrounding whitespace.
+//
 //   - R3(a): every command substitution below ends `2>/dev/null || true`,
 //     AND the awk program itself always `exit 0`s from its END block —
 //     belt and suspenders — so a parse failure can never hand a non-zero
 //     status to the sourcing `set -eu` shell.
+//
 //   - R3(b): control flow is if/fi only; there is no top-level `&&` chain
 //     standing in for it (the `&&` inside the outer `if [ ... ] && [ ... ];
 //     then` is the condition of that if, which `set -e` always exempts,
@@ -131,6 +152,7 @@ const AliveCheckSnippet = `buzz_acp_alive() {
 //     whatever the last `if` decided, the `.` builtin's reported status
 //     (the status of the last command run) is always 0 — sourcing can
 //     never die here even when this is the last content in the file.
+//
 //   - R3(c): every scratch variable is `buzz_`-prefixed and explicitly
 //     `unset` before the final `:`. install.BuildVerifyCommand sources
 //     this content under `set -a`, which auto-exports every variable
@@ -138,10 +160,11 @@ const AliveCheckSnippet = `buzz_acp_alive() {
 //     buzz_token would leak into buzz-agent's own handshake environment.
 const SandboxAuthSnippet = `# Zero-token inference auth (provider_config.inference_auth="sandbox"):
 # derive DATABRICKS_HOST/DATABRICKS_TOKEN from the sandbox's baked
-# creator-identity ~/.databrickscfg, only if not already set above by
-# env_vars. This block is a fallback, never an override: env_vars are
-# rendered first and this only fires when DATABRICKS_TOKEN is still unset.
-if [ -z "${DATABRICKS_TOKEN:-}" ] && [ -r "$HOME/.databrickscfg" ]; then
+# creator-identity ~/.databrickscfg, only if NEITHER is already set above
+# by env_vars. This block is a fallback, never an override, and it is
+# ALL-OR-NOTHING: deriving only one of the pair would let a payload supply
+# the endpoint and inherit the sandbox's owner-level token.
+if [ -z "${DATABRICKS_TOKEN:-}" ] && [ -z "${DATABRICKS_HOST:-}" ] && [ -r "$HOME/.databrickscfg" ]; then
   buzz_awk_extract='
     BEGIN { insec = 0; found = 0 }
     /^\[/ {

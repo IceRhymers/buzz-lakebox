@@ -452,7 +452,7 @@ func (d *Deployer) provision(ctx context.Context, profile, sandboxID string, fre
 	// skip does).
 	switch {
 	case sandboxAuth:
-		if err := d.authProbe(ctx, profile, sandboxID, agent.EnvVars); err != nil {
+		if err := d.authProbe(ctx, profile, sandboxID); err != nil {
 			return err
 		}
 	case !req.ProviderConfig.KeepWorkspacePAT:
@@ -567,7 +567,7 @@ const authProbeCauseMarkerPrefix = "BUZZ_PROBE_CAUSE="
 // ctx bounded by deployTimeoutOrDefault() (Critic note 5) — identical to
 // every neighboring in-sandbox step in this flow; there is no separate,
 // tighter timeout to add here.
-func (d *Deployer) authProbe(ctx context.Context, profile, sandboxID string, envVars map[string]string) error {
+func (d *Deployer) authProbe(ctx context.Context, profile, sandboxID string) error {
 	out, err := d.SSH.RunWithStdin(ctx, profile, sandboxID,
 		step("auth-probe", authProbeScript()),
 		strings.NewReader(nest.SandboxAuthSnippet),
@@ -576,7 +576,7 @@ func (d *Deployer) authProbe(ctx context.Context, profile, sandboxID string, env
 		return nil
 	}
 	cause := authProbeCause(out)
-	msg := authProbeCauseMessage(cause, envVars)
+	msg := authProbeCauseMessage(cause)
 	return &preMutationFailure{err: failf(CodeSandboxAuth,
 		"zero-token auth probe failed: %s (probe output: %s)",
 		msg, remoteText(strings.TrimSpace(out)),
@@ -652,17 +652,21 @@ func probeCause(out, prefix string) string {
 
 // authProbeCauseMessage renders a human diagnosis for one of the probe's
 // three disambiguated causes (docs/PLAN.md zero-token design; Critic
-// notes 2 + 3). envVars is the agent's own env_vars map, checked for
-// cause "stub" so the diagnosis can note that explicit env_vars
-// credentials would have taken precedence over derivation anyway.
-func authProbeCauseMessage(cause string, envVars map[string]string) string {
+// note 2).
+//
+// It used to take the agent's env_vars and, for cause "stub", add a note
+// that explicit env_vars credentials would take precedence over derivation
+// anyway. That branch is gone because the combination it described can no
+// longer reach this code: payload.validateOwnerPATEnvVars now rejects
+// env_vars.DATABRICKS_HOST/DATABRICKS_TOKEN outright under
+// inference_auth="sandbox", since supplying one of the pair let a payload
+// couple its own endpoint to the sandbox's owner-level token. A diagnosis
+// for an unreachable state is worse than none — it would tell an operator
+// that a rejected configuration was merely redundant.
+func authProbeCauseMessage(cause string) string {
 	switch cause {
 	case "stub":
-		msg := "sandbox was previously deployed in env mode; its baked PAT is unrestorable — delete the sandbox and redeploy fresh in sandbox mode"
-		if envVars["DATABRICKS_HOST"] != "" || envVars["DATABRICKS_TOKEN"] != "" {
-			msg += "; note: your env_vars-supplied credentials would take precedence anyway"
-		}
-		return msg
+		return "sandbox was previously deployed in env mode; its baked PAT is unrestorable — delete the sandbox and redeploy fresh in sandbox mode"
 	case "parse":
 		return "~/.databrickscfg missing or unparseable by the derivation snippet"
 	case "credential":

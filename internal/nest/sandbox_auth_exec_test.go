@@ -286,3 +286,107 @@ func TestSandboxAuthSnippet_NoScratchVarLeakUnderSetA(t *testing.T) {
 		}
 	}
 }
+
+// sourceSnippetWithPresetHost sources SandboxAuthSnippet with an arbitrary
+// set of variables pre-exported — the ordering RenderEnv produces, since
+// agent env_vars are emitted BEFORE this snippet. The shared helper above
+// can only preset the token, and the case that matters here is the host.
+func sourceSnippetWithPresetHost(t *testing.T, cfg string, preset map[string]string) sourceResult {
+	t.Helper()
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, ".databrickscfg"), []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write fixture cfg: %v", err)
+	}
+	snippetPath := filepath.Join(home, "auth.sh")
+	if err := os.WriteFile(snippetPath, []byte(SandboxAuthSnippet), 0o600); err != nil {
+		t.Fatalf("write snippet: %v", err)
+	}
+
+	var script strings.Builder
+	script.WriteString("set -eu\n")
+	for k, v := range preset {
+		script.WriteString("export " + k + "=" + shellquote.Single(v) + "\n")
+	}
+	script.WriteString(". " + shellquote.Single(snippetPath) + "\n")
+	script.WriteString(`echo "BUZZ_TEST_HOST=${DATABRICKS_HOST:-}"` + "\n")
+	script.WriteString(`echo "BUZZ_TEST_TOKEN=${DATABRICKS_TOKEN:-}"` + "\n")
+
+	cmd := exec.Command("sh", "-c", script.String())
+	cmd.Env = []string{"HOME=" + home, "PATH=" + os.Getenv("PATH")}
+	out, err := cmd.Output()
+
+	res := sourceResult{}
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			res.exitCode = ee.ExitCode()
+		} else {
+			t.Fatalf("run shell: %v", err)
+		}
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if v, ok := strings.CutPrefix(line, "BUZZ_TEST_HOST="); ok {
+			res.host = v
+		}
+		if v, ok := strings.CutPrefix(line, "BUZZ_TEST_TOKEN="); ok {
+			res.token = v
+		}
+	}
+	return res
+}
+
+// TestSandboxAuthSnippet_DerivationIsAllOrNothing is the regression test for
+// a real credential-egress defect, and the asymmetry it pins is subtle
+// enough to be worth spelling out.
+//
+// The snippet used to gate derivation on DATABRICKS_TOKEN alone while
+// overwriting the token unconditionally. A payload that supplied only
+// DATABRICKS_HOST therefore kept its own endpoint AND received the
+// sandbox's baked creator-identity token — pairing an endpoint the payload
+// chose with a workspace-owner credential it never had to carry. The
+// runtime snippets wired that pair up faithfully, and the deploy-time
+// inference probe shipped the token to that endpoint itself, before the
+// agent ever launched, with the deploy reporting healthy.
+//
+// Deriving one half of a credential pair is never correct: either the
+// sandbox supplies both, or it supplies neither.
+func TestSandboxAuthSnippet_DerivationIsAllOrNothing(t *testing.T) {
+	const cfg = "[DEFAULT]\nhost = https://real.databricks.com\ntoken = dapi-OWNER-PAT\n"
+
+	t.Run("host alone derives NO token", func(t *testing.T) {
+		res := sourceSnippetWithPresetHost(t, cfg, map[string]string{
+			"DATABRICKS_HOST": "https://attacker.example",
+		})
+		if res.token != "" {
+			t.Errorf("payload-supplied host must not inherit the sandbox's owner token, got %q paired with host %q", res.token, res.host)
+		}
+		if res.host != "https://attacker.example" {
+			t.Errorf("an owner-supplied host must be left untouched, got %q", res.host)
+		}
+	})
+
+	t.Run("token alone derives no host", func(t *testing.T) {
+		res := sourceSnippetWithPresetHost(t, cfg, map[string]string{
+			"DATABRICKS_TOKEN": "dapi-owner-own",
+		})
+		if res.host != "" {
+			t.Errorf("supplying only a token must not derive a host, got %q", res.host)
+		}
+	})
+
+	t.Run("neither supplied derives both", func(t *testing.T) {
+		res := sourceSnippetWithPresetHost(t, cfg, nil)
+		if res.host != "https://real.databricks.com" || res.token != "dapi-OWNER-PAT" {
+			t.Errorf("with nothing supplied the sandbox must supply both, got host=%q token=%q", res.host, res.token)
+		}
+	})
+
+	t.Run("both supplied are both left alone", func(t *testing.T) {
+		res := sourceSnippetWithPresetHost(t, cfg, map[string]string{
+			"DATABRICKS_HOST":  "https://mine.example",
+			"DATABRICKS_TOKEN": "dapi-my-own",
+		})
+		if res.host != "https://mine.example" || res.token != "dapi-my-own" {
+			t.Errorf("owner-supplied credentials must both win, got host=%q token=%q", res.host, res.token)
+		}
+	})
+}

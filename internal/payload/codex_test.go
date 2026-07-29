@@ -121,7 +121,11 @@ func TestValidate_CodexSandboxModeOtherwiseAccepted(t *testing.T) {
 	if err := codexReq(nil, "sandbox").Validate(); err != nil {
 		t.Fatalf("a plain sandbox-mode codex deploy must be accepted: %v", err)
 	}
-	if err := codexReq(map[string]string{"HTTP_PROXY": "http://p"}, "sandbox").Validate(); err != nil {
+	// A genuinely unrelated variable. HTTP_PROXY was used here originally
+	// and is no longer a valid example: validateOwnerPATEnvVars now refuses
+	// it under this mode, because a proxy the inference client honours sees
+	// requests carrying the owner token.
+	if err := codexReq(map[string]string{"MY_APP_SETTING": "1"}, "sandbox").Validate(); err != nil {
 		t.Fatalf("unrelated env_vars must not trip the codex guard: %v", err)
 	}
 }

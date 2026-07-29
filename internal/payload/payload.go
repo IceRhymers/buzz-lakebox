@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
+	"strings"
 )
 
 // envVarKeyPattern is a valid POSIX shell/environment variable name. Keys
@@ -95,6 +97,23 @@ func (c ProviderConfig) SandboxInferenceAuth() bool {
 	return c.InferenceAuth == "sandbox"
 }
 
+// OwnerPATInSandbox reports whether the deploy leaves a workspace-owner
+// credential reachable inside the sandbox — the actual condition the
+// env_vars restrictions below care about.
+//
+// Two distinct settings produce it, and gating on only the first is a hole:
+// inference_auth="sandbox" derives the baked creator-identity PAT into the
+// agent's environment, and keep_workspace_pat=true skips the PAT stub so
+// the baked credential simply stays in ~/.databrickscfg — where the image's
+// own ~/.codex/config.toml symlink has an auth.command that reads it back
+// out (docs/M3_CODEX_PROBE_RESULTS.md S2). keep_workspace_pat is a
+// documented total grant, so this is defense in depth there rather than a
+// new guarantee; the point is that the check should key on the condition
+// rather than on one of its two causes.
+func (c ProviderConfig) OwnerPATInSandbox() bool {
+	return c.SandboxInferenceAuth() || c.KeepWorkspacePAT
+}
+
 // ParseDeployRequest unmarshals a raw deploy request body (the "agent" and
 // "provider_config" sub-objects of the envelope already routed by
 // internal/provider). Unknown fields anywhere are tolerated by default
@@ -160,11 +179,121 @@ func (r DeployRequest) Validate() error {
 			r.ProviderConfig.InferenceAuth,
 		)
 	}
+	if err := r.validateOwnerPATEnvVars(); err != nil {
+		return err
+	}
 	if err := r.validateClaudeInferenceSource(); err != nil {
 		return err
 	}
 	if err := r.validateCodexInferenceSource(); err != nil {
 		return err
+	}
+	return nil
+}
+
+// ownerPATForbiddenEnvKeys are exact env_vars names refused whenever a
+// workspace-owner credential is reachable in the sandbox
+// (ProviderConfig.OwnerPATInSandbox). Each either decides WHERE that
+// credential is sent or WHAT code receives it.
+var ownerPATForbiddenEnvKeys = []string{
+	// The endpoint half of the credential pair. SandboxAuthSnippet now
+	// derives host and token all-or-nothing, so supplying a host alone can
+	// no longer inherit the sandbox token — this makes the same case fail
+	// loudly here, before provisioning, with an error that names the real
+	// problem instead of surfacing later as an "unset" probe failure.
+	"DATABRICKS_HOST", "DATABRICKS_TOKEN",
+	// Interception: a proxy the agent's inference client honours sees
+	// (or, with a supplied CA, terminates) requests carrying the token.
+	"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+	"http_proxy", "https_proxy", "all_proxy", "no_proxy",
+	// Trust-store substitution, which is what turns a proxy into a
+	// cleartext read of the bearer.
+	"SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+	"NODE_EXTRA_CA_CERTS",
+	// Command resolution for anything the agent shells out to.
+	"PATH", "SHELL", "BASH_ENV", "ENV", "IFS",
+}
+
+// ownerPATForbiddenEnvPrefixes are env_vars name PREFIXES refused under the
+// same condition. These are loader-class variables: they choose code that
+// runs inside a process holding the credential, before that process's own
+// code does.
+//
+// A prefix rule rather than a name list is deliberate. NODE_OPTIONS with an
+// `--import=data:text/javascript,...` URL executes arbitrary attacker code
+// in the adapter with DATABRICKS_TOKEN in process.env and no file on disk;
+// LD_PRELOAD does the same for the spawned native binary. Neither is an
+// adapter setting, so no adapter-derived list would ever have caught them,
+// and enumerating the loader surface exactly is not a winnable game.
+var ownerPATForbiddenEnvPrefixes = []string{
+	"LD_",         // dynamic-linker injection into any native child
+	"DYLD_",       // the macOS equivalent, for completeness
+	"NODE_",       // NODE_OPTIONS and friends, for the npm ACP adapters
+	"npm_config_", // registry/CA/prefix redirection
+	"PYTHON",      // PYTHONPATH / PYTHONSTARTUP for python children
+	"GIT_",        // git-credential-nostr and any repo tooling
+}
+
+// validateOwnerPATEnvVars refuses payload-supplied environment that could
+// redirect, intercept, or read a workspace-owner credential the payload
+// never had to carry.
+//
+// The asymmetry is the whole rule, and it is not a loophole. Under
+// inference_auth="env" the token in the agent's environment is the OWNER'S
+// OWN, supplied by them in this same payload: pointing it at another
+// endpoint, through a proxy, or at instrumented code is their business, and
+// this returns nil. Under inference_auth="sandbox" (or keep_workspace_pat)
+// the credential is the sandbox's baked creator-identity PAT, which this
+// provider materializes on the owner's behalf — so forwarding it somewhere
+// of their choosing would be a privilege escalation performed BY the
+// provider, and the deploy would report healthy while doing it.
+//
+// This applies to every runtime, not just the ACP adapters: buzz-agent
+// reads DATABRICKS_HOST/DATABRICKS_TOKEN directly, so the endpoint half of
+// the pair has always been reachable there too.
+//
+// Scope, stated honestly: this closes silent forwarding by the provider. It
+// does not, and cannot, stop a determined agent OWNER from obtaining the
+// credential — they can simply ask the agent to print it, and the answer
+// returns over the relay as ordinary transcript text. See docs/PLAN.md §5.
+func (r DeployRequest) validateOwnerPATEnvVars() error {
+	if !r.ProviderConfig.OwnerPATInSandbox() {
+		return nil
+	}
+	// Sorted so the reported key is deterministic when a payload sets
+	// several; map iteration order would otherwise vary between runs.
+	keys := make([]string, 0, len(r.Agent.EnvVars))
+	for k := range r.Agent.EnvVars {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		var why string
+		for _, forbidden := range ownerPATForbiddenEnvKeys {
+			if key == forbidden {
+				why = "it decides where that credential is sent or what receives it"
+				break
+			}
+		}
+		if why == "" {
+			for _, prefix := range ownerPATForbiddenEnvPrefixes {
+				if strings.HasPrefix(key, prefix) {
+					why = "variables starting with " + prefix + " choose code that runs inside the process holding that credential"
+					break
+				}
+			}
+		}
+		if why == "" {
+			continue
+		}
+		return fmt.Errorf(
+			"env_vars.%s must not be set when the sandbox holds a workspace-owner credential "+
+				"(provider_config.inference_auth=\"sandbox\" or keep_workspace_pat=true): %s, "+
+				"and that credential is the sandbox's baked owner token which this payload never supplied. "+
+				"Use inference_auth=\"env\" with your own DATABRICKS_HOST/DATABRICKS_TOKEN if you need to control this",
+			key, why,
+		)
 	}
 	return nil
 }
