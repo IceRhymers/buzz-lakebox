@@ -243,6 +243,25 @@ databricks sandbox ssh <id> -p <profile> -- 'ls -l $HOME/.buzz-backend/bin/claud
 
 **Model selection is not configurable on this runtime.** `agent.model` is ignored. A Databricks gateway model id (`databricks-claude-*`) gets rewritten by the Anthropic SDK into a canonical id the gateway does not serve, which fails every turn — so the provider emits no model variable and the adapter uses its own default.
 
+**Codex: the "model metadata not found" warning is expected, and is not a bug.** The first agent message of **every** codex session reads:
+
+```
+Warning: Model metadata for `databricks-gpt-5-3-codex` not found.
+Defaulting to fallback metadata; this can degrade performance and cause issues.
+```
+
+It arrives as transcript text, not stderr, so it is visible in the desktop. It is structurally unavoidable and was not introduced by this provider: the AI Gateway accepts **only** `databricks-`-prefixed model ids, while codex's own metadata table contains **only** unprefixed ids — the two sets are disjoint by construction. Setting `model_context_window`/`model_max_output_tokens` explicitly does not suppress it (retested). Sessions complete normally (`stopReason: end_turn`). Do not file it; do not "fix" it by changing the model id, which will instead produce a 404 from the gateway.
+
+**Codex: never set `CODEX_PATH`, `CODEX_HOME`, `CODEX_CONFIG`, `MODEL_PROVIDER`, or `DEFAULT_AUTH_REQUEST` in `env_vars`.** Under `inference_auth: "sandbox"` the provider rejects all five at the payload boundary, because each can redirect where codex sends the sandbox's baked workspace-owner credential. Under `inference_auth: "env"` they are permitted — the token is then your own — but `CODEX_PATH` in particular will break the runtime outright: the adapter spawns it as `<path> app-server`, and the image's `/usr/local/bin/codex` is a Databricks `ucode` wrapper that accepts no arguments. Leave it unset and the adapter resolves its own bundled binary directly, with no `PATH` lookup at all.
+
+**Codex: inspecting the generated config.** The runtime's endpoint lives in a file the provider regenerates on every launch, not in an environment variable:
+
+```
+databricks sandbox ssh <id> -p <profile> -- 'cat "$HOME/.buzz-backend/codex/config.toml"'
+```
+
+An **absent** file is meaningful, not broken: it means the provider could not derive a host and deliberately declined to write one (see `install.codex_inference` cause "unset" in §7). Do not hand-write one to work around that — it will be removed on the next launch, and the reason it is missing is that something upstream of it is misconfigured.
+
 **Resource and disk notes.** Each adapter process is ~115 MB RSS at idle, so `parallelism: N` costs roughly `N × 115 MB` on the sandbox's 8 GiB before session working set. Claude Code also writes conversation transcripts under `~/.claude/`. If a long-lived `--no-autostop` sandbox runs low on space:
 
 ```sh

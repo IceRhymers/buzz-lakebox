@@ -116,6 +116,18 @@ reference implementation for the PR.
 **Size:** large (protocol + desktop + UI). Best proposed as a design
 issue first, with gaps 1–2 as its independently-landable slices.
 
+## 6. Codex tool-path network access is described in macOS Seatbelt terms, on a Linux sandbox
+
+**Status: unverified, low confidence, non-blocking.** Raised so it is not rediscovered as a mystery.
+
+`crates/buzz-acp/src/config.rs` (`codex_network_env`, ~:697-749) injects `CODEX_CONFIG={"sandbox_workspace_write":{"network_access":true}}` for codex agents, so the buzz-cli MCP subprocess can reach the relay. Its doc comment describes this as opening "the Seatbelt network sandbox" — Seatbelt is macOS. A Lakebox sandbox is Linux, where codex's `workspaceWrite` policy is enforced by a different mechanism.
+
+Why it matters here: the codex adapter's default `AgentMode` sets `networkAccess: false` (`@agentclientprotocol/codex-acp@1.1.7`, `src/AgentMode.ts` — see `docs/M3_CODEX_PROBE_RESULTS.md` S10), and this provider's own probe observed codex's shell tool unable to resolve DNS while an ordinary shell in the same sandbox had open egress. That probe drove the adapter **directly, with no relay**, so buzz-acp never injected `CODEX_CONFIG` and the observation says nothing about a real deploy — but it does mean the injection is the only thing standing between a deployed codex agent and a tool path with no network.
+
+Two secondary notes on the same function: it returns `None` (injecting nothing, silently) when the relay URL cannot be parsed, and this provider validates `agent.relay_url` only as non-empty; and its equivalence claim to the TOML key `sandbox_workspace_write.network_access` is itself unverified from our side, since a neighbouring key in that same namespace (`sandbox_mode`) was measured to be ignored entirely.
+
+**Ask:** confirm whether `network_access: true` opens the Linux sandbox path as it does the macOS one, or document that it does not. **Provider-side action:** none available — this is upstream's mechanism. Confirm at live acceptance.
+
 ## Non-gaps we already absorbed provider-side (no upstream ask)
 
 For contrast, these session findings were fixable entirely in this repo
