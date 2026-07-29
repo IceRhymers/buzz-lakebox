@@ -148,7 +148,7 @@ var remedies = map[Code]string{
 	CodeInstallScript: "pass a known `provider_config.buzz_version` (the error lists the pinned versions this build ships sha256s for)",
 	CodeInstallWrite:  "check sandbox SSH reachability with `databricks sandbox ssh <id> -- true`",
 	CodeInstallExec:   "read the install output above: a sha256 mismatch means the pinned release changed; a fetch failure means the sandbox lost egress to GitHub",
-	CodeAdapterScript: "pass a known `provider_config.claude_adapter_version` (the error lists the adapter versions this build ships a pinned package-lock.json for)",
+	CodeAdapterScript: "pass a known `provider_config.claude_adapter_version` / `codex_adapter_version` — the error names which adapter it hit and lists the versions this build ships a pinned package-lock.json for",
 	CodeAdapterWrite:  "check sandbox SSH reachability with `databricks sandbox ssh <id> -- true`",
 	CodeAdapterExec:   "read the npm output above: an integrity mismatch means the registry served different bytes than the pinned lockfile — do NOT retry, report it; anything else is usually lost sandbox egress to registry.npmjs.org, which is safe to retry",
 	CodeRuntimeVerify: "the installed agent runtime could not complete an ACP initialize handshake — check `logs` and the inference env for that runtime (buzz-agent: BUZZ_AGENT_PROVIDER / DATABRICKS_HOST / DATABRICKS_TOKEN; claude: ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN / DATABRICKS_HOST)",

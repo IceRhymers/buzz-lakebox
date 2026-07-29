@@ -172,14 +172,16 @@ type VerifySpec struct {
 // rejects — an unroutable runtime must fail loudly rather than silently
 // verify the wrong binary.
 func VerifySpecFor(spawnCommand string) VerifySpec {
-	switch spawnCommand {
-	case "buzz-agent":
+	// buzz-agent ships in the .deb rather than as an npm adapter, so it has
+	// no adapterSpecs row; every other runtime is verified via the binary
+	// its adapter symlinks into BinDir under the same name.
+	if spawnCommand == "buzz-agent" {
 		return VerifySpec{Bin: BinDir + "/buzz-agent"}
-	case AdapterBinName:
-		return VerifySpec{Bin: BinDir + "/" + AdapterBinName}
-	default:
-		return VerifySpec{}
 	}
+	if spec, ok := AdapterSpecFor(spawnCommand); ok {
+		return VerifySpec{Bin: BinDir + "/" + spec.BinName}
+	}
+	return VerifySpec{}
 }
 
 // BuildVerifyCommand renders the COMBINED verify script run as a single

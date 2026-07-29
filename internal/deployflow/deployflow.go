@@ -733,8 +733,8 @@ func (d *Deployer) installAndVerify(ctx context.Context, profile, sandboxID stri
 		return failf(CodeInstallExec, "install: %w", err)
 	}
 
-	if rt == payload.RuntimeClaude {
-		if err := d.installClaudeAdapter(ctx, profile, sandboxID, cfg.ClaudeAdapterVersion); err != nil {
+	if spec, ok := install.AdapterSpecFor(rt.SpawnCommand()); ok {
+		if err := d.installACPAdapter(ctx, profile, sandboxID, spec, adapterVersionFor(rt, cfg)); err != nil {
 			return err
 		}
 	}
@@ -767,23 +767,42 @@ func (d *Deployer) installAndVerify(ctx context.Context, profile, sandboxID stri
 	return nil
 }
 
-// installClaudeAdapter installs the npm ACP adapter the Claude runtime
-// spawns, as its own write+exec pair so a failure is attributable to the
-// adapter rather than to the .deb.
-func (d *Deployer) installClaudeAdapter(ctx context.Context, profile, sandboxID, adapterVersion string) error {
-	script, err := install.BuildAdapterInstallScript(adapterVersion)
+// adapterVersionFor picks the per-runtime adapter version override from
+// provider_config. A runtime with no override field yields "", which
+// BuildAdapterInstallScript reads as "use the spec's pinned default".
+func adapterVersionFor(rt payload.Runtime, cfg payload.ProviderConfig) string {
+	switch rt {
+	case payload.RuntimeClaude:
+		return cfg.ClaudeAdapterVersion
+	case payload.RuntimeCodex:
+		return cfg.CodexAdapterVersion
+	default:
+		return ""
+	}
+}
+
+// installACPAdapter installs the npm ACP adapter a runtime spawns, as its
+// own write+exec pair so a failure is attributable to the adapter rather
+// than to the .deb.
+//
+// The script path is shared across runtimes even though each adapter has
+// its own npm tree: it is written immediately before it is executed and
+// never read again, so it carries no runtime-specific state worth
+// partitioning.
+func (d *Deployer) installACPAdapter(ctx context.Context, profile, sandboxID string, spec install.AdapterSpec, adapterVersion string) error {
+	script, err := install.BuildAdapterInstallScript(spec.BinName, adapterVersion)
 	if err != nil {
-		return failf(CodeAdapterScript, "claude adapter install: %w", err)
+		return failf(CodeAdapterScript, "%s adapter install: %w", spec.Label, err)
 	}
 	const adapterScriptPath = "$HOME/.buzz-backend/install-adapter.sh"
 	if _, err := d.SSH.RunWithStdin(ctx, profile, sandboxID,
 		step("adapter-write", fmt.Sprintf(`set -eu; umask 077; mkdir -p "$HOME/.buzz-backend"; cat > %s`, dquote(adapterScriptPath))),
 		strings.NewReader(script),
 	); err != nil {
-		return failf(CodeAdapterWrite, "claude adapter install: write install script: %w", err)
+		return failf(CodeAdapterWrite, "%s adapter install: write install script: %w", spec.Label, err)
 	}
 	if _, err := d.SSH.Run(ctx, profile, sandboxID, step("adapter-exec", fmt.Sprintf(`sh %s`, dquote(adapterScriptPath)))); err != nil {
-		return failf(CodeAdapterExec, "claude adapter install: %w", err)
+		return failf(CodeAdapterExec, "%s adapter install: %w", spec.Label, err)
 	}
 	return nil
 }

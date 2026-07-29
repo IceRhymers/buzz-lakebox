@@ -69,13 +69,23 @@ type ProviderConfig struct {
 	InferenceAuth string `json:"inference_auth"`
 
 	// ClaudeAdapterVersion pins the @agentclientprotocol/claude-agent-acp
-	// version installed for the Claude runtime; empty means
-	// install.DefaultAdapterVersion. Expert-only: deliberately NOT
+	// version installed for the Claude runtime; empty means that adapter's
+	// AdapterSpec.DefaultVersion. Expert-only: deliberately NOT
 	// advertised in the provider's config_schema (same posture as
 	// BuzzVersion and KeepWorkspacePAT), so Buzz Desktop's create-agent
 	// dialog stays unchanged. Every segment of the key name avoids the
 	// desktop's secret-word filter (token/key/secret/password/credential).
 	ClaudeAdapterVersion string `json:"claude_adapter_version"`
+
+	// CodexAdapterVersion is the codex twin of ClaudeAdapterVersion, with
+	// the same expert-only posture and the same secret-word-safe naming.
+	//
+	// Bumping it is a deliberate act with a consequence beyond the version
+	// number: the codex adapter — not this provider's config.toml — is
+	// what governs the agent's sandbox and approval policy
+	// (docs/M3_CODEX_PROBE_RESULTS.md S7/S10), so a new version must be
+	// re-verified against that finding rather than assumed equivalent.
+	CodexAdapterVersion string `json:"codex_adapter_version"`
 }
 
 // SandboxInferenceAuth reports whether provider_config opts the deploy into
