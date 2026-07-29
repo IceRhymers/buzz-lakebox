@@ -6,7 +6,7 @@ import (
 )
 
 func TestRuntimeFor_CodexAliases(t *testing.T) {
-	for _, alias := range []string{"codex", "codex-acp", "codex-cli"} {
+	for _, alias := range []string{"codex", "codex-acp"} {
 		rt, ok := RuntimeFor(alias)
 		if !ok {
 			t.Errorf("alias %q should be accepted", alias)

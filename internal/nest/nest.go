@@ -267,7 +267,7 @@ func RenderEnv(agent payload.Agent, rt payload.Runtime, sandboxInferenceAuth boo
 	// BUZZ_ACP_MODEL here would make buzz-acp attempt a per-session switch
 	// to a gateway id absent from codex's catalog — the unsupported_model
 	// frame described above, on every session.
-	if shape.BuzzAgentWiring {
+	if shape.BuzzAgentInference {
 		emit("BUZZ_ACP_MODEL", derefOrEmpty(agent.Model))
 	}
 	emit("BUZZ_ACP_RESPOND_TO", agent.RespondTo)
@@ -316,16 +316,35 @@ func RenderEnv(agent payload.Agent, rt payload.Runtime, sandboxInferenceAuth boo
 	// MCP_HOOK_SERVERS is buzz-agent's own variable (read by the agent,
 	// not by buzz-acp) and is meaningless to the adapter.
 	//
-	// Codex is excluded for the same reason as Claude — it ships its own
-	// tools, so the buzz-agent silent-agent failure does not apply — and
-	// independently could not use this anyway: codex advertises
-	// mcpCapabilities {acp:false, http:true, sse:false}, i.e. no stdio MCP
-	// at all, and buzz-dev-mcp is stdio (docs/M3_CODEX_PROBE_RESULTS.md S4).
+	// CODEX IS NOT EXCLUDED, and the reasoning that would exclude it is
+	// wrong in a way worth recording. It is tempting to argue "codex ships
+	// its own tools, so the buzz-agent failure does not apply, same as
+	// Claude" — but upstream's discovery table sets mcp_command
+	// Some("buzz-dev-mcp") for codex and None only for claude. The
+	// difference is concrete: Claude Code's shell runs `buzz messages send`
+	// directly, while codex's tool calls execute under the ACP adapter's
+	// workspaceWrite sandbox with networkAccess:false
+	// (docs/M3_CODEX_PROBE_RESULTS.md S10), so its shell cannot reach the
+	// relay. The MCP subprocess is how a codex agent answers at all — which
+	// is also why buzz-acp injects CODEX_CONFIG network_access for exactly
+	// this runtime and no other.
 	//
-	// Escape hatch: env_vars render after this block, so an owner who
-	// wants buzz tooling can still set BUZZ_ACP_MCP_COMMAND=buzz-dev-mcp.
-	if shape.BuzzAgentWiring {
+	// A related misreading is worth flagging for the next runtime: codex's
+	// initialize reply carries mcpCapabilities {acp:false, http:true,
+	// sse:false}, which looks like "no stdio MCP". It is not. stdio is the
+	// baseline ACP transport and appears in no capability flag at all — the
+	// adapter's own schema has a zMcpServerStdio with command/args. Reading
+	// that field as a stdio denial is what produced the wrong conclusion.
+	//
+	// MCP_HOOK_SERVERS is separate: upstream sets mcp_hooks true for
+	// buzz-agent ONLY, so codex takes the command without the hooks.
+	//
+	// Escape hatch: env_vars render after this block, so an owner who wants
+	// different tooling can still override BUZZ_ACP_MCP_COMMAND.
+	if shape.StdioMCPCommand {
 		emit("BUZZ_ACP_MCP_COMMAND", "buzz-dev-mcp")
+	}
+	if shape.MCPHookServers {
 		emit("MCP_HOOK_SERVERS", "*")
 	}
 	// Observer frames are the desktop's ONLY health signal for a
@@ -349,7 +368,7 @@ func RenderEnv(agent payload.Agent, rt payload.Runtime, sandboxInferenceAuth boo
 	// ANTHROPIC_BASE_URL (ClaudeEnvSnippet), codex from the config.toml
 	// under CODEX_HOME (CodexEnvSnippet) — both appended after everything
 	// below.
-	if shape.BuzzAgentWiring {
+	if shape.BuzzAgentInference {
 		emit("BUZZ_AGENT_PROVIDER", derefOrDefault(agent.Provider, DefaultBuzzAgentProvider))
 		emit("DATABRICKS_MODEL", derefOrEmpty(agent.Model))
 	} else if shape.PinACPPermissionMode {

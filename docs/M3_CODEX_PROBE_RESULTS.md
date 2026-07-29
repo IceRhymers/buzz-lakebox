@@ -135,6 +135,12 @@ authMethods: [{id: "api-key", …}, {id: "chat-gpt", …}]
 stderr: (empty)
 ```
 
+> **CORRECTION (added after code review).** `mcpCapabilities: {acp:false, http:true, sse:false}` was read here as "codex supports no stdio MCP, so `buzz-dev-mcp` is unusable". **That is wrong**, and it drove a decision that would have shipped silent codex agents.
+>
+> **stdio is the baseline ACP transport and appears in no capability flag at all** — the capability set covers only the optional transports (`http`, `sse`, `acp`). The adapter's own schema carries a `zMcpServerStdio` with `name`/`command`/`args`, so stdio MCP is fully supported. Upstream agrees and is explicit: desktop's discovery table sets `mcp_command: Some("buzz-dev-mcp")` for **codex** and `None` only for **claude**.
+>
+> The reason for that split is concrete, and it is the opposite of the intuition that codex "ships its own tools so needs no MCP": Claude Code's shell can run `buzz messages send` directly, while codex's tool calls execute under the adapter's `workspaceWrite` sandbox with `networkAccess:false` (S10), so its shell cannot reach the relay at all. The MCP subprocess is how a codex agent answers — which is also why buzz-acp injects `CODEX_CONFIG` `network_access` for exactly this runtime.
+
 Note `authMethods` is **non-empty** here (Claude's was `[]`) — but S5 proves no `authenticate` call is needed when the provider supplies auth via config. The adapter **requires stdin to stay open**; closing it immediately yields `rc=0` with no response at all (an easy false-negative when probing).
 
 ## S5. Full ACP session against the gateway — VERIFIED ✅

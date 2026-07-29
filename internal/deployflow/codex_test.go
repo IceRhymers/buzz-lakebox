@@ -4,7 +4,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/IceRhymers/buzz-lakebox/internal/install"
 	"github.com/IceRhymers/buzz-lakebox/internal/nest"
+	"github.com/IceRhymers/buzz-lakebox/internal/payload"
 )
 
 // TestCodexProbeScript_ReadsEndpointFromArtifact pins the design choice that
@@ -37,9 +39,9 @@ func TestCodexProbeScript_ShapeInvariants(t *testing.T) {
 
 	for _, want := range []string{
 		"set -eu",
-		`trap 'rm -f "$BUZZ_PROBE_TMP" "$BUZZ_PROBE_ERR"' EXIT`,
+		`trap 'rm -f "$BUZZ_PROBE_TMP" "$BUZZ_PROBE_ERR" "$BUZZ_PROBE_HDR"' EXIT`,
 		`/responses`,
-		"Authorization: Bearer",
+		`-K "$BUZZ_PROBE_HDR"`,
 		codexProbeCauseMarkerPrefix + "unset",
 		codexProbeCauseMarkerPrefix + "auth",
 		codexProbeCauseMarkerPrefix + "unreachable",
@@ -126,5 +128,61 @@ func TestCodexProbeCauseMessage_AuthStatusIsValidated(t *testing.T) {
 
 	if msg := codexProbeCauseMessage("auth", "BUZZ_CODEX_PROBE_STATUS=403\n"); !strings.Contains(msg, "HTTP 403") {
 		t.Errorf("a well-formed status should be reported, got: %s", msg)
+	}
+}
+
+// TestAdapterSpecsMatchSpawnCommands closes a gap that exists only because
+// two packages hold parallel per-runtime registries with no compile-time
+// link between them: internal/payload owns spawnCommands, and
+// internal/install keys adapterSpecs by spawn-command STRING specifically
+// to avoid importing payload. Nothing forces the two to agree.
+//
+// This test lives in deployflow because it is the one package that imports
+// both. A drift makes installAndVerify's
+// `if spec, ok := AdapterSpecFor(rt.SpawnCommand()); ok` silently SKIP the
+// adapter install — the deploy then fails later at BuildVerifyCommand with
+// an error about a missing binary rather than a missing install, so this is
+// defense in depth against a confusing failure, not a silent one.
+func TestAdapterSpecsMatchSpawnCommands(t *testing.T) {
+	// Every runtime that needs an npm adapter must have a spec reachable
+	// by its canonical spawn command.
+	for _, rt := range []payload.Runtime{payload.RuntimeClaude, payload.RuntimeCodex} {
+		spec, ok := install.AdapterSpecFor(rt.SpawnCommand())
+		if !ok {
+			t.Errorf("runtime %q spawns %q but has no adapterSpecs entry; its adapter would never be installed", rt, rt.SpawnCommand())
+			continue
+		}
+		if spec.BinName != rt.SpawnCommand() {
+			t.Errorf("runtime %q spawns %q but its adapter symlinks %q — buzz-acp would spawn a name that does not exist", rt, rt.SpawnCommand(), spec.BinName)
+		}
+	}
+
+	// And buzz-agent must NOT have one: it ships in the .deb, so a spec
+	// would make the deploy try to npm-install a package that does not
+	// exist.
+	if _, ok := install.AdapterSpecFor(payload.RuntimeBuzzAgent.SpawnCommand()); ok {
+		t.Error("buzz-agent ships in the .deb and must not have an npm adapter spec")
+	}
+}
+
+// TestProbeScripts_TokenNeverInArgv pins that neither probe puts a bearer
+// on a command line. Both run BEFORE the prelaunch kill, so a previous
+// deploy's agent can still be alive in the sandbox, and /proc/<pid>/cmdline
+// is readable by the same uid it runs as. The header goes through a curl
+// config file created by mktemp (0600) and removed by the existing trap.
+func TestProbeScripts_TokenNeverInArgv(t *testing.T) {
+	for name, script := range map[string]string{
+		"codex":  codexInferenceProbeScript(),
+		"claude": claudeInferenceProbeScript(),
+	} {
+		if strings.Contains(script, `-H "Authorization: Bearer`) {
+			t.Errorf("%s probe passes the bearer in argv; use the -K config file instead", name)
+		}
+		if !strings.Contains(script, `-K "$BUZZ_PROBE_HDR"`) {
+			t.Errorf("%s probe should read its auth header from a config file", name)
+		}
+		if !strings.Contains(script, `"$BUZZ_PROBE_HDR"' EXIT`) {
+			t.Errorf("%s probe must remove the header file on every exit path", name)
+		}
 	}
 }

@@ -65,17 +65,23 @@ var supportedAgentCommands = map[string]Runtime{
 
 	// Bare "codex" IS accepted, unlike bare "claude", and the asymmetry is
 	// deliberate rather than an oversight — do not "fix" it by removing
-	// this row. Upstream's zero-arg identity list (config.rs:689-691)
-	// contains "codex" and "codex-acp" but NOT "claude", so accepting
-	// "codex" keeps this provider's accepted set equal to what buzz-acp
-	// will spawn with zero args, which is the rule the claude rows follow
-	// too. The hazard bare "claude" was excluded for does not apply here
-	// because every alias canonicalizes to "codex-acp" (see spawnCommands)
-	// before anything reaches the sandbox, so the image's ucode wrapper is
+	// this row. Upstream's zero-arg identity list (config.rs:691) contains
+	// "codex" and "codex-acp" but NOT "claude", so accepting "codex" keeps
+	// this provider's accepted set equal to what buzz-acp will spawn with
+	// zero args, which is the rule the claude rows follow too. The hazard
+	// bare "claude" was excluded for does not apply here because every
+	// alias canonicalizes to "codex-acp" (see spawnCommands) before
+	// anything reaches the sandbox, so the image's ucode wrapper is
 	// unreachable regardless of what the payload said.
+	//
+	// There is deliberately NO "codex-cli" row. An earlier version had one,
+	// justified by the same upstream-parity rule that does not actually
+	// cover it: "codex-cli" appears in neither buzz-acp's identity list nor
+	// desktop's discovery entry (commands ["codex-acp"], aliases []). It
+	// was invented here. Accepting a command upstream will not spawn buys
+	// nothing and quietly widens the contract.
 	"codex":     RuntimeCodex,
 	"codex-acp": RuntimeCodex,
-	"codex-cli": RuntimeCodex,
 }
 
 // spawnCommands is the canonical command buzz-acp is told to spawn
@@ -100,22 +106,53 @@ var spawnCommands = map[Runtime]string{
 // at each site, which is what this package encoded while exactly two
 // runtimes existed — silently means "buzz-agent OR ANYTHING ADDED LATER".
 // A third runtime added under that spelling inherits buzz-agent's model
-// variable, its stdio MCP server, and its inference config, none of which an
-// ACP adapter can use, and loses the pinned permission mode. That ships
-// green — the .deb installs, the ACP handshake passes, the inference probe
-// passes — and fails at session time, which is the exact silent-agent class
+// variable and its inference config, neither of which an ACP adapter can
+// use, and loses the pinned permission mode. That ships green — the .deb
+// installs, the ACP handshake passes, the inference probe passes — and
+// fails at session time, which is the exact silent-agent class
 // nest.go:264-272 and :247-254 record being live-bitten by twice.
 //
-// Naming is deliberately positive ("does this runtime want buzz-agent's
-// wiring?") rather than negative, so the zero value withholds wiring rather
-// than granting it: a runtime someone forgets to classify gets nothing it
-// cannot use. The omission is still a bug, and TestEnvShapes_CoverEveryRuntime
-// fails on it — but it fails safe in the meantime.
+// Each field is ONE decision, and they are deliberately not collapsed into
+// a single "is this buzz-agent" flag, because the three runtimes do not
+// partition that way. Codex needs buzz-agent's MCP command but none of its
+// inference wiring; buzz-agent alone needs the MCP hook tools. An earlier
+// version of this struct bundled all of it behind one flag and gave codex
+// neither — trading the bug this type exists to prevent for a different
+// instance of it.
+//
+// The safest zero value is the one that withholds, so a runtime someone
+// forgets to classify renders bare rather than mis-wired. That is still a
+// bug — TestEnvShapes_CoverEveryRuntime fails on it — but it fails visibly
+// at session time rather than silently doing the wrong thing.
 type EnvShape struct {
-	// BuzzAgentWiring emits buzz-agent's own tool and inference
-	// configuration: BUZZ_ACP_MODEL, BUZZ_ACP_MCP_COMMAND,
-	// MCP_HOOK_SERVERS, BUZZ_AGENT_PROVIDER, DATABRICKS_MODEL.
-	BuzzAgentWiring bool
+	// BuzzAgentInference emits buzz-agent's own model and provider
+	// configuration: BUZZ_ACP_MODEL, BUZZ_AGENT_PROVIDER, DATABRICKS_MODEL.
+	// Meaningless to an ACP adapter, which takes its endpoint from
+	// elsewhere.
+	BuzzAgentInference bool
+
+	// StdioMCPCommand emits BUZZ_ACP_MCP_COMMAND=buzz-dev-mcp, giving the
+	// agent the buzz tools it needs to answer a mention.
+	//
+	// Matching upstream exactly here matters more than it looks. Desktop's
+	// discovery table sets mcp_command Some("buzz-dev-mcp") for BOTH
+	// buzz-agent and codex, and None only for claude — Claude Code ships a
+	// shell that can run `buzz messages send` itself, whereas codex's tool
+	// calls run under the adapter's workspaceWrite/no-network sandbox, so
+	// its shell cannot reach the relay. The MCP subprocess is how a codex
+	// agent talks back at all, which is also why buzz-acp injects
+	// CODEX_CONFIG network_access for exactly this runtime.
+	//
+	// Withholding it from codex produces an agent that installs, handshakes,
+	// probes clean, and then never answers — the silent-agent failure
+	// recorded twice in nest.go.
+	StdioMCPCommand bool
+
+	// MCPHookServers emits MCP_HOOK_SERVERS=* for the hook tools (_Stop,
+	// _PostCompact). Upstream sets mcp_hooks true for buzz-agent ONLY —
+	// codex gets the MCP command without the hooks — so this is a separate
+	// field rather than a rider on StdioMCPCommand.
+	MCPHookServers bool
 
 	// PinACPPermissionMode emits BUZZ_ACP_PERMISSION_MODE for runtimes
 	// driven through an ACP adapter. It pins parity with buzz-acp's own
@@ -125,11 +162,12 @@ type EnvShape struct {
 }
 
 // envShapes must have an entry for every Runtime in spawnCommands;
-// TestEnvShapes_CoverEveryRuntime enforces it.
+// TestEnvShapes_CoverEveryRuntime enforces it. Each row mirrors that
+// runtime's entry in upstream's discovery table (see EnvShape's fields).
 var envShapes = map[Runtime]EnvShape{
-	RuntimeBuzzAgent: {BuzzAgentWiring: true},
+	RuntimeBuzzAgent: {BuzzAgentInference: true, StdioMCPCommand: true, MCPHookServers: true},
 	RuntimeClaude:    {PinACPPermissionMode: true},
-	RuntimeCodex:     {PinACPPermissionMode: true},
+	RuntimeCodex:     {StdioMCPCommand: true, PinACPPermissionMode: true},
 }
 
 // EnvShape returns the env-rendering capabilities of r.
@@ -153,7 +191,7 @@ func (r Runtime) SpawnCommand() string {
 // error text, in a fixed order (map iteration order is randomized, and this
 // string is asserted on by tests).
 func supportedAgentCommandList() string {
-	return "buzz-agent, claude-agent-acp (aliases: claude-code-acp, claude-code, claudecode), codex-acp (aliases: codex, codex-cli)"
+	return "buzz-agent, claude-agent-acp (aliases: claude-code-acp, claude-code, claudecode), codex-acp (alias: codex)"
 }
 
 // unsupportedRuntimeError is the rejection for an agent_command this

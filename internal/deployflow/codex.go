@@ -48,11 +48,12 @@ func codexInferenceProbeScript() string {
 	return fmt.Sprintf(`set -eu
 BUZZ_PROBE_TMP=$(mktemp)
 BUZZ_PROBE_ERR=$(mktemp)
+BUZZ_PROBE_HDR=$(mktemp)
 # The trap is not belt-and-braces: BUZZ_PROBE_TMP holds the agent's REAL env
 # — nsec, auth tag, and the Databricks token. Sourcing it under set -e can
 # abort, and without the trap the plain rm below would be skipped, stranding
 # a secret-bearing file that no teardown path ever reclaims.
-trap 'rm -f "$BUZZ_PROBE_TMP" "$BUZZ_PROBE_ERR"' EXIT
+trap 'rm -f "$BUZZ_PROBE_TMP" "$BUZZ_PROBE_ERR" "$BUZZ_PROBE_HDR"' EXIT
 cat > "$BUZZ_PROBE_TMP"
 # shellcheck disable=SC1090
 . "$BUZZ_PROBE_TMP"
@@ -71,9 +72,14 @@ if [ -z "$BUZZ_PROBE_URL" ] || [ -z "${DATABRICKS_TOKEN:-}" ]; then
   exit 1
 fi
 
+# The bearer goes in a 0600 config file, never in argv: these probes run
+# BEFORE the prelaunch kill, so a previous deploy's agent may still be alive
+# in this sandbox, and /proc/<pid>/cmdline is readable by the same uid.
+printf 'header = "Authorization: Bearer %%s"\n' "${DATABRICKS_TOKEN}" > "$BUZZ_PROBE_HDR"
+
 BUZZ_PROBE_CODE=$(curl -sS -o /dev/null -w '%%{http_code}' --max-time 30 \
   -X POST "${BUZZ_PROBE_URL%%/}/responses" \
-  -H "Authorization: Bearer ${DATABRICKS_TOKEN}" \
+  -K "$BUZZ_PROBE_HDR" \
   -H 'content-type: application/json' \
   -d '{"model":"%s","input":"hi"}' 2>"$BUZZ_PROBE_ERR") || {
   echo "%sunreachable"

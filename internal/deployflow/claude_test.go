@@ -277,8 +277,11 @@ func TestClaudeProbeCauseMessage_StatusIsValidated(t *testing.T) {
 // install.BuildVerifyCommand traps; nothing else ever shreds this path.
 func TestClaudeInferenceProbeScript_TrapsSecretTempFile(t *testing.T) {
 	script := claudeInferenceProbeScript()
-	if !strings.Contains(script, `trap 'rm -f "$BUZZ_PROBE_TMP" "$BUZZ_PROBE_ERR"' EXIT`) {
-		t.Fatal("probe must trap-remove its secret-bearing temp file; a plain rm is skipped when sourcing aborts")
+	// BUZZ_PROBE_HDR joined this list when the bearer moved out of curl's
+	// argv into a config file; it is secret-bearing too, so the same trap
+	// must reclaim it.
+	if !strings.Contains(script, `trap 'rm -f "$BUZZ_PROBE_TMP" "$BUZZ_PROBE_ERR" "$BUZZ_PROBE_HDR"' EXIT`) {
+		t.Fatal("probe must trap-remove its secret-bearing temp files; a plain rm is skipped when sourcing aborts")
 	}
 	trapIdx := strings.Index(script, "trap 'rm -f")
 	catIdx := strings.Index(script, `cat > "$BUZZ_PROBE_TMP"`)
@@ -292,8 +295,8 @@ func TestClaudeInferenceProbeScript_TrapsSecretTempFile(t *testing.T) {
 	if !strings.Contains(script, "-o /dev/null") {
 		t.Error("probe must discard curl's response body")
 	}
-	if !strings.Contains(script, `trap 'rm -f "$BUZZ_PROBE_TMP" "$BUZZ_PROBE_ERR"' EXIT`) {
-		t.Error("both temp files must be trapped, including curl's stderr capture")
+	if !strings.Contains(script, `"$BUZZ_PROBE_ERR"`) {
+		t.Error("curl's stderr capture must be trapped too")
 	}
 	if strings.Contains(script, "Authorization: Bearer") && strings.Contains(script, "set -x") {
 		t.Error("tracing would echo the Authorization header")

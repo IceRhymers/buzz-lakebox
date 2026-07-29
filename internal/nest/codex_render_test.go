@@ -24,9 +24,9 @@ func codexTestAgent() payload.Agent {
 //     gateway id absent from codex's catalog, emitting an unsupported_model
 //     observer frame on every session (nest.go:224-234). The model belongs
 //     in the generated config.toml instead.
-//   - BUZZ_ACP_MCP_COMMAND / MCP_HOOK_SERVERS: buzz-dev-mcp is a STDIO MCP
-//     server, and codex advertises mcpCapabilities {acp:false, http:true,
-//     sse:false} — no stdio MCP at all (docs/M3_CODEX_PROBE_RESULTS.md S4).
+//   - MCP_HOOK_SERVERS: the hook tools (_Stop, _PostCompact). Upstream sets
+//     mcp_hooks true for buzz-agent ONLY, so codex takes the MCP command
+//     without the hooks.
 //   - BUZZ_AGENT_PROVIDER / DATABRICKS_MODEL: buzz-agent's own inference
 //     config, meaningless to an ACP adapter that reads a config.toml.
 //
@@ -48,7 +48,6 @@ func TestRenderEnv_CodexGolden(t *testing.T) {
 
 	for _, dontWant := range []string{
 		"BUZZ_ACP_MODEL=",
-		"BUZZ_ACP_MCP_COMMAND=",
 		"MCP_HOOK_SERVERS=",
 		"BUZZ_AGENT_PROVIDER=",
 		"DATABRICKS_MODEL=",
@@ -56,6 +55,27 @@ func TestRenderEnv_CodexGolden(t *testing.T) {
 		if strings.Contains(env, dontWant) {
 			t.Errorf("codex env must not contain %q — it is buzz-agent wiring an ACP adapter cannot use", dontWant)
 		}
+	}
+}
+
+// TestRenderEnv_CodexGetsBuzzTooling is the counterpart, and it is the
+// assertion an earlier version of this file got exactly backwards.
+//
+// It is tempting to reason "codex ships its own tools, therefore it needs no
+// MCP, same as claude". Upstream says otherwise, and the reason is concrete:
+// Claude Code's shell can run `buzz messages send` directly, while codex's
+// tool calls run under the adapter's workspaceWrite sandbox with
+// networkAccess:false, so its shell cannot reach the relay at all. The MCP
+// subprocess is how a codex agent answers a mention — which is also why
+// buzz-acp injects CODEX_CONFIG network_access for exactly this runtime.
+//
+// Withholding it yields an agent that installs, handshakes, passes the
+// inference probe, and is then permanently silent: the failure mode
+// nest.go:264-272 records being live-bitten by.
+func TestRenderEnv_CodexGetsBuzzTooling(t *testing.T) {
+	env := RenderEnv(codexTestAgent(), payload.RuntimeCodex, false)
+	if !strings.Contains(env, `export BUZZ_ACP_MCP_COMMAND='buzz-dev-mcp'`) {
+		t.Errorf("codex must receive buzz-dev-mcp — without it the agent cannot talk back:\n%s", env)
 	}
 }
 
@@ -80,7 +100,7 @@ func TestRenderEnv_CodexNoInertSandboxKeys(t *testing.T) {
 // ucode-wrapper defense: whatever alias the payload used, no rendered
 // artifact may tell buzz-acp to spawn bare `codex`.
 func TestRenderEnv_CodexNeverSpawnsBareCodex(t *testing.T) {
-	for _, alias := range []string{"codex", "codex-acp", "codex-cli"} {
+	for _, alias := range []string{"codex", "codex-acp"} {
 		agent := codexTestAgent()
 		agent.AgentCommand = alias
 		env := RenderEnv(agent, payload.RuntimeCodex, false)
