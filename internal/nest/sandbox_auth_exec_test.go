@@ -5,7 +5,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 
@@ -416,14 +418,10 @@ func TestSandboxAuthSnippet_DerivationIsAllOrNothing(t *testing.T) {
 // make it pass without re-checking TestSandboxAuthSnippet_DerivationIsAllOrNothing
 // against the new arrangement.
 func TestRenderEnv_SandboxAuthPrecedesRuntimeSnippets(t *testing.T) {
-	for _, tc := range []struct {
-		rt      payload.Runtime
-		snippet string
-		name    string
-	}{
-		{payload.RuntimeClaude, ClaudeEnvSnippet, "claude"},
-		{payload.RuntimeCodex, CodexEnvSnippet, "codex"},
-	} {
+	// Driven from runtimeSnippets rather than a literal list, so a future
+	// snippet-bearing runtime cannot be added without appearing here —
+	// TestRuntimeSnippets_CoverEveryRuntime enforces the mapping.
+	for _, tc := range runtimeSnippetCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := claudeTestAgent()
 			agent.AgentCommand = string(tc.rt)
@@ -441,11 +439,98 @@ func TestRenderEnv_SandboxAuthPrecedesRuntimeSnippets(t *testing.T) {
 				t.Errorf("SandboxAuthSnippet (at %d) must precede the %s snippet (at %d): the all-or-nothing derivation guard assumes nothing has set DATABRICKS_HOST before it runs", iAuth, tc.name, iRt)
 			}
 
-			// And no env_vars entry may be emitted after SandboxAuthSnippet,
-			// which is the other half of the same assumption.
-			if tail := env[iAuth:]; strings.Contains(tail, "\nexport DATABRICKS_HOST=") {
-				t.Error("DATABRICKS_HOST is exported after SandboxAuthSnippet; the derivation guard would see it already set")
+			// And nothing may export DATABRICKS_HOST/TOKEN after
+			// SandboxAuthSnippet, which is the security half of the same
+			// assumption — pairing the derived token with a host set
+			// afterwards is the only shape that reproduces the original
+			// credential-egress defect.
+			//
+			// Two things this had to get right, both learned the hard way.
+			// The snippet's OWN exports must be excluded first: they are
+			// inside the derivation branch and would self-trip any
+			// whitespace-tolerant match. And the match must then BE
+			// whitespace-tolerant: an earlier version keyed on the literal
+			// "\nexport DATABRICKS_HOST=", which only matches at column 0,
+			// while every export in these snippets is indented inside an
+			// `if` — so it was structurally incapable of firing. Verified by
+			// mutation: adding an indented post-auth export to
+			// ClaudeEnvSnippet left the whole suite green.
+			tail := env[iAuth+len(SandboxAuthSnippet):]
+			if postAuthCredentialExport.MatchString(tail) {
+				t.Errorf("DATABRICKS_HOST/TOKEN is exported after SandboxAuthSnippet; the derivation guard would see it already set:\n%s", tail)
 			}
 		})
+	}
+}
+
+// postAuthCredentialExport matches an export of either half of the
+// credential pair, at any indentation. Whitespace tolerance is the whole
+// point: every export inside these snippets sits within an `if`, so a
+// column-0 pattern can never fire.
+var postAuthCredentialExport = regexp.MustCompile(`(?m)^[ \t]*export[ \t]+DATABRICKS_(HOST|TOKEN)=`)
+
+// runtimeSnippets maps each runtime to the snippet RenderEnv appends for
+// it. A runtime with no snippet is absent rather than mapped to "".
+var runtimeSnippets = map[payload.Runtime]string{
+	payload.RuntimeClaude: ClaudeEnvSnippet,
+	payload.RuntimeCodex:  CodexEnvSnippet,
+}
+
+type runtimeSnippetCase struct {
+	rt      payload.Runtime
+	snippet string
+	name    string
+}
+
+func runtimeSnippetCases() []runtimeSnippetCase {
+	out := make([]runtimeSnippetCase, 0, len(runtimeSnippets))
+	for rt, snippet := range runtimeSnippets {
+		out = append(out, runtimeSnippetCase{rt: rt, snippet: snippet, name: string(rt)})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
+	return out
+}
+
+// TestRuntimeSnippets_CoverEveryRuntime keeps the ordering guard from
+// silently skipping a runtime added later. A runtime whose RenderEnv
+// appends a snippet but which is missing from runtimeSnippets would have
+// its snippet ordering unasserted — and the ordering is what the
+// all-or-nothing derivation guard's reachability argument rests on.
+func TestRuntimeSnippets_CoverEveryRuntime(t *testing.T) {
+	agent := claudeTestAgent()
+	for _, rt := range []payload.Runtime{payload.RuntimeBuzzAgent, payload.RuntimeClaude, payload.RuntimeCodex} {
+		agent.AgentCommand = string(rt)
+		env := RenderEnv(agent, rt, true)
+		// Everything after SandboxAuthSnippet is a runtime snippet.
+		i := strings.Index(env, SandboxAuthSnippet)
+		if i < 0 {
+			t.Fatalf("%s: SandboxAuthSnippet must render in sandbox mode", rt)
+		}
+		hasSnippet := strings.TrimSpace(env[i+len(SandboxAuthSnippet):]) != ""
+		_, mapped := runtimeSnippets[rt]
+		if hasSnippet != mapped {
+			t.Errorf("%s: RenderEnv appends a snippet = %v, but runtimeSnippets has an entry = %v; add it so the ordering guard covers this runtime", rt, hasSnippet, mapped)
+		}
+	}
+}
+
+// TestSandboxAuthSnippet_HostLineMissing pins the INNER half of the
+// all-or-nothing derivation, which was shipped unpinned.
+//
+// The outer guard (both env vars unset) is covered by
+// TestSandboxAuthSnippet_DerivationIsAllOrNothing. This covers the cfg
+// side: a ~/.databrickscfg carrying a token line and NO host line must
+// derive neither. Reverting the inner guard to `[ -n "$buzz_token" ]` left
+// the entire suite green before this test existed — the exact unpinned-guard
+// failure mode that produced three defects earlier in this branch.
+func TestSandboxAuthSnippet_HostLineMissing(t *testing.T) {
+	requireShAndAwk(t)
+	cfg := "[DEFAULT]\ntoken = dapi-BAKED-OWNER-PAT\n"
+	res := sourceSnippet(t, &cfg, "", "set -eu", false, nil)
+	if res.exitCode != 0 {
+		t.Fatalf("expected exit 0, got %d", res.exitCode)
+	}
+	if res.host != "" || res.token != "" {
+		t.Fatalf("got host=%q token=%q, want NEITHER: exporting the baked owner token with no endpoint is half a credential pair", res.host, res.token)
 	}
 }

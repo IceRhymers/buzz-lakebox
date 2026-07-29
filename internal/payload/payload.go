@@ -176,9 +176,9 @@ func (a Agent) Validate() error {
 		// Each snippet also initializes its own scratch variables, which is
 		// the real fix; this closes the class so the next snippet author
 		// does not have to remember the rule.
-		if strings.HasPrefix(key, "buzz_") {
+		if reservedScratchEnvKey(key) {
 			return fmt.Errorf(
-				"env_vars key %q uses the buzz_ prefix, which is reserved for this provider's own shell scratch variables; rename it",
+				"env_vars key %q collides with this provider's own shell scratch variables; rename it",
 				key,
 			)
 		}
@@ -241,6 +241,47 @@ func (r DeployRequest) Validate() error {
 //
 // The two lists are gated on DIFFERENT conditions, and conflating them was
 // itself a defect. See validateOwnerPATEnvVars.
+
+// reservedScratchEnvKey reports whether an env_vars key collides with a
+// shell variable this provider uses in its own generated scripts.
+//
+// This is a namespace reservation, not a security control in itself — but
+// the collisions it prevents are, because every one of these scripts
+// `.`-sources the rendered env file, and env_vars are emitted LAST. So a
+// payload key with one of these names silently replaces the provider's own
+// value *after* the script assigned it. Two demonstrated consequences:
+//
+//   - Lowercase buzz_*: an inherited buzz_codex_url reached CodexEnvSnippet's
+//     heredoc without passing the host charset gate, because the write and
+//     the gate had been decoupled into separate branches. Arbitrary TOML,
+//     including an auth.command codex runs at startup.
+//   - Uppercase BUZZ_PROBE_*: the inference probes assign these BEFORE
+//     sourcing, so the source overwrites them. Reproduced: the probe wrote
+//     the owner-PAT bearer into a payload-chosen path and curl -K read it
+//     from there, while the real mktemp file holding the agent's full env —
+//     nsec, auth tag, token — was orphaned 0600 on disk, un-reclaimed by the
+//     EXIT trap (which deletes the decoy) and invisible to
+//     secretShredCommand's fixed path list.
+//
+// Each script also initializes its own scratch variables, which is the real
+// fix in both cases. This closes the class so the next script author does
+// not have to rediscover the rule.
+//
+// Uppercase BUZZ_ACP_* must stay reachable — it is buzz-acp's real
+// configuration surface — so this cannot be a blanket BUZZ_ prefix.
+func reservedScratchEnvKey(key string) bool {
+	// Lowercase provider scratch, used across SandboxAuthSnippet,
+	// ClaudeEnvSnippet and CodexEnvSnippet.
+	if strings.HasPrefix(key, "buzz_") {
+		return true
+	}
+	// Inference-probe scratch (internal/deployflow/{claude,codex}.go).
+	if strings.HasPrefix(key, "BUZZ_PROBE_") {
+		return true
+	}
+	// install.BuildVerifyCommand's env-file and output paths.
+	return key == "ENVF" || key == "OUTF"
+}
 
 // credentialPairEnvKeys decide WHERE the provider-derived credential is
 // sent. They are refused only under inference_auth="sandbox", because that
@@ -316,8 +357,43 @@ var ownerPATForbiddenEnvKeys = []string{
 	"NODE_EXTRA_CA_CERTS",
 	// Command resolution and process layout. HOME relocates
 	// ~/.databrickscfg, $CODEX_HOME, the launch lock, and the path
-	// launch.sh execs buzz-acp from.
-	"PATH", "SHELL", "BASH_ENV", "ENV", "IFS", "HOME",
+	// launch.sh execs buzz-acp from. BUZZ_SHELL is the one actually
+	// honoured in this stack — buzz-dev-mcp's shell tool resolves it and
+	// spawns it as its interpreter (buzz-dev-mcp/src/shell.rs:365-388) —
+	// while plain SHELL is read by nothing here; both are listed because
+	// the criterion is the variable's effect, not its popularity.
+	"PATH", "SHELL", "BUZZ_SHELL", "BASH_ENV", "ENV", "IFS", "HOME",
+
+	// FILE-READING LEVERS, and the reason this list's criterion had to be
+	// widened. Everything above decides what CODE runs beside the
+	// credential. These decide what the PROVIDER'S OWN STACK READS and
+	// sends to a payload-chosen endpoint — no agent tool call, no
+	// session/request_permission, no relay traffic, nothing on disk.
+	//
+	// buzz-acp reads each of these paths itself and prepends the contents
+	// (up to 1 MB) to every prompt it sends to the configured inference
+	// endpoint: base at config.rs:851, system at :823, heartbeat at :843,
+	// all plain std::fs::read_to_string. Point one at ~/.databrickscfg
+	// under keep_workspace_pat — where the baked PAT is still on disk and
+	// the credential pair is legitimately payload-supplied — and the owner
+	// token is exfiltrated in the prompt body on the first mention. The
+	// heartbeat variant needs no mention at all: it fires on a timer.
+	//
+	// BUZZ_ACP_SYSTEM_PROMPT_FILE is the least reachable of the three
+	// (clap conflicts with BUZZ_ACP_SYSTEM_PROMPT, which RenderEnv always
+	// emits) and is listed anyway: a defense that depends on an upstream
+	// conflict declaration staying put is not a defense.
+	"BUZZ_ACP_BASE_PROMPT_FILE", "BUZZ_ACP_SYSTEM_PROMPT_FILE",
+	"BUZZ_ACP_HEARTBEAT_PROMPT_FILE",
+
+	// Observability integrity. RenderEnv emits BUZZ_ACP_RELAY_OBSERVER
+	// ="true" and calls observer frames "the desktop's ONLY health signal
+	// for a provider-deployed agent" — then emits env_vars after it, so a
+	// payload wins. Not a credential lever on its own, which is why it sits
+	// at the end of this list rather than among the ones above; it is here
+	// because it composes with them, removing the last operator-visible
+	// trace of an agent doing something else.
+	"BUZZ_ACP_RELAY_OBSERVER",
 }
 
 // validateOwnerPATEnvVars refuses payload-supplied environment that could

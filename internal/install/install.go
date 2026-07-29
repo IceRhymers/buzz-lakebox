@@ -102,7 +102,7 @@ if [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$BUZZ_VERSION" ]; then
 else
   TMP_DEB=$(mktemp "${TMPDIR:-/tmp}/buzz-XXXXXX.deb")
   trap 'rm -f "$TMP_DEB"' EXIT
-  curl -fL --retry 2 -o "$TMP_DEB" "$BUZZ_URL"
+  curl -q -fL --retry 2 -o "$TMP_DEB" "$BUZZ_URL"
   echo "$BUZZ_SHA256  $TMP_DEB" | sha256sum -c -
   rm -rf "$DIST_DIR"
   mkdir -p "$DIST_DIR"

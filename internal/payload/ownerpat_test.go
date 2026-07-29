@@ -253,14 +253,30 @@ func TestValidate_BuzzScratchNamespaceReserved(t *testing.T) {
 			t.Errorf("env_vars.%s must be rejected: it collides with a provider shell scratch variable", key)
 			continue
 		}
-		if !strings.Contains(err.Error(), "reserved") {
+		if !strings.Contains(err.Error(), "collides") {
 			t.Errorf("rejection for %s should explain the namespace, got: %v", key, err)
 		}
 	}
-	// Uppercase BUZZ_ is buzz-acp's real configuration surface and must
-	// still be reachable — the reservation is the lowercase scratch prefix.
-	if err := ownerPATReq("codex-acp", map[string]string{"BUZZ_ACP_DEDUP": "queue"}, ProviderConfig{}).Validate(); err != nil {
-		t.Errorf("uppercase BUZZ_ variables are buzz-acp configuration, not scratch: %v", err)
+	// The UPPERCASE probe scratch names are reserved too, and this half was
+	// missing until round 3. The inference probes assign BUZZ_PROBE_TMP /
+	// _HDR / _ERR before sourcing the rendered env, so the source overwrites
+	// them: reproduced, the probe wrote the owner-PAT bearer to a
+	// payload-chosen path and curl -K read it from there, while the real
+	// mktemp file holding nsec + auth tag + token was orphaned on disk
+	// beyond the reach of both the EXIT trap and secretShredCommand.
+	for _, key := range []string{"BUZZ_PROBE_TMP", "BUZZ_PROBE_HDR", "BUZZ_PROBE_ERR", "ENVF", "OUTF"} {
+		if err := ownerPATReq("codex-acp", map[string]string{key: "/tmp/attacker"}, ProviderConfig{}).Validate(); err == nil {
+			t.Errorf("env_vars.%s must be rejected: it collides with a provider script's scratch variable", key)
+		}
+	}
+
+	// But uppercase BUZZ_ACP_* is buzz-acp's real configuration surface and
+	// must stay reachable — which is exactly why this cannot be a blanket
+	// BUZZ_ prefix rule.
+	for _, key := range []string{"BUZZ_ACP_DEDUP", "BUZZ_ACP_IDLE_TIMEOUT", "BUZZ_ACP_SYSTEM_PROMPT"} {
+		if err := ownerPATReq("codex-acp", map[string]string{key: "x"}, ProviderConfig{}).Validate(); err != nil {
+			t.Errorf("uppercase %s is buzz-acp configuration, not scratch: %v", key, err)
+		}
 	}
 }
 

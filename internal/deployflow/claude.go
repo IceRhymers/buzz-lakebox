@@ -179,15 +179,32 @@ fi
 # also decodes backslash escapes inside double quotes, silently corrupting
 # an otherwise valid token into a false "auth" diagnosis. Anything outside
 # the base64url/PAT charset fails closed as "unset" instead.
+#
+# -q MUST stay the FIRST argument, and it is a security control rather
+# than tidiness. Without it curl reads $CURL_HOME/.curlrc, then
+# $XDG_CONFIG_HOME/curlrc, then $HOME/.curlrc, BEFORE applying argv --
+# and a url directive in any of them makes curl issue a second
+# request replaying this Authorization header and the request body to
+# an attacker's endpoint (reproduced against curl 8.20: two requests,
+# the first to the attacker, both carrying the bearer).
+#
+# That is the same primitive the token charset gate above closes,
+# reached through a channel the gate structurally cannot see: it
+# inspects a variable, this is a file. It matters here specifically
+# because these probes run BEFORE the prelaunch kill, so a previous
+# deploy's agent -- the hostile neighbour the -K change exists to
+# defend against -- may still be alive to have written it. $HOME
+# persists across redeploys into a reused sandbox, which is the
+# normal path. curl only honours -q in first position.
 case "${ANTHROPIC_AUTH_TOKEN:-}" in
   *[!A-Za-z0-9._~+/=-]*)
-    echo "%sunset"
+    echo "%smalformed"
     exit 1
     ;;
 esac
 printf 'header = "Authorization: Bearer %%s"\n' "${ANTHROPIC_AUTH_TOKEN}" > "$BUZZ_PROBE_HDR"
 
-BUZZ_PROBE_CODE=$(curl -sS -o /dev/null -w '%%{http_code}' --max-time 30 \
+BUZZ_PROBE_CODE=$(curl -q -sS -o /dev/null -w '%%{http_code}' --max-time 30 \
   -X POST "${ANTHROPIC_BASE_URL%%/}/v1/messages" \
   -K "$BUZZ_PROBE_HDR" \
   -H 'content-type: application/json' \
@@ -222,6 +239,12 @@ esac
 // by the caller via remoteText; nothing secret is interpolated here.
 func claudeProbeCauseMessage(cause, out string) string {
 	switch cause {
+	case "malformed":
+		// See the codex probe's twin: distinct from "unset" so the remedy
+		// names the credential rather than the endpoint.
+		return "the credential contains characters outside the token charset (A-Za-z0-9._~+/=-) and was refused BEFORE use, " +
+			"because a config-file parser treats some of them as directive separators — check for whitespace, quoting, or a stray carriage return " +
+			"in env_vars ANTHROPIC_AUTH_TOKEN/DATABRICKS_TOKEN, or on the `token =` line of the sandbox's ~/.databrickscfg"
 	case "unset":
 		return "the rendered env produced no ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN — in inference_auth \"env\" set env_vars DATABRICKS_HOST and DATABRICKS_TOKEN; " +
 			"in \"sandbox\" mode the baked ~/.databrickscfg did not yield both. The agent was NOT launched, deliberately: without a base URL it would fall back to the public Anthropic API"

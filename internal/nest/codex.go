@@ -54,12 +54,20 @@ const CodexDefaultModel = "databricks-gpt-5-3-codex"
 // statement. A FILE breaks that equivalence. This provider reuses sandboxes
 // across redeploys (deployflow keyed on npub) and $HOME persists, so:
 // deploy #1 derives a host and writes config.toml; a redeploy hits the same
-// sandbox with a regenerated ~/.databrickscfg carrying a token line but no
-// host line (the exact case ClaudeEnvSnippet's gate exists for);
-// SandboxAuthSnippet exports DATABRICKS_TOKEN anyway, because that export is
-// NOT gated on the host; this snippet correctly declines to write — and
-// deploy #1's file is still on disk, sending the CURRENT token to the
-// PREVIOUS host. So the removal below is unconditional, and its success is
+// sandbox and derives a DIFFERENT host, or derives nothing at all; this
+// snippet declines to write — and deploy #1's file is still on disk,
+// pointing the agent at the PREVIOUS host.
+//
+// (An earlier version of this comment cited the half-derivation case —
+// "SandboxAuthSnippet exports DATABRICKS_TOKEN anyway, because that export
+// is NOT gated on the host". That was true when written and is not any
+// more: derivation is now all-or-nothing at nest.go, so a cfg with a token
+// and no host derives neither. The removal is still required — the
+// different-host-on-redeploy case above is enough on its own — but the
+// example was stale, and a stale justification is how a guard gets deleted
+// by someone who checks the example and finds it no longer reproduces.)
+//
+// So the removal below is unconditional, and its success is
 // CHECKED rather than assumed: `rm -f` is `|| :`-guarded like every other
 // filesystem statement here, which would otherwise swallow a failure and
 // leave the stale file in place behind a declined gate. If removal fails,

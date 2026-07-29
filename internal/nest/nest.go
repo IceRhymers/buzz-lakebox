@@ -176,6 +176,12 @@ if [ -z "${DATABRICKS_TOKEN:-}" ] && [ -z "${DATABRICKS_HOST:-}" ] && [ -r "$HOM
       sub(/^[ \t]+/, "", line)
       if (line ~ ("^" want "[ \t]*=")) {
         sub(("^" want "[ \t]*=[ \t]*"), "", line)
+        # Trailing whitespace and CR are stripped as well as leading: the
+        # cfg is regenerated into /run on every start (probe S2), and a
+        # trailing space or a CRLF line ending would otherwise produce a
+        # token the inference probes' charset gate refuses, turning cosmetic
+        # contamination into a hard deploy failure.
+        sub(/[ \t\r]+$/, "", line)
         print line
         found = 1
       }
