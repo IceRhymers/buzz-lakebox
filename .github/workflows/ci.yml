@@ -42,6 +42,58 @@ jobs:
       - name: go test
         run: go test ./... -race
 
+  # Dependency advisories. This provider's entire threat model is credential
+  # handling, so a vulnerable dependency in either ecosystem is directly on
+  # the path of a workspace-owner PAT.
+  #
+  # Both are needed because they cover disjoint trees. govulncheck reads
+  # go.mod (5 direct dependencies); the two npm ACP adapter lockfiles are
+  # integrity-pinned by sha512, which proves the bytes match what the
+  # registry served when the lockfile was generated — it says nothing about
+  # whether those bytes were later found vulnerable. `npm audit` against the
+  # committed lockfiles is the analogous gate, and --package-lock-only keeps
+  # it from installing the ~900 MB of adapter trees to do it.
+  vulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: govulncheck
+        run: |
+          go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+      - name: npm audit (committed adapter lockfiles)
+        run: |
+          set -eu
+          rc=0
+          for lock in internal/install/lockfiles/*.package-lock.json; do
+            name=$(basename "$lock" .package-lock.json)
+            work=$(mktemp -d)
+            # npm audit needs the manifest beside the lockfile; the lockfile's
+            # own root entry carries the name/version the manifest must match.
+            cp "$lock" "$work/package-lock.json"
+            python3 - "$work" <<'PYEOF'
+          import json, sys, os
+          work = sys.argv[1]
+          lock = json.load(open(os.path.join(work, "package-lock.json")))
+          root = lock["packages"][""]
+          json.dump({
+              "name": lock["name"],
+              "version": lock.get("version", "0.0.0"),
+              "private": True,
+              "dependencies": root.get("dependencies", {}),
+          }, open(os.path.join(work, "package.json"), "w"))
+          PYEOF
+            echo "::group::npm audit $name"
+            ( cd "$work" && npm audit --package-lock-only --audit-level=high ) || rc=1
+            echo "::endgroup::"
+          done
+          exit $rc
+
   cross-compile:
     runs-on: ubuntu-latest
     needs: test

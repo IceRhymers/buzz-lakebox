@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/IceRhymers/buzz-lakebox/internal/payload"
 	"github.com/IceRhymers/buzz-lakebox/internal/shellquote"
 )
 
@@ -396,4 +397,55 @@ func TestSandboxAuthSnippet_DerivationIsAllOrNothing(t *testing.T) {
 			t.Errorf("owner-supplied credentials must both win, got host=%q token=%q", res.host, res.token)
 		}
 	})
+}
+
+// TestRenderEnv_SandboxAuthPrecedesRuntimeSnippets pins the ordering the
+// all-or-nothing derivation depends on, and it exists because that property
+// is weaker than it looks.
+//
+// "Derive both or neither" prevents a payload from pairing its own endpoint
+// with the sandbox's owner token only because nothing sets DATABRICKS_HOST
+// between the env_vars block and SandboxAuthSnippet. That is a REACHABILITY
+// argument, not a positive invariant: a provenance marker would survive
+// refactoring, whereas this holds only while the render order does. If a
+// future runtime snippet ever derived a host before SandboxAuthSnippet ran,
+// the guard would see a non-empty DATABRICKS_HOST, decline to derive, and
+// the property would die with no other test failing.
+//
+// So the order is asserted directly. If this test fails, do not reorder to
+// make it pass without re-checking TestSandboxAuthSnippet_DerivationIsAllOrNothing
+// against the new arrangement.
+func TestRenderEnv_SandboxAuthPrecedesRuntimeSnippets(t *testing.T) {
+	for _, tc := range []struct {
+		rt      payload.Runtime
+		snippet string
+		name    string
+	}{
+		{payload.RuntimeClaude, ClaudeEnvSnippet, "claude"},
+		{payload.RuntimeCodex, CodexEnvSnippet, "codex"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := claudeTestAgent()
+			agent.AgentCommand = string(tc.rt)
+			env := RenderEnv(agent, tc.rt, true)
+
+			iAuth := strings.Index(env, SandboxAuthSnippet)
+			iRt := strings.Index(env, tc.snippet)
+			if iAuth < 0 {
+				t.Fatal("SandboxAuthSnippet must be rendered in sandbox mode")
+			}
+			if iRt < 0 {
+				t.Fatalf("%s snippet must be rendered", tc.name)
+			}
+			if iAuth > iRt {
+				t.Errorf("SandboxAuthSnippet (at %d) must precede the %s snippet (at %d): the all-or-nothing derivation guard assumes nothing has set DATABRICKS_HOST before it runs", iAuth, tc.name, iRt)
+			}
+
+			// And no env_vars entry may be emitted after SandboxAuthSnippet,
+			// which is the other half of the same assumption.
+			if tail := env[iAuth:]; strings.Contains(tail, "\nexport DATABRICKS_HOST=") {
+				t.Error("DATABRICKS_HOST is exported after SandboxAuthSnippet; the derivation guard would see it already set")
+			}
+		})
+	}
 }
