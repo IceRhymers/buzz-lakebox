@@ -404,3 +404,112 @@ func TestCodexEnv_HostNormalization(t *testing.T) {
 		}
 	}
 }
+
+// TestCodexEnv_HostileHostWritesNoConfig is the TOML-injection regression
+// test. DATABRICKS_HOST arrives unvalidated from either source and is
+// interpolated into a TOML file, so a value carrying a quote and a newline
+// closes base_url and appends attacker-authored TOML — including a
+// [model_providers.*.auth] block whose `command` codex runs at startup,
+// with no shell tool, no permission request, and nothing in the transcript.
+//
+// Note this was never SHELL injection: the result of a parameter expansion
+// is not re-scanned, so `$(...)` in the value stays literal. Writing a
+// config this provider did not author is enough on its own.
+func TestCodexEnv_HostileHostWritesNoConfig(t *testing.T) {
+	hostile := []struct{ name, host string }{
+		{"quote and newline", "https://evil.example\"\n[model_providers.pwn.auth]\ncommand = \"sh\"\n#"},
+		{"bare newline", "https://evil.example\nkey = 1"},
+		{"command substitution", "https://evil.example$(id)"},
+		{"backtick", "https://evil.example`id`"},
+		{"space", "https://evil.example and more"},
+	}
+	for _, tc := range hostile {
+		t.Run(tc.name, func(t *testing.T) {
+			res := sourceCodexSnippet(t, t.TempDir(), map[string]string{
+				"DATABRICKS_HOST":  tc.host,
+				"DATABRICKS_TOKEN": "dapi-marker-secret",
+			}, codexStrictPrelude, false)
+
+			if res.exitCode != 0 {
+				t.Fatalf("a hostile host must not abort the launch, got exit %d", res.exitCode)
+			}
+			if res.exists {
+				t.Errorf("a host that is not URL-shaped must produce NO config, got:\n%s", res.config)
+			}
+			// And CODEX_HOME is still exported, so codex cannot fall back
+			// to the image's ~/.codex symlink.
+			if res.codexHome == "" {
+				t.Error("CODEX_HOME must still be exported when the host is refused")
+			}
+		})
+	}
+}
+
+// TestCodexEnv_WellFormedHostsStillAccepted keeps the charset gate from
+// becoming a denial of service against legitimate hosts.
+func TestCodexEnv_WellFormedHostsStillAccepted(t *testing.T) {
+	for _, host := range []string{
+		"https://dbc-31174ae0-1a02.cloud.databricks.com",
+		"dbc-31174ae0-1a02.cloud.databricks.com",
+		"http://localhost:8080",
+		"https://example.databricks.com/",
+		"https://my_workspace.example.com",
+	} {
+		res := sourceCodexSnippet(t, t.TempDir(), map[string]string{
+			"DATABRICKS_HOST":  host,
+			"DATABRICKS_TOKEN": "dapi-marker-secret",
+		}, codexStrictPrelude, false)
+		if !res.exists {
+			t.Errorf("well-formed host %q must still produce a config", host)
+		}
+	}
+}
+
+// TestCodexEnv_FailClosedWhenRemovalAndMktempBothFail covers the
+// correlated double failure the first fallback missed: `rm -f` fails
+// because the tree is unwritable, and the first `mktemp -d` creates its
+// directory inside that SAME tree, so it fails for exactly the same
+// reason. A single attempt left CODEX_HOME pointed at the stale config
+// while writing nothing new — the precise "current token, previous host"
+// state this branch exists to prevent.
+func TestCodexEnv_FailClosedWhenRemovalAndMktempBothFail(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	home := t.TempDir()
+	codexDir := filepath.Join(home, ".buzz-backend", "codex")
+	if err := os.MkdirAll(codexDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(codexDir, "config.toml")
+	if err := os.WriteFile(stale, []byte("base_url = \"https://STALE-previous-host.example/v1\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Both the config's own directory AND its parent are unwritable, so
+	// the removal and the in-tree mktemp fail together.
+	if err := os.Chmod(codexDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(home, ".buzz-backend"), 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(filepath.Join(home, ".buzz-backend"), 0o700)
+		_ = os.Chmod(codexDir, 0o700)
+	})
+
+	res := sourceCodexSnippet(t, home, map[string]string{
+		"DATABRICKS_HOST":  "https://current.databricks.com",
+		"DATABRICKS_TOKEN": "dapi-marker-secret",
+	}, codexStrictPrelude, false)
+
+	if res.exitCode != 0 {
+		t.Fatalf("snippet must never abort the launch, got exit %d", res.exitCode)
+	}
+	if res.codexHome == codexDir {
+		t.Fatal("CODEX_HOME must be redirected away from the directory holding the un-removable stale config")
+	}
+	if res.exists && strings.Contains(res.config, "STALE-previous-host") {
+		t.Fatalf("the agent must never run against a config this launch did not write, got:\n%s", res.config)
+	}
+}

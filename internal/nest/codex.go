@@ -71,6 +71,31 @@ const CodexDefaultModel = "databricks-gpt-5-3-codex"
 // DID NOT WRITE. Re-asserting on every launch mirrors what launch.sh already
 // does with the PAT stub, and for the same reason.
 //
+// The removal's fallback is itself chained, because the two failures are
+// correlated by construction: `rm -f` fails when the tree is unwritable, and
+// the first `mktemp -d` creates its directory inside that same tree, so it
+// fails for exactly the same reason. A single attempt left CODEX_HOME on the
+// stale config while writing nothing new — the precise state this branch
+// exists to prevent. It now tries the provider tree, then $TMPDIR, then a
+// path that cannot hold a config because it does not exist. An empty or
+// absent CODEX_HOME is safe: probe S11 confirms `initialize` still succeeds,
+// and the inference probe reports "unset", which fails the deploy loudly.
+//
+// HOST VALIDATION. DATABRICKS_HOST is interpolated into a TOML file and
+// arrives unvalidated from both sources — payload env_vars in "env" mode,
+// and the sandbox's own ~/.databrickscfg in "sandbox" mode, which no
+// payload-side check can see. A value carrying a quote and a newline closes
+// base_url and appends attacker-authored TOML, including a
+// [model_providers.*.auth] block whose `command` codex executes at startup:
+// no shell tool, no session/request_permission, nothing in the transcript.
+//
+// This was never SHELL injection — the result of a parameter expansion is
+// not re-scanned, so `$(...)` in the value stays literal, and env_vars keys
+// are separately charset-gated by payload.Agent.Validate. Writing a config
+// this provider did not author is enough on its own. Anything outside
+// [A-Za-z0-9.:/_-] therefore produces NO file, so the deploy fails closed
+// as "unset" rather than launching against a controlled config.
+//
 // WHAT IS DELIBERATELY NOT EMITTED: sandbox_mode and approval_policy. Both
 // are INERT under @agentclientprotocol/codex-acp@1.1.7, and not merely
 // unobserved-to-work: the adapter applies an AgentMode preset per session
@@ -131,11 +156,23 @@ if [ -z "${CODEX_HOME:-}" ]; then
   if [ -e "$buzz_codex_cfg" ]; then
     # Removal failed (non-writable dir, immutable attr, ENOTDIR). Do NOT
     # fall through to the gate: redirect to a directory that is clean by
-    # construction and write nothing.
+    # construction and write nothing. The two failures are correlated — the
+    # removal fails because the tree is unwritable, and the first mktemp
+    # creates its directory inside that same tree — so a single attempt
+    # would silently leave CODEX_HOME on the stale config.
     buzz_codex_alt=$(mktemp -d "$HOME/.buzz-backend/codex.XXXXXX" 2>/dev/null) || buzz_codex_alt=
-    if [ -n "$buzz_codex_alt" ]; then
-      export CODEX_HOME="$buzz_codex_alt"
+    if [ -z "$buzz_codex_alt" ]; then
+      buzz_codex_alt=$(mktemp -d 2>/dev/null) || buzz_codex_alt=
     fi
+    if [ -z "$buzz_codex_alt" ]; then
+      # Last resort: a path that CANNOT hold a stale config because it does
+      # not exist. codex finds no config.toml, the probe reports "unset",
+      # and the deploy fails closed — which is the correct outcome, and
+      # strictly better than running against a config this launch did not
+      # write.
+      buzz_codex_alt="$CODEX_HOME/buzz-unavailable.$$"
+    fi
+    export CODEX_HOME="$buzz_codex_alt"
   elif [ -n "${DATABRICKS_HOST:-}" ]; then
     buzz_codex_h="${DATABRICKS_HOST:-}"
     case "$buzz_codex_h" in
@@ -143,6 +180,20 @@ if [ -z "${CODEX_HOME:-}" ]; then
       *) buzz_codex_h="https://$buzz_codex_h" ;;
     esac
     buzz_codex_url="${buzz_codex_h%/}/ai-gateway/codex/v1"
+    # Refuse anything that is not URL-shaped. DATABRICKS_HOST reaches here
+    # unvalidated from either source, and it is interpolated into a TOML
+    # file: a value carrying a quote and a newline would close base_url and
+    # append attacker-authored TOML, including a [model_providers.*.auth]
+    # block whose command runs at codex startup. This is not a shell
+    # injection (the result of a parameter expansion is not re-scanned),
+    # but writing a config we did not author is enough on its own. An
+    # invalid host produces NO file, so the deploy fails closed as "unset"
+    # rather than launching against a controlled config.
+    case "$buzz_codex_url" in
+      *[!A-Za-z0-9.:/_-]*) buzz_codex_url= ;;
+    esac
+  fi
+  if [ -n "${buzz_codex_url:-}" ]; then
     # Subshell so the umask does not leak into the rest of launch.sh.
     (
       umask 077
