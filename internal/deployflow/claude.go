@@ -170,6 +170,21 @@ fi
 # The bearer goes in a 0600 config file, never in argv: this probe runs
 # BEFORE the prelaunch kill, so a previous deploy's agent may still be alive
 # in this sandbox, and /proc/<pid>/cmdline is readable by the same uid.
+#
+# But a config file is PARSED, so the token is charset-gated first. curl's
+# -K config syntax treats an embedded quote-newline as the end of one directive and
+# the start of another, so a crafted token can append a url directive and make
+# curl issue a SECOND request replaying this Authorization header and the
+# request body to an attacker's endpoint (verified against curl 8.20). It
+# also decodes backslash escapes inside double quotes, silently corrupting
+# an otherwise valid token into a false "auth" diagnosis. Anything outside
+# the base64url/PAT charset fails closed as "unset" instead.
+case "${ANTHROPIC_AUTH_TOKEN:-}" in
+  *[!A-Za-z0-9._~+/=-]*)
+    echo "%sunset"
+    exit 1
+    ;;
+esac
 printf 'header = "Authorization: Bearer %%s"\n' "${ANTHROPIC_AUTH_TOKEN}" > "$BUZZ_PROBE_HDR"
 
 BUZZ_PROBE_CODE=$(curl -sS -o /dev/null -w '%%{http_code}' --max-time 30 \
@@ -199,7 +214,7 @@ case "$BUZZ_PROBE_CODE" in
     ;;
   *) exit 0 ;;
 esac
-`, claudeProbeCauseMarkerPrefix, claudeProbeModel, claudeProbeCauseMarkerPrefix, claudeProbeCauseMarkerPrefix)
+`, claudeProbeCauseMarkerPrefix, claudeProbeCauseMarkerPrefix, claudeProbeModel, claudeProbeCauseMarkerPrefix, claudeProbeCauseMarkerPrefix)
 }
 
 // claudeProbeCauseMessage renders a human diagnosis for one of the probe's

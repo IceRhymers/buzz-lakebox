@@ -207,6 +207,16 @@ func TestSandboxAuthSnippet_MissingFile(t *testing.T) {
 	}
 }
 
+// TestSandboxAuthSnippet_TokenLineMissing pins that a cfg carrying a host
+// line and no token line derives NEITHER.
+//
+// This assertion was inverted until the all-or-nothing fix: it required the
+// host to still be derived. That was the same half-pair shape as the
+// credential-egress defect on the inherited-value side — deriving one half
+// of a credential pair is never useful. A host with no token cannot
+// authenticate, so it produces an agent that fails at first mention rather
+// than at deploy time; deriving nothing makes the inference probe report
+// "unset" and fail the deploy loudly instead.
 func TestSandboxAuthSnippet_TokenLineMissing(t *testing.T) {
 	requireShAndAwk(t)
 	cfg := "[DEFAULT]\nhost = https://notoken.databricks.com\n"
@@ -214,11 +224,8 @@ func TestSandboxAuthSnippet_TokenLineMissing(t *testing.T) {
 	if res.exitCode != 0 {
 		t.Fatalf("expected exit 0, got %d", res.exitCode)
 	}
-	if res.host != "https://notoken.databricks.com" {
-		t.Fatalf("host = %q, want it still derived", res.host)
-	}
-	if res.token != "" {
-		t.Fatalf("token = %q, want empty when the cfg has no token line", res.token)
+	if res.host != "" || res.token != "" {
+		t.Fatalf("got host=%q token=%q, want NEITHER derived from a half-populated cfg", res.host, res.token)
 	}
 }
 

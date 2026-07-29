@@ -6,6 +6,7 @@ package payload
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
@@ -136,6 +137,24 @@ func (a Agent) Validate() error {
 	if a.RelayURL == "" {
 		return fmt.Errorf("agent.relay_url must not be empty")
 	}
+	// Parsed, not merely non-empty, and this is a silent-agent guard rather
+	// than tidiness. buzz-acp's codex_network_env does Url::parse on this
+	// value and returns None on failure, skipping the CODEX_CONFIG
+	// injection that grants codex's MCP subprocess outbound network
+	// (block/buzz crates/buzz-acp/src/config.rs:717-749). Since the MCP
+	// subprocess is how a codex agent answers a mention, a
+	// malformed-but-non-empty relay_url yields an agent that installs,
+	// handshakes, passes the inference probe, and is then permanently
+	// silent — with nothing on the provider side reporting a problem.
+	//
+	// Upstream accepts ws/wss/http/https here; we require a scheme and a
+	// host and nothing more, so this rejects only what upstream would also
+	// fail to parse.
+	if u, err := url.Parse(a.RelayURL); err != nil || u.Host == "" {
+		return fmt.Errorf("agent.relay_url %q is not a parseable URL with a host; buzz-acp silently skips the codex network injection for URLs it cannot parse, which produces an agent that deploys clean and never answers", a.RelayURL)
+	} else if u.Scheme != "ws" && u.Scheme != "wss" && u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("agent.relay_url scheme %q is not one of ws, wss, http, https", u.Scheme)
+	}
 	if _, ok := RuntimeFor(a.AgentCommand); !ok {
 		return unsupportedRuntimeError(a.AgentCommand)
 	}
@@ -146,6 +165,23 @@ func (a Agent) Validate() error {
 	// choke point both deploy entry points (provider.handleDeploy and
 	// deployflow.Deploy) route through via DeployRequest.Validate().
 	for key := range a.EnvVars {
+		// The provider owns the lowercase buzz_ namespace across three
+		// shell snippets (SandboxAuthSnippet, ClaudeEnvSnippet,
+		// CodexEnvSnippet), whose scratch variables all match the key
+		// charset below and are therefore settable from a payload. Those
+		// snippets render AFTER env_vars, so an inherited value is visible
+		// to them — and one such variable gating a config write is exactly
+		// how a charset gate got bypassed once already.
+		//
+		// Each snippet also initializes its own scratch variables, which is
+		// the real fix; this closes the class so the next snippet author
+		// does not have to remember the rule.
+		if strings.HasPrefix(key, "buzz_") {
+			return fmt.Errorf(
+				"env_vars key %q uses the buzz_ prefix, which is reserved for this provider's own shell scratch variables; rename it",
+				key,
+			)
+		}
 		if !envVarKeyPattern.MatchString(key) {
 			return fmt.Errorf(
 				"env_vars key %q is not a valid environment variable name; only names matching ^[A-Za-z_][A-Za-z0-9_]*$ are allowed",
@@ -191,33 +227,53 @@ func (r DeployRequest) Validate() error {
 	return nil
 }
 
-// ownerPATForbiddenEnvKeys are exact env_vars names refused whenever a
-// workspace-owner credential is reachable in the sandbox
-// (ProviderConfig.OwnerPATInSandbox). Each either decides WHERE that
-// credential is sent or WHAT code receives it.
-var ownerPATForbiddenEnvKeys = []string{
-	// The endpoint half of the credential pair. SandboxAuthSnippet now
-	// derives host and token all-or-nothing, so supplying a host alone can
-	// no longer inherit the sandbox token — this makes the same case fail
-	// loudly here, before provisioning, with an error that names the real
-	// problem instead of surfacing later as an "unset" probe failure.
+// THE INVARIANT THESE LISTS ENFORCE, stated once because three separate
+// mistakes came from not having it written down:
+//
+//	agent.env_vars render LAST and win over everything the provider emits.
+//	So the question is never "does an adapter read this" — it is "does this
+//	decide where the credential goes, or what code runs beside it".
+//
+// An earlier version reasoned only about variables the codex ADAPTER reads,
+// which missed both the loader class (NODE_OPTIONS, LD_PRELOAD) and the
+// provider's own emitted variables (BUZZ_ACP_AGENT_COMMAND) — the latter
+// being the most direct lever of all.
+//
+// The two lists are gated on DIFFERENT conditions, and conflating them was
+// itself a defect. See validateOwnerPATEnvVars.
+
+// credentialPairEnvKeys decide WHERE the provider-derived credential is
+// sent. They are refused only under inference_auth="sandbox", because that
+// is the only mode in which the provider derives the sandbox's baked
+// owner PAT into the agent's environment at all (nest.RenderEnv renders
+// SandboxAuthSnippet for that mode and no other).
+//
+// Under keep_workspace_pat with inference_auth="env" the provider derives
+// nothing: the token in the agent's environment is the owner's own,
+// supplied in the same payload, going to their own host. Refusing these
+// there blocks the ONLY working inference configuration for buzz-agent —
+// which reads DATABRICKS_HOST/DATABRICKS_TOKEN directly and has no
+// bring-your-own-endpoint alternative — while preventing nothing.
+//
+// Enumerated rather than a DATABRICKS_ prefix on purpose: DATABRICKS_MODEL
+// is a legitimate env_vars entry that RenderEnv itself emits for
+// buzz-agent, and a prefix rule would reject it.
+var credentialPairEnvKeys = []string{
 	"DATABRICKS_HOST", "DATABRICKS_TOKEN",
-	// Interception: a proxy the agent's inference client honours sees
-	// (or, with a supplied CA, terminates) requests carrying the token.
-	"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
-	"http_proxy", "https_proxy", "all_proxy", "no_proxy",
-	// Trust-store substitution, which is what turns a proxy into a
-	// cleartext read of the bearer.
-	"SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
-	"NODE_EXTRA_CA_CERTS",
-	// Command resolution for anything the agent shells out to.
-	"PATH", "SHELL", "BASH_ENV", "ENV", "IFS",
+	// Alternate paths to a workspace credential, and the file the
+	// derivation reads.
+	"DATABRICKS_CONFIG_FILE", "DATABRICKS_CLIENT_ID", "DATABRICKS_CLIENT_SECRET",
+	// The claude runtime's own pair. Its snippet leaves both untouched when
+	// supplied together, so in sandbox mode these would point the agent —
+	// and the inference probe's own request — at an endpoint of the
+	// payload's choosing while the provider supplies the credential.
+	"ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
 }
 
 // ownerPATForbiddenEnvPrefixes are env_vars name PREFIXES refused under the
-// same condition. These are loader-class variables: they choose code that
-// runs inside a process holding the credential, before that process's own
-// code does.
+// same condition as ownerPATForbiddenEnvKeys. These are loader-class
+// variables: they choose code that runs inside the process holding the
+// credential, before that process's own code does.
 //
 // A prefix rule rather than a name list is deliberate. NODE_OPTIONS with an
 // `--import=data:text/javascript,...` URL executes arbitrary attacker code
@@ -232,6 +288,36 @@ var ownerPATForbiddenEnvPrefixes = []string{
 	"npm_config_", // registry/CA/prefix redirection
 	"PYTHON",      // PYTHONPATH / PYTHONSTARTUP for python children
 	"GIT_",        // git-credential-nostr and any repo tooling
+}
+
+// ownerPATForbiddenEnvKeys decide WHAT CODE runs in a process that can
+// reach a workspace-owner credential. They are refused whenever such a
+// credential is reachable at all (ProviderConfig.OwnerPATInSandbox), which
+// includes keep_workspace_pat: there the baked PAT stays in
+// ~/.databrickscfg, and the image's own ~/.codex/config.toml symlink has an
+// auth.command that reads it straight back out (probe S2).
+var ownerPATForbiddenEnvKeys = []string{
+	// The programs buzz-acp spawns. RenderEnv emits all three BEFORE the
+	// env_vars block, so an owner-supplied value wins — making these the
+	// most direct lever in the whole surface, needing no loader trick and
+	// nothing on disk: BUZZ_ACP_AGENT_COMMAND=sh with
+	// BUZZ_ACP_AGENT_ARGS=-c,<exfiltrate> is complete on its own, using
+	// only image-resident binaries. BUZZ_ACP_AGENT_COMMAND additionally
+	// defeats the spawn-command canonicalization the entire ucode-wrapper
+	// defense rests on: whatever agent_command said, this is what runs.
+	"BUZZ_ACP_AGENT_COMMAND", "BUZZ_ACP_AGENT_ARGS", "BUZZ_ACP_MCP_COMMAND",
+	// Interception: a proxy the agent's inference client honours sees
+	// (or, with a supplied CA, terminates) requests carrying the token.
+	"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+	"http_proxy", "https_proxy", "all_proxy", "no_proxy",
+	// Trust-store substitution, which is what turns a proxy into a
+	// cleartext read of the bearer.
+	"SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+	"NODE_EXTRA_CA_CERTS",
+	// Command resolution and process layout. HOME relocates
+	// ~/.databrickscfg, $CODEX_HOME, the launch lock, and the path
+	// launch.sh execs buzz-acp from.
+	"PATH", "SHELL", "BASH_ENV", "ENV", "IFS", "HOME",
 }
 
 // validateOwnerPATEnvVars refuses payload-supplied environment that could
@@ -257,9 +343,6 @@ var ownerPATForbiddenEnvPrefixes = []string{
 // credential — they can simply ask the agent to print it, and the answer
 // returns over the relay as ordinary transcript text. See docs/PLAN.md §5.
 func (r DeployRequest) validateOwnerPATEnvVars() error {
-	if !r.ProviderConfig.OwnerPATInSandbox() {
-		return nil
-	}
 	// Sorted so the reported key is deterministic when a payload sets
 	// several; map iteration order would otherwise vary between runs.
 	keys := make([]string, 0, len(r.Agent.EnvVars))
@@ -270,17 +353,27 @@ func (r DeployRequest) validateOwnerPATEnvVars() error {
 
 	for _, key := range keys {
 		var why string
-		for _, forbidden := range ownerPATForbiddenEnvKeys {
-			if key == forbidden {
-				why = "it decides where that credential is sent or what receives it"
-				break
+		if r.ProviderConfig.SandboxInferenceAuth() {
+			for _, forbidden := range credentialPairEnvKeys {
+				if key == forbidden {
+					why = "it decides where this provider sends the credential it derived"
+					break
+				}
 			}
 		}
-		if why == "" {
-			for _, prefix := range ownerPATForbiddenEnvPrefixes {
-				if strings.HasPrefix(key, prefix) {
-					why = "variables starting with " + prefix + " choose code that runs inside the process holding that credential"
+		if why == "" && r.ProviderConfig.OwnerPATInSandbox() {
+			for _, forbidden := range ownerPATForbiddenEnvKeys {
+				if key == forbidden {
+					why = "it decides what code runs in a process that can reach that credential"
 					break
+				}
+			}
+			if why == "" {
+				for _, prefix := range ownerPATForbiddenEnvPrefixes {
+					if strings.HasPrefix(key, prefix) {
+						why = "variables starting with " + prefix + " choose code that runs inside the process holding that credential"
+						break
+					}
 				}
 			}
 		}
@@ -394,7 +487,12 @@ func (r DeployRequest) validateCodexInferenceSource() error {
 	if !ok || rt != RuntimeCodex {
 		return nil
 	}
-	if !r.ProviderConfig.SandboxInferenceAuth() {
+	// OwnerPATInSandbox, not SandboxInferenceAuth: keep_workspace_pat=true
+	// leaves the baked PAT in ~/.databrickscfg, where the image's own
+	// ~/.codex/config.toml symlink has an auth.command that reads it back
+	// out (probe S2). Gating on one of the two causes rather than the
+	// condition is the shape of the bug this whole round was about.
+	if !r.ProviderConfig.OwnerPATInSandbox() {
 		return nil
 	}
 	for _, key := range codexAdapterEnvVars {

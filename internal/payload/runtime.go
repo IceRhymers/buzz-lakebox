@@ -136,12 +136,22 @@ type EnvShape struct {
 	//
 	// Matching upstream exactly here matters more than it looks. Desktop's
 	// discovery table sets mcp_command Some("buzz-dev-mcp") for BOTH
-	// buzz-agent and codex, and None only for claude — Claude Code ships a
-	// shell that can run `buzz messages send` itself, whereas codex's tool
-	// calls run under the adapter's workspaceWrite/no-network sandbox, so
-	// its shell cannot reach the relay. The MCP subprocess is how a codex
-	// agent talks back at all, which is also why buzz-acp injects
-	// CODEX_CONFIG network_access for exactly this runtime.
+	// buzz-agent and codex, and None only for claude: Claude Code ships its
+	// own unsandboxed shell and can run `buzz messages send` directly,
+	// while codex has no equivalent path to the buzz CLI.
+	//
+	// Be careful with the mechanism, because a plausible-sounding version of
+	// it is wrong. The MCP subprocess is NOT a privileged channel around
+	// codex's sandbox — upstream's own comment (config.rs:697-701) says
+	// codex sandboxes MCP subprocesses INCLUDING buzz-cli, and that without
+	// the CODEX_CONFIG injection "buzz-cli requests are blocked before they
+	// can reach the relay WebSocket". The subprocess and the shell are under
+	// the same policy; the injection is what opens it. So this variable and
+	// buzz-acp's network injection are two halves of one mechanism, and
+	// neither works alone.
+	//
+	// That coupling is why Agent.Validate parses relay_url: the injection is
+	// skipped entirely when the URL cannot be parsed.
 	//
 	// Withholding it from codex produces an agent that installs, handshakes,
 	// probes clean, and then never answers — the silent-agent failure

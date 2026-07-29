@@ -185,10 +185,13 @@ if [ -z "${DATABRICKS_TOKEN:-}" ] && [ -z "${DATABRICKS_HOST:-}" ] && [ -r "$HOM
   buzz_host=$(awk -v want=host "$buzz_awk_extract" "$HOME/.databrickscfg" 2>/dev/null || true)
   buzz_token=$(awk -v want=token "$buzz_awk_extract" "$HOME/.databrickscfg" 2>/dev/null || true)
 
-  if [ -z "${DATABRICKS_HOST:-}" ] && [ -n "$buzz_host" ]; then
+  # Both or neither, matching the outer guard: a cfg carrying a token line
+  # and no host line must not export the token alone. In sandbox mode the
+  # auth probe catches that first, so this is the second of two defenses —
+  # but the comment above is the specification, and code that does not meet
+  # its own specification is what survives the next refactor.
+  if [ -n "$buzz_host" ] && [ -n "$buzz_token" ]; then
     export DATABRICKS_HOST="$buzz_host"
-  fi
-  if [ -n "$buzz_token" ]; then
     export DATABRICKS_TOKEN="$buzz_token"
   fi
 fi

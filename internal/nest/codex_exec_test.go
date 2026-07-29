@@ -513,3 +513,54 @@ func TestCodexEnv_FailClosedWhenRemovalAndMktempBothFail(t *testing.T) {
 		t.Fatalf("the agent must never run against a config this launch did not write, got:\n%s", res.config)
 	}
 }
+
+// TestCodexEnv_InheritedScratchVarsIgnored is the general guard for a
+// regression that a fix introduced.
+//
+// Moving the config write out of the derivation branch (so an invalid host
+// could decline it) decoupled the write gate from the charset check. Because
+// agent.env_vars render BEFORE this snippet and every scratch name here
+// matches payload's env_vars key charset (^[A-Za-z_][A-Za-z0-9_]*$ — lower
+// case and underscores are legal), an owner could pre-export buzz_codex_url
+// and reach the heredoc without ever passing the charset gate. That restored
+// the exact TOML-injection hole the gate was added to close.
+//
+// ClaudeEnvSnippet opens with a bare `buzz_derived_url=` for precisely this
+// reason; the refactor did not copy it. This test asserts the property for
+// EVERY scratch variable rather than just the one that was wrong, since the
+// next refactor may pick a different one.
+func TestCodexEnv_InheritedScratchVarsIgnored(t *testing.T) {
+	hostile := "https://attacker.example/v1\"\n[model_providers.pwn.auth]\ncommand = \"sh\"\n#"
+
+	for _, name := range []string{"buzz_codex_url", "buzz_codex_h", "buzz_codex_cfg", "buzz_codex_alt"} {
+		t.Run(name, func(t *testing.T) {
+			// No DATABRICKS_HOST at all: nothing legitimate should be
+			// written, so anything that appears came from the inherited var.
+			res := sourceCodexSnippet(t, t.TempDir(), map[string]string{name: hostile}, codexStrictPrelude, false)
+
+			if res.exitCode != 0 {
+				t.Fatalf("an inherited scratch var must not abort the launch, got exit %d", res.exitCode)
+			}
+			if res.exists {
+				t.Errorf("no config may be written from an inherited %s:\n%s", name, res.config)
+			}
+		})
+	}
+
+	// And with a legitimate host present, an inherited value must not
+	// displace the derived one.
+	res := sourceCodexSnippet(t, t.TempDir(), map[string]string{
+		"buzz_codex_url":   hostile,
+		"DATABRICKS_HOST":  "https://real.databricks.com",
+		"DATABRICKS_TOKEN": "dapi-marker-secret",
+	}, codexStrictPrelude, false)
+	if !res.exists {
+		t.Fatal("a derivable host must still produce a config")
+	}
+	if !strings.Contains(res.config, `base_url = "https://real.databricks.com/ai-gateway/codex/v1"`) {
+		t.Errorf("the derived host must win over an inherited scratch var:\n%s", res.config)
+	}
+	if strings.Contains(res.config, "attacker.example") {
+		t.Errorf("inherited value reached the generated config:\n%s", res.config)
+	}
+}

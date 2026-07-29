@@ -146,6 +146,15 @@ const CodexEnvSnippet = `# Codex inference via the workspace AI Gateway. Appende
 # base URL was derived here, and any previous one is removed first, so a
 # stale config from an earlier deploy can never outlive its host.
 if [ -z "${CODEX_HOME:-}" ]; then
+  # Never trust an inherited value for ANY scratch variable here: env_vars
+  # render before this snippet, and every name below matches the env_vars
+  # key charset, so an owner can pre-export them. buzz_codex_url gates the
+  # write, so an inherited one would reach the heredoc without passing the
+  # charset check that lives in the derivation branch. ClaudeEnvSnippet
+  # opens with the same bare initialization for the same reason.
+  buzz_codex_url=
+  buzz_codex_h=
+  buzz_codex_alt=
   # Exported even when no config is written: without it codex falls back to
   # ~/.codex/config.toml, which in this image is a symlink to the baked
   # gateway config that reads the workspace PAT out of ~/.databrickscfg.

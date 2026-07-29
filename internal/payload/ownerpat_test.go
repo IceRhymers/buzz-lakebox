@@ -155,3 +155,134 @@ func TestValidate_OwnerPATRejectionIsDeterministic(t *testing.T) {
 		}
 	}
 }
+
+// TestValidate_KeepWorkspacePATEnvModePermitsCredentialPair is the
+// regression test for a fix that over-corrected.
+//
+// A first pass gated BOTH lists on OwnerPATInSandbox(). That broke the only
+// working inference configuration for buzz-agent under
+// keep_workspace_pat: true + inference_auth: "env" — it reads
+// DATABRICKS_HOST/DATABRICKS_TOKEN directly and has no bring-your-own
+// endpoint alternative, so rejecting them left it undeployable, and made
+// the RUNBOOK §9 PAT-opt-out acceptance step unrunnable.
+//
+// The distinction the two tiers encode: in "env" mode the provider renders
+// no SandboxAuthSnippet and derives nothing, so the token in the agent's
+// environment is the owner's own. There is no provider-supplied credential
+// to misdirect, and the escalation is structurally impossible.
+func TestValidate_KeepWorkspacePATEnvModePermitsCredentialPair(t *testing.T) {
+	for _, runtime := range []string{"buzz-agent", "claude-code", "codex-acp"} {
+		req := ownerPATReq(runtime, map[string]string{
+			"DATABRICKS_HOST":  "https://mine.example",
+			"DATABRICKS_TOKEN": "dapi-my-own",
+		}, ProviderConfig{InferenceAuth: "env", KeepWorkspacePAT: true})
+		if err := req.Validate(); err != nil {
+			t.Errorf("%s: keep_workspace_pat in env mode derives nothing, so the owner's own credential pair must be permitted: %v", runtime, err)
+		}
+	}
+}
+
+// TestValidate_KeepWorkspacePATStillBlocksCodeSelection pins the other half:
+// keep_workspace_pat leaves the baked PAT in ~/.databrickscfg, where the
+// image's ~/.codex symlink reads it back out (probe S2). So variables that
+// choose what CODE runs are still refused there, even though the credential
+// pair is not.
+func TestValidate_KeepWorkspacePATStillBlocksCodeSelection(t *testing.T) {
+	for _, key := range []string{"NODE_OPTIONS", "LD_PRELOAD", "PATH", "HOME", "BUZZ_ACP_AGENT_COMMAND", "HTTPS_PROXY"} {
+		req := ownerPATReq("codex-acp", map[string]string{key: "x"},
+			ProviderConfig{InferenceAuth: "env", KeepWorkspacePAT: true})
+		if err := req.Validate(); err == nil {
+			t.Errorf("env_vars.%s must still be refused under keep_workspace_pat: the baked PAT is reachable in the sandbox", key)
+		}
+	}
+}
+
+// TestValidate_ProviderEmittedCommandVarsRejected covers the most direct
+// lever in the whole surface, and the one an adapter-derived denylist would
+// never have contained.
+//
+// RenderEnv emits these itself, in the fixed block, BEFORE env_vars — so an
+// owner-supplied value wins on `.`-source. buzz-acp then spawns exactly what
+// they name, as a child holding the derived credential.
+// BUZZ_ACP_AGENT_COMMAND=sh with BUZZ_ACP_AGENT_ARGS=-c,<exfiltrate> needs no
+// loader trick and nothing written to disk, and it also defeats the
+// spawn-command canonicalization the ucode-wrapper defense depends on.
+func TestValidate_ProviderEmittedCommandVarsRejected(t *testing.T) {
+	for _, key := range []string{"BUZZ_ACP_AGENT_COMMAND", "BUZZ_ACP_AGENT_ARGS", "BUZZ_ACP_MCP_COMMAND"} {
+		for _, cfg := range []ProviderConfig{
+			{InferenceAuth: "sandbox"},
+			{InferenceAuth: "env", KeepWorkspacePAT: true},
+		} {
+			req := ownerPATReq("codex-acp", map[string]string{key: "sh"}, cfg)
+			if err := req.Validate(); err == nil {
+				t.Errorf("env_vars.%s must be rejected (inference_auth=%q keep_pat=%v): it names the program buzz-acp spawns beside the credential",
+					key, cfg.InferenceAuth, cfg.KeepWorkspacePAT)
+			}
+		}
+	}
+}
+
+// TestValidate_DatabricksModelStillAllowed keeps the credential-pair list
+// from becoming a DATABRICKS_ prefix rule. DATABRICKS_MODEL is a legitimate
+// env_vars entry that RenderEnv itself emits for buzz-agent, and a prefix
+// would have rejected it.
+func TestValidate_DatabricksModelStillAllowed(t *testing.T) {
+	req := ownerPATReq("buzz-agent", map[string]string{"DATABRICKS_MODEL": "databricks-claude-opus-4-8"},
+		ProviderConfig{InferenceAuth: "sandbox"})
+	if err := req.Validate(); err != nil {
+		t.Errorf("DATABRICKS_MODEL selects a model, not a credential destination: %v", err)
+	}
+}
+
+// TestValidate_BuzzScratchNamespaceReserved closes the class behind a
+// CRITICAL that a fix introduced: a restructuring left CodexEnvSnippet's
+// buzz_codex_url readable before assignment, and because env_vars render
+// BEFORE the snippets and buzz_codex_url matches the env-var key charset, a
+// payload could pre-export it and drive the config write past the host
+// charset gate.
+//
+// Each snippet now initializes its own scratch variables, which is the
+// actual fix. This is the belt: the provider owns the lowercase buzz_
+// namespace across three snippets, and the next snippet author will not
+// remember the rule.
+func TestValidate_BuzzScratchNamespaceReserved(t *testing.T) {
+	for _, key := range []string{"buzz_codex_url", "buzz_codex_h", "buzz_derived_url", "buzz_host", "buzz_token"} {
+		req := ownerPATReq("codex-acp", map[string]string{key: "x"}, ProviderConfig{})
+		err := req.Validate()
+		if err == nil {
+			t.Errorf("env_vars.%s must be rejected: it collides with a provider shell scratch variable", key)
+			continue
+		}
+		if !strings.Contains(err.Error(), "reserved") {
+			t.Errorf("rejection for %s should explain the namespace, got: %v", key, err)
+		}
+	}
+	// Uppercase BUZZ_ is buzz-acp's real configuration surface and must
+	// still be reachable — the reservation is the lowercase scratch prefix.
+	if err := ownerPATReq("codex-acp", map[string]string{"BUZZ_ACP_DEDUP": "queue"}, ProviderConfig{}).Validate(); err != nil {
+		t.Errorf("uppercase BUZZ_ variables are buzz-acp configuration, not scratch: %v", err)
+	}
+}
+
+// TestValidate_RelayURLMustParse guards the last silent-agent path the
+// provider can close by itself. buzz-acp's codex_network_env does
+// Url::parse on relay_url and returns None on failure, skipping the
+// CODEX_CONFIG injection that grants codex's MCP subprocess outbound
+// network — and that subprocess is how a codex agent answers. A
+// malformed-but-non-empty value therefore deploys clean and never answers.
+func TestValidate_RelayURLMustParse(t *testing.T) {
+	for _, bad := range []string{"not a url", "relay.example.com", "://nohost", "wss://"} {
+		req := ownerPATReq("codex-acp", nil, ProviderConfig{})
+		req.Agent.RelayURL = bad
+		if err := req.Validate(); err == nil {
+			t.Errorf("relay_url %q must be rejected: buzz-acp silently skips the codex network injection for URLs it cannot parse", bad)
+		}
+	}
+	for _, good := range []string{"wss://relay.example.com", "ws://localhost:3000", "https://relay.example.com/path"} {
+		req := ownerPATReq("codex-acp", nil, ProviderConfig{})
+		req.Agent.RelayURL = good
+		if err := req.Validate(); err != nil {
+			t.Errorf("relay_url %q should be accepted: %v", good, err)
+		}
+	}
+}
