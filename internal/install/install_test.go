@@ -144,3 +144,69 @@ func TestBuildVerifyCommand_RejectsHostilePaths(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildVerifyCommand_CodexHoldsStdinOpen pins a fix for what would have
+// been a total codex runtime failure, presented as a handshake error.
+//
+// The handshake is `printf FRAME | timeout N BIN`, so stdin closes the
+// instant the frame is written. claude-agent-acp answers and exits 0 on
+// that EOF in ~355ms, which is what the original shape was measured
+// against. codex-acp does NOT: measured against the real published
+// adapter, `printf FRAME | codex-acp` exits 0 having written ZERO bytes,
+// while the same frame with stdin held open for even one second returns
+// the full initialize reply (690 bytes, agentInfo present).
+//
+// Without the hold, installAndVerify's AgentInfoMarker scan would find
+// nothing and EVERY codex deploy would die at CodeRuntimeVerify — whose
+// remedy text would then send the operator to look at inference variables
+// for a problem that has nothing to do with them.
+func TestBuildVerifyCommand_CodexHoldsStdinOpen(t *testing.T) {
+	cmd, err := BuildVerifyCommand(`$HOME/.buzz-backend/.env.verify`, 10, VerifySpecFor("codex-acp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A brace group, so the pipeline still has exactly one stdin source.
+	if !strings.Contains(cmd, "; sleep 2; } | timeout 10") {
+		t.Errorf("codex verify must hold stdin open after the frame, got:\n%s", cmd)
+	}
+}
+
+// TestBuildVerifyCommand_NonCodexUnchanged is the other half: the stdin
+// hold is per-runtime precisely so it does not perturb the two runtimes
+// that were already verified working. A global sleep would have added
+// latency to every deploy to fix one runtime's problem.
+func TestBuildVerifyCommand_NonCodexUnchanged(t *testing.T) {
+	for _, spawnCommand := range []string{"claude-agent-acp", "buzz-agent"} {
+		cmd, err := BuildVerifyCommand(`$HOME/.buzz-backend/.env.verify`, 10, VerifySpecFor(spawnCommand))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(cmd, "sleep") {
+			t.Errorf("%s answers on stdin EOF and must not pay for the codex hold:\n%s", spawnCommand, cmd)
+		}
+		if !strings.Contains(cmd, "printf '%s\\n' '"+InitializeFrame+"' | timeout 10") {
+			t.Errorf("%s verify pipeline changed shape:\n%s", spawnCommand, cmd)
+		}
+	}
+}
+
+// TestAdapterSpecs_VerifyStdinHoldDeclared makes the requirement explicit
+// for any future adapter: a new ACP adapter must state whether it answers a
+// stdin that closes with the frame, because getting it wrong ships a
+// runtime that installs cleanly and never handshakes.
+func TestAdapterSpecs_VerifyStdinHoldDeclared(t *testing.T) {
+	want := map[string]int{"claude-agent-acp": 0, "codex-acp": 2}
+	for spawnCommand, spec := range adapterSpecs {
+		expected, known := want[spawnCommand]
+		if !known {
+			t.Errorf("adapter %q has no declared stdin-hold expectation; measure it against the real adapter and add it here", spawnCommand)
+			continue
+		}
+		if spec.VerifyStdinHoldSeconds != expected {
+			t.Errorf("adapter %q VerifyStdinHoldSeconds = %d, want %d", spawnCommand, spec.VerifyStdinHoldSeconds, expected)
+		}
+		if got := VerifySpecFor(spawnCommand).StdinHoldSeconds; got != expected {
+			t.Errorf("adapter %q spec does not reach VerifySpec: got %d, want %d", spawnCommand, got, expected)
+		}
+	}
+}

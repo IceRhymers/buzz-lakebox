@@ -319,6 +319,25 @@ Corrects the working assumption that `DEFAULT_AUTH_REQUEST` was the most benign 
 
 ---
 
+## S13. The verify handshake's stdin shape is a codex correctness requirement 🚨 (offline, settles the S4/S11 tension)
+
+S4 recorded that "the adapter **requires stdin to stay open**; closing it immediately yields `rc=0` with no response at all (an easy false-negative when probing)". S11 then held stdin open for 6 s and got a clean reply, which read as reassurance. **It was not** — S11 simply avoided the case S4 warned about, and the shipped `install.BuildVerifyCommand` is the case S4 warned about.
+
+Measured offline against the real adapter, using the exact rendered pipeline:
+
+| stdin shape | rc | stdout | `agentInfo` |
+|---|---|---|---|
+| `printf FRAME \| timeout 10 codex-acp` (as shipped) | 0 | **0 bytes** | **absent** |
+| `{ printf FRAME; sleep 1; } \| …` | 0 | 690 bytes | present |
+| `{ printf FRAME; sleep 2; } \| …` | 0 | 690 bytes | present |
+
+`rc=0` with empty output is the worst possible shape: the pipeline succeeds, so the failure surfaces only as the `AgentInfoMarker` scan finding nothing — reported as `install.runtime_verify`, whose remedy text points at inference variables that have nothing to do with it. **Every codex deploy would have failed there**, after a successful 362 MB adapter install.
+
+`claude-agent-acp` is genuinely different (P5: answers and exits 0 on EOF in ~355 ms), so the fix is per-runtime — `AdapterSpec.VerifyStdinHoldSeconds`, 0 for claude and buzz-agent, 2 for codex. A global sleep would have taxed every deploy to fix one runtime.
+
+**Lesson worth carrying: a probe that establishes a behaviour must be run in the shape production uses.** S11's value was real (it proved `initialize` succeeds with no `config.toml`) but its stdin handling silently diverged from the shipped command, and that divergence hid a total runtime failure through the entire plan and implementation.
+
+
 ## What this means for the plan
 
 1. **Delete the `wire_api = "chat"` fallback branch entirely** (G2). One code path, not two.

@@ -55,6 +55,12 @@ type AdapterSpec struct {
 	// per-runtime adapter version override is empty.
 	DefaultVersion string
 
+	// VerifyStdinHoldSeconds is this adapter's VerifySpec.StdinHoldSeconds
+	// — how long the verification handshake must keep stdin open after
+	// writing the initialize frame. See VerifySpec for why it is a
+	// correctness requirement rather than a tuning knob.
+	VerifyStdinHoldSeconds int
+
 	// Lockfiles maps a pinned version to its committed package-lock.json.
 	// This is the integrity pin, and the reason the install uses `npm ci`
 	// rather than `npm install`: the lockfile carries a sha512 for every
@@ -84,6 +90,10 @@ var adapterSpecs = map[string]AdapterSpec{
 		PackageJSONName: "buzz-claude-adapter",
 		DefaultVersion:  "0.63.0",
 
+		// Answers and exits 0 on stdin EOF in ~355ms (probe P5), so the
+		// handshake closes stdin immediately as it always has.
+		VerifyStdinHoldSeconds: 0,
+
 		// One lockfile covers every platform: npm records all 8
 		// @anthropic-ai/claude-agent-sdk-<os>-<arch> optional dependencies
 		// with integrity hashes and selects the matching one at install
@@ -98,6 +108,12 @@ var adapterSpecs = map[string]AdapterSpec{
 		Dir:             "$HOME/.buzz-backend/npm-codex",
 		PackageJSONName: "buzz-codex-adapter",
 		DefaultVersion:  "1.1.7",
+
+		// MUST be non-zero. `printf FRAME | codex-acp` exits 0 having
+		// written nothing at all; the same frame with stdin held open for
+		// one second returns the full initialize reply. 2s is that
+		// measured minimum doubled, and it is paid once per deploy.
+		VerifyStdinHoldSeconds: 2,
 
 		// 25 packages, 0 missing integrity, 362 MB, 4.4s cold `npm ci`
 		// (docs/M3_CODEX_PROBE_RESULTS.md S3).
@@ -126,9 +142,9 @@ func AdapterSpecFor(spawnCommand string) (AdapterSpec, bool) {
 // twin of UnknownVersionError, and for the same reason: overriding the
 // version without a pinned integrity source must fail loud rather than
 // silently install whatever the registry currently serves.
-// Package names the adapter whose version was rejected, so an operator who
-// overrode the wrong runtime's version sees which one they actually hit.
 type UnknownAdapterVersionError struct {
+	// Package names the adapter whose version was rejected, so an operator
+	// who overrode the wrong runtime's version sees which one they hit.
 	Package string
 	Version string
 }

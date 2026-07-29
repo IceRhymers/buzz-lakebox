@@ -152,15 +152,37 @@ const InitializeFrame = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":
 // — so no per-runtime marker is needed and VerifySpec carries only a path.
 const AgentInfoMarker = "agentInfo"
 
-// VerifySpec is the per-runtime part of the verification handshake. It is
-// deliberately just the binary: the frame (InitializeFrame) and the success
-// marker (AgentInfoMarker) are shared across runtimes.
+// VerifySpec is the per-runtime part of the verification handshake. The
+// frame (InitializeFrame) and the success marker (AgentInfoMarker) are
+// shared across runtimes; what differs is the binary and how it treats
+// stdin.
 type VerifySpec struct {
 	// Bin is a TRUSTED, static "$HOME"-relative literal naming the
 	// executable to hand the initialize frame to. Never payload data —
 	// it is validated against verifyEnvFileCharset for the same reason
 	// envFile is.
 	Bin string
+
+	// StdinHoldSeconds keeps the handshake's stdin open for this long
+	// AFTER the frame is written, for runtimes that will not answer a
+	// stdin that closes immediately. 0 means close right away.
+	//
+	// This is not a tuning knob, it is a correctness requirement, and it
+	// differs per runtime because the adapters genuinely differ.
+	// claude-agent-acp answers and exits 0 on EOF in ~355ms
+	// (docs/M2_CLAUDE_PROBE_RESULTS.md P5), so it holds nothing and its
+	// rendered command is unchanged. codex-acp writes NOTHING AT ALL when
+	// stdin closes with the frame — measured: `printf FRAME | codex-acp`
+	// exits 0 with zero bytes of output, while the same frame with stdin
+	// held open for even one second returns the full initialize reply.
+	//
+	// Without this the marker scan below would find nothing and EVERY
+	// codex deploy would die at CodeRuntimeVerify — a total runtime
+	// failure, presented as a handshake error. docs/M3_CODEX_PROBE_RESULTS.md
+	// S4 recorded the behaviour ("an easy false-negative when probing");
+	// S11 then masked it by holding stdin open, which is not what this
+	// command does.
+	StdinHoldSeconds int
 }
 
 // VerifySpecFor returns the verification spec for a runtime, keyed by the
@@ -179,7 +201,7 @@ func VerifySpecFor(spawnCommand string) VerifySpec {
 		return VerifySpec{Bin: BinDir + "/buzz-agent"}
 	}
 	if spec, ok := AdapterSpecFor(spawnCommand); ok {
-		return VerifySpec{Bin: BinDir + "/" + spec.BinName}
+		return VerifySpec{Bin: BinDir + "/" + spec.BinName, StdinHoldSeconds: spec.VerifyStdinHoldSeconds}
 	}
 	return VerifySpec{}
 }
@@ -229,6 +251,14 @@ func BuildVerifyCommand(envFile string, timeoutSeconds int, spec VerifySpec) (st
 	if !verifyEnvFileCharset.MatchString(spec.Bin) {
 		return "", fmt.Errorf("verify binary path %q contains characters outside the allowed set [A-Za-z0-9_$/.-]; BuildVerifyCommand accepts trusted static literals only", spec.Bin)
 	}
+	// A runtime that will not answer a stdin closing with the frame needs
+	// the pipe held open; see VerifySpec.StdinHoldSeconds. The brace group
+	// keeps this a single stdin source for the pipeline.
+	stdinSource := fmt.Sprintf("printf '%%s\\n' %s", shellquote.Single(InitializeFrame))
+	if spec.StdinHoldSeconds > 0 {
+		stdinSource = fmt.Sprintf("{ %s; sleep %d; }", stdinSource, spec.StdinHoldSeconds)
+	}
+
 	return fmt.Sprintf(`set -eu
 umask 077
 ENVF="%s"
@@ -241,10 +271,10 @@ set -a
 . "$ENVF"
 set +a
 rc=0
-printf '%%s\n' %s | timeout %d "%s" > "$OUTF" 2>&1 || rc=$?
+%s | timeout %d "%s" > "$OUTF" 2>&1 || rc=$?
 tail -c %d "$OUTF"
 exit $rc
-`, envFile, shellquote.Single(InitializeFrame), timeoutSeconds, spec.Bin, maxVerifyOutputBytes), nil
+`, envFile, stdinSource, timeoutSeconds, spec.Bin, maxVerifyOutputBytes), nil
 }
 
 // maxVerifyOutputBytes bounds the merged stdout+stderr the verify handshake
