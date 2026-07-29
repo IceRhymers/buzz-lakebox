@@ -4,7 +4,7 @@ import "fmt"
 
 // Runtime is the agent runtime a deploy request selects via
 // agent.agent_command. v0 supported exactly one (buzz-agent); v0.1 adds the
-// Claude Code ACP adapter (issue #2). Codex is still outstanding (issue #3).
+// Claude Code ACP adapter (issue #2) and Codex (issue #3).
 //
 // The provider branches on Runtime — never on the raw agent_command string —
 // so the alias set below is the only place aliases exist. Everything
@@ -29,9 +29,7 @@ const (
 	// Unlike the other two runtimes, codex takes its endpoint from a TOML
 	// file rather than from environment variables, so the provider renders
 	// a config.toml under a provider-owned CODEX_HOME at launch — see
-	// nest.CodexEnvSnippet. No agent_command maps here yet; the alias rows
-	// are the last thing added, so that everything this runtime needs is
-	// already in place before any payload can route to it.
+	// nest.CodexEnvSnippet.
 	RuntimeCodex Runtime = "codex"
 )
 
@@ -64,6 +62,20 @@ var supportedAgentCommands = map[string]Runtime{
 	"claude-code-acp":  RuntimeClaude,
 	"claude-code":      RuntimeClaude,
 	"claudecode":       RuntimeClaude,
+
+	// Bare "codex" IS accepted, unlike bare "claude", and the asymmetry is
+	// deliberate rather than an oversight — do not "fix" it by removing
+	// this row. Upstream's zero-arg identity list (config.rs:689-691)
+	// contains "codex" and "codex-acp" but NOT "claude", so accepting
+	// "codex" keeps this provider's accepted set equal to what buzz-acp
+	// will spawn with zero args, which is the rule the claude rows follow
+	// too. The hazard bare "claude" was excluded for does not apply here
+	// because every alias canonicalizes to "codex-acp" (see spawnCommands)
+	// before anything reaches the sandbox, so the image's ucode wrapper is
+	// unreachable regardless of what the payload said.
+	"codex":     RuntimeCodex,
+	"codex-acp": RuntimeCodex,
+	"codex-cli": RuntimeCodex,
 }
 
 // spawnCommands is the canonical command buzz-acp is told to spawn
@@ -141,16 +153,16 @@ func (r Runtime) SpawnCommand() string {
 // error text, in a fixed order (map iteration order is randomized, and this
 // string is asserted on by tests).
 func supportedAgentCommandList() string {
-	return "buzz-agent, claude-agent-acp (aliases: claude-code-acp, claude-code, claudecode)"
+	return "buzz-agent, claude-agent-acp (aliases: claude-code-acp, claude-code, claudecode), codex-acp (aliases: codex, codex-cli)"
 }
 
 // unsupportedRuntimeError is the rejection for an agent_command this
-// provider does not implement. It points at issue #3 (codex), the only
-// runtime still outstanding — issue #1 (buzz-agent) and #2 (claude) are
-// both closed by the runtimes above.
+// provider does not implement. Every runtime buzz-acp can spawn with zero
+// args is now covered except goose, so the error simply names what is
+// accepted rather than pointing at a tracking issue.
 func unsupportedRuntimeError(agentCommand string) error {
 	return fmt.Errorf(
-		"agent_command %q is not supported by this provider; supported: %s — see https://github.com/IceRhymers/buzz-lakebox/issues/3 for codex support",
+		"agent_command %q is not supported by this provider; supported: %s",
 		agentCommand, supportedAgentCommandList(),
 	)
 }

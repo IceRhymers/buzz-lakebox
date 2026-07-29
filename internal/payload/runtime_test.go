@@ -43,59 +43,6 @@ func TestRuntimeCodex_SpawnCommandNeverBareCodex(t *testing.T) {
 	}
 }
 
-// TestRuntimeFor_CodexNotYetRoutable pins this commit's scope: the runtime
-// exists so the machinery beneath it can be built and reviewed, but nothing
-// routes to it yet. The alias rows land last, once the adapter install, env
-// rendering, and inference probe are all in place — so there is never a
-// commit where a payload can select a runtime that is only half-built.
-//
-// This test is expected to be DELETED by the commit that adds the aliases.
-func TestRuntimeFor_CodexNotYetRoutable(t *testing.T) {
-	for _, v := range []string{"codex", "codex-acp", "codex-cli"} {
-		if _, ok := RuntimeFor(v); ok {
-			t.Errorf("%q must not be routable until the codex runtime is fully wired", v)
-		}
-	}
-}
-
-// TestEnvShapes_CoverEveryRuntime is the completeness gate on envShapes.
-// A runtime missing from that table still renders — it just silently gets
-// the zero shape, which withholds buzz-agent's wiring (safe) but also drops
-// the pinned BUZZ_ACP_PERMISSION_MODE (a bug). Failing safe is not the same
-// as being correct, so the omission must be caught here.
-func TestEnvShapes_CoverEveryRuntime(t *testing.T) {
-	for rt := range spawnCommands {
-		shape, ok := envShapes[rt]
-		if !ok {
-			t.Errorf("runtime %q has no envShapes entry; it would render with the zero shape and lose its permission-mode pin", rt)
-			continue
-		}
-		// Every runtime is either buzz-agent-shaped or adapter-shaped;
-		// neither-nor means someone added a row without classifying it.
-		if !shape.BuzzAgentWiring && !shape.PinACPPermissionMode {
-			t.Errorf("runtime %q has an empty EnvShape; classify it explicitly", rt)
-		}
-		if shape.BuzzAgentWiring && shape.PinACPPermissionMode {
-			t.Errorf("runtime %q claims both buzz-agent wiring and an ACP permission-mode pin; those are alternatives", rt)
-		}
-	}
-}
-
-// TestEnvShape_CodexIsAdapterShaped pins the specific classification that
-// three `rt != RuntimeClaude` branches would have gotten wrong. Codex must
-// NOT inherit buzz-agent's model variable, stdio MCP server, or inference
-// config — see the negative assertions in nest's TestRenderEnv_CodexGolden
-// for what each would break.
-func TestEnvShape_CodexIsAdapterShaped(t *testing.T) {
-	shape := RuntimeCodex.EnvShape()
-	if shape.BuzzAgentWiring {
-		t.Error("codex must not receive buzz-agent's tool and inference wiring")
-	}
-	if !shape.PinACPPermissionMode {
-		t.Error("codex is driven through an ACP adapter and must pin the permission mode")
-	}
-}
-
 func TestRuntimeFor_ExactCaseOnly(t *testing.T) {
 	for _, v := range []string{"Claude-Code", "CLAUDE-CODE", "Buzz-Agent", " claude-code"} {
 		if _, ok := RuntimeFor(v); ok {

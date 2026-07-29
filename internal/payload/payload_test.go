@@ -140,7 +140,10 @@ func TestValidate_MissingSecrets(t *testing.T) {
 }
 
 func TestValidate_UnsupportedRuntimeRejected(t *testing.T) {
-	for _, runtime := range []string{"goose", "claude", "codex", "python foo.py", ""} {
+	// "codex" has moved OUT of this list: it is now an accepted alias.
+	// Bare "claude" stays, because upstream excludes it too — see
+	// TestRuntimeFor_BareClaudeRejected for why the two are not symmetric.
+	for _, runtime := range []string{"goose", "claude", "python foo.py", ""} {
 		body := `{"agent":{"relay_url":"wss://r","private_key_nsec":"nsec1x","auth_tag":"t","agent_command":"` + runtime + `"}}`
 		req, err := ParseDeployRequest([]byte(body))
 		if err != nil {
@@ -150,12 +153,11 @@ func TestValidate_UnsupportedRuntimeRejected(t *testing.T) {
 		if err == nil {
 			t.Fatalf("Validate() should reject agent_command %q", runtime)
 		}
-		// Points at issue #3 (codex) — the only runtime still outstanding.
-		// #1 (buzz-agent) and #2 (claude) are both implemented, so the old
-		// "see the v0.1 roadmap" wording would now send an operator to a
-		// closed issue.
-		if !strings.Contains(err.Error(), "issues/3") {
-			t.Fatalf("error for agent_command %q should point at the codex issue, got: %v", runtime, err)
+		// The error used to point at issue #3 as "the only runtime still
+		// outstanding". Codex now ships, so it names the accepted set
+		// instead — a link to a closed issue is worse than no link.
+		if !strings.Contains(err.Error(), "supported:") {
+			t.Fatalf("error for agent_command %q should list the accepted commands, got: %v", runtime, err)
 		}
 	}
 }

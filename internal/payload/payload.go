@@ -163,6 +163,88 @@ func (r DeployRequest) Validate() error {
 	if err := r.validateClaudeInferenceSource(); err != nil {
 		return err
 	}
+	if err := r.validateCodexInferenceSource(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// codexAdapterEnvVars is the COMPLETE set of environment variables
+// @agentclientprotocol/codex-acp@1.1.7 reads, taken from its published
+// bundle (docs/M3_CODEX_PROBE_RESULTS.md S10). Each is an owner-controlled
+// input that can redirect where codex sends its credential, and none is
+// visible to nest.CodexEnvSnippet's file-based gate: agent.env_vars render
+// BEFORE the snippet and are exported into the agent's process.
+//
+// Ordered by severity rather than alphabetically, so a reader meets the
+// worst one first.
+var codexAdapterEnvVars = []string{
+	// Adapter-level auth override. With methodId "gateway" it calls
+	// applyGatewayConfig({baseUrl, headers, providerName}), installing a
+	// provider that SUPERSEDES the generated [model_providers.databricks]
+	// block entirely — an arbitrary base_url plus arbitrary HTTP headers.
+	// Its "api-key" branch additionally carries an inline key. This is a
+	// full endpoint-redirect primitive, not an auth-method selector.
+	"DEFAULT_AUTH_REQUEST",
+	// The owner's own config.toml, with their own base_url and an
+	// env_key that names the token this provider exports.
+	"CODEX_HOME",
+	// Session-level config override, applied at thread start, outranking
+	// anything in the generated file.
+	"CODEX_CONFIG",
+	// Selects a provider block; ours defines only "databricks". A silent
+	// denial of service rather than a leak, but silent.
+	"MODEL_PROVIDER",
+	// Spawned as `<path> app-server`. The image's /usr/local/bin/codex is
+	// a ucode wrapper that takes no arguments, so this also breaks the
+	// runtime outright (probe S1/S10).
+	"CODEX_PATH",
+}
+
+// validateCodexInferenceSource is the codex analogue of
+// validateClaudeInferenceSource, and it has to work differently because the
+// mechanism that makes the Claude rule safe is unavailable here.
+//
+// Claude's rule is "bring-your-own endpoint requires bring-your-own token",
+// and it is enforceable because the provider can WITHHOLD its credential:
+// nest.ClaudeEnvSnippet simply does not export ANTHROPIC_AUTH_TOKEN for an
+// endpoint it did not derive. Codex has no such lever. Its token arrives via
+// `env_key = "DATABRICKS_TOKEN"`, and DATABRICKS_TOKEN is already exported
+// for other reasons — by SandboxAuthSnippet in sandbox mode, ungated on the
+// host, or by the owner's own env_vars in env mode.
+//
+// So under inference_auth="sandbox" — where the credential is the sandbox's
+// baked workspace-OWNER PAT, which the payload never had to carry — any of
+// the adapter's env vars would let a deploy forward that credential to an
+// endpoint of the owner's choosing, on every turn, with the deploy reporting
+// healthy: the inference probe reads the same artifact the owner supplied,
+// so it would validate the attacker's endpoint rather than catch it.
+// Rejecting the whole set is the only enforceable rule.
+//
+// Under inference_auth="env" they are all permitted: there the token is the
+// owner's own, supplied by them, and pointing it wherever they like is their
+// business. That asymmetry — not a blanket ban — is the true mirror of the
+// Claude posture.
+func (r DeployRequest) validateCodexInferenceSource() error {
+	rt, ok := RuntimeFor(r.Agent.AgentCommand)
+	if !ok || rt != RuntimeCodex {
+		return nil
+	}
+	if !r.ProviderConfig.SandboxInferenceAuth() {
+		return nil
+	}
+	for _, key := range codexAdapterEnvVars {
+		if _, present := r.Agent.EnvVars[key]; !present {
+			continue
+		}
+		return fmt.Errorf(
+			"agent_command %q with provider_config.inference_auth=\"sandbox\" must not set env_vars.%s: "+
+				"the codex adapter reads that variable to decide where it sends inference requests, and in this mode the credential it would carry "+
+				"is the sandbox's baked workspace-owner token that this payload never supplied. "+
+				"Use inference_auth=\"env\" with your own DATABRICKS_HOST/DATABRICKS_TOKEN to point codex at another endpoint",
+			r.Agent.AgentCommand, key,
+		)
+	}
 	return nil
 }
 
