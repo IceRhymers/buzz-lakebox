@@ -534,3 +534,44 @@ func TestSandboxAuthSnippet_HostLineMissing(t *testing.T) {
 		t.Fatalf("got host=%q token=%q, want NEITHER: exporting the baked owner token with no endpoint is half a credential pair", res.host, res.token)
 	}
 }
+
+// TestSnippets_AreSyntacticallyValidShell is the cheapest possible guard
+// against the most embarrassing failure mode this package has: a COMMENT
+// breaking the runtime.
+//
+// Every snippet here is a Go string containing shell, and SandboxAuthSnippet
+// embeds an awk program inside a single-quoted shell string. A single
+// apostrophe anywhere in that program — including in prose like "the probes'
+// charset gate" — closes the string and turns the remainder into shell
+// syntax. That shipped once: `sh -n` reported "Syntax error: word
+// unexpected" at the line after the comment, and because SandboxAuthSnippet
+// is sourced by launch.sh, EVERY sandbox-mode deploy would have failed at
+// launch.
+//
+// The behavioural tests below catch it too, but only for snippets that have
+// exec coverage and only in the configurations those tests exercise. This
+// catches it for all of them, unconditionally, in milliseconds — and it
+// fails with the offending line number rather than a downstream symptom.
+func TestSnippets_AreSyntacticallyValidShell(t *testing.T) {
+	requireShAndAwk(t)
+
+	for name, snippet := range map[string]string{
+		"SandboxAuthSnippet": SandboxAuthSnippet,
+		"ClaudeEnvSnippet":   ClaudeEnvSnippet,
+		"CodexEnvSnippet":    CodexEnvSnippet,
+		"AliveCheckSnippet":  AliveCheckSnippet,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "snippet.sh")
+			if err := os.WriteFile(path, []byte(snippet), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			// -n parses without executing, so this is safe for snippets
+			// whose side effects we do not want here.
+			out, err := exec.Command("sh", "-n", path).CombinedOutput()
+			if err != nil {
+				t.Errorf("%s is not valid shell: %v\n%s", name, err, out)
+			}
+		})
+	}
+}

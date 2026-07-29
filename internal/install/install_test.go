@@ -80,8 +80,8 @@ func TestBuildInstallScript_ChecksumVerification(t *testing.T) {
 	if !strings.Contains(script, "sha256sum -c -") {
 		t.Fatal("script should verify sha256 via sha256sum -c")
 	}
-	if !strings.Contains(script, "curl -fL") {
-		t.Fatal("script should fetch via curl -fL")
+	if !strings.Contains(script, "curl -q -fL") {
+		t.Fatal("script should fetch via curl, with -q FIRST so it ignores ~/.curlrc")
 	}
 	if !strings.Contains(script, "dpkg-deb -x") {
 		t.Fatal("script should extract via dpkg-deb -x")

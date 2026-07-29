@@ -177,10 +177,14 @@ if [ -z "${DATABRICKS_TOKEN:-}" ] && [ -z "${DATABRICKS_HOST:-}" ] && [ -r "$HOM
       if (line ~ ("^" want "[ \t]*=")) {
         sub(("^" want "[ \t]*=[ \t]*"), "", line)
         # Trailing whitespace and CR are stripped as well as leading: the
-        # cfg is regenerated into /run on every start (probe S2), and a
-        # trailing space or a CRLF line ending would otherwise produce a
-        # token the inference probes' charset gate refuses, turning cosmetic
+        # cfg is regenerated into /run on every start, and a trailing space
+        # or a CRLF line ending would otherwise yield a token that the
+        # inference probes charset-gate refuses, turning cosmetic
         # contamination into a hard deploy failure.
+        # NOTE: no apostrophes in this awk program. It lives inside a
+        # single-quoted shell string, so one would close the string and turn
+        # the rest into shell syntax -- which is exactly how this comment
+        # broke every sandbox-mode launch once already.
         sub(/[ \t\r]+$/, "", line)
         print line
         found = 1
