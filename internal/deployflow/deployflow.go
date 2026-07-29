@@ -759,8 +759,13 @@ func (d *Deployer) installAndVerify(ctx context.Context, profile, sandboxID stri
 		return failf(CodeRuntimeVerify, "install verification: %s ACP initialize response did not contain %q: %s", rt.SpawnCommand(), install.AgentInfoMarker, remoteText(strings.TrimSpace(out)))
 	}
 
-	if rt == payload.RuntimeClaude {
+	switch rt {
+	case payload.RuntimeClaude:
 		if err := d.claudeInferenceProbe(ctx, profile, sandboxID, envContent); err != nil {
+			return err
+		}
+	case payload.RuntimeCodex:
+		if err := d.codexInferenceProbe(ctx, profile, sandboxID, envContent); err != nil {
 			return err
 		}
 	}
@@ -843,6 +848,32 @@ func (d *Deployer) claudeInferenceProbe(ctx context.Context, profile, sandboxID,
 	}
 	return failf(CodeClaudeInference, "claude inference probe: %s (probe output: %s)",
 		claudeProbeCauseMessage(cause, out), remoteText(strings.TrimSpace(out)))
+}
+
+// codexInferenceProbe is the codex twin of claudeInferenceProbe: it closes
+// the same gap between "the agent process answers an ACP handshake" and
+// "the agent can actually reach an LLM", which neither install verification
+// nor launch verification touches.
+func (d *Deployer) codexInferenceProbe(ctx context.Context, profile, sandboxID, envContent string) error {
+	// Same shape as authProbe and claudeInferenceProbe: the script signals
+	// failure by exiting non-zero, so the error is the NORMAL failure path
+	// and the cause marker must be parsed from the output it still
+	// returned — returning early on err would make the diagnosis below
+	// dead code.
+	out, err := d.SSH.RunWithStdin(ctx, profile, sandboxID,
+		step("codex-inference-probe", codexInferenceProbeScript()),
+		strings.NewReader(envContent),
+	)
+	if err == nil {
+		return nil
+	}
+	cause := probeCause(out, codexProbeCauseMarkerPrefix)
+	if cause == "" {
+		// No marker: the transport itself failed before the script ran.
+		return failf(CodeCodexInference, "codex inference probe: %w", err)
+	}
+	return failf(CodeCodexInference, "codex inference probe: %s (probe output: %s)",
+		codexProbeCauseMessage(cause, out), remoteText(strings.TrimSpace(out)))
 }
 
 // verifyLaunch implements docs/PLAN.md §4.4 step 10's pass signal, waiting
