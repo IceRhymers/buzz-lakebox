@@ -71,8 +71,15 @@ const (
 	// endpoint, a rejected credential, or a gateway that does not serve
 	// the anthropic route all deploy "healthy" and die at first mention.
 	CodeClaudeInference Code = "install.claude_inference"
-	CodeEnvWrite        Code = "provision.env_write"
-	CodePrelaunchKill   Code = "launch.prelaunch_kill"
+	// CodeCodexInference is the codex twin of CodeClaudeInference, and
+	// exists separately rather than as a shared code because its remedies
+	// differ: a different gateway surface, a different config mechanism
+	// (a generated config.toml rather than env vars), and a distinct
+	// fail-closed consequence — a codex agent with no config falls back to
+	// the image's ~/.codex symlink and its baked workspace credential.
+	CodeCodexInference Code = "install.codex_inference"
+	CodeEnvWrite       Code = "provision.env_write"
+	CodePrelaunchKill  Code = "launch.prelaunch_kill"
 	// CodeStaleAgent fires when a previous buzz-acp is still alive after
 	// the prelaunch kill's bounded wait. Launching over it would be worse
 	// than failing: launch.sh refuses to relaunch while one is alive, and
@@ -113,7 +120,7 @@ var AllCodes = []Code{
 	CodeIdentityDerive, CodeIdentityAmbiguous, CodeStateRead, CodeStateWrite,
 	CodeSandboxList, CodeSandboxCreate, CodeSandboxStart, CodeSandboxWait, CodeSandboxStatus, CodeSandboxStop, CodeSandboxDelete,
 	CodePATReset, CodeSandboxAuth, CodeInstallScript, CodeInstallWrite, CodeInstallExec,
-	CodeAdapterScript, CodeAdapterWrite, CodeAdapterExec, CodeRuntimeVerify, CodeClaudeInference,
+	CodeAdapterScript, CodeAdapterWrite, CodeAdapterExec, CodeRuntimeVerify, CodeClaudeInference, CodeCodexInference,
 	CodeEnvWrite, CodePrelaunchKill, CodeStaleAgent, CodeLaunchWrite, CodeLaunchExec,
 	CodeVerifySSH, CodeVerifyUnparseable, CodeVerifyProcessDead, CodeVerifyRelayDenied, CodeVerifyNotReady,
 	CodeAutostopConfig,
@@ -148,12 +155,15 @@ var remedies = map[Code]string{
 	CodeInstallScript: "pass a known `provider_config.buzz_version` (the error lists the pinned versions this build ships sha256s for)",
 	CodeInstallWrite:  "check sandbox SSH reachability with `databricks sandbox ssh <id> -- true`",
 	CodeInstallExec:   "read the install output above: a sha256 mismatch means the pinned release changed; a fetch failure means the sandbox lost egress to GitHub",
-	CodeAdapterScript: "pass a known `provider_config.claude_adapter_version` (the error lists the adapter versions this build ships a pinned package-lock.json for)",
+	CodeAdapterScript: "pass a known `provider_config.claude_adapter_version` / `codex_adapter_version` — the error names which adapter it hit and lists the versions this build ships a pinned package-lock.json for",
 	CodeAdapterWrite:  "check sandbox SSH reachability with `databricks sandbox ssh <id> -- true`",
 	CodeAdapterExec:   "read the npm output above: an integrity mismatch means the registry served different bytes than the pinned lockfile — do NOT retry, report it; anything else is usually lost sandbox egress to registry.npmjs.org, which is safe to retry",
-	CodeRuntimeVerify: "the installed agent runtime could not complete an ACP initialize handshake — check `logs` and the inference env for that runtime (buzz-agent: BUZZ_AGENT_PROVIDER / DATABRICKS_HOST / DATABRICKS_TOKEN; claude: ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN / DATABRICKS_HOST)",
+	CodeRuntimeVerify: "the installed agent runtime could not complete an ACP initialize handshake — check `logs` and the inference env for that runtime (buzz-agent: BUZZ_AGENT_PROVIDER / DATABRICKS_HOST / DATABRICKS_TOKEN; claude: ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN / DATABRICKS_HOST; codex: CODEX_HOME and the generated $HOME/.buzz-backend/codex/config.toml)",
 	CodeClaudeInference: "the agent installed and handshook, but could not reach the AI Gateway: confirm the workspace serves `{host}/ai-gateway/anthropic/v1/messages` and that the credential is accepted there — " +
 		"in `inference_auth: \"env\"` check env_vars DATABRICKS_HOST/DATABRICKS_TOKEN, in `\"sandbox\"` mode retry or fall back to env mode for this agent",
+	CodeCodexInference: "the agent installed and handshook, but could not reach the AI Gateway: confirm the workspace serves `{host}/ai-gateway/codex/v1/responses` and that the credential is accepted there — " +
+		"in `inference_auth: \"env\"` check env_vars DATABRICKS_HOST/DATABRICKS_TOKEN, in `\"sandbox\"` mode retry or fall back to env mode for this agent. " +
+		"An \"unset\" cause means no config.toml was generated at all, which is the fail-closed path working: the agent was deliberately NOT launched",
 	CodeEnvWrite:      "check sandbox SSH reachability and that $HOME is writable in the sandbox",
 	CodePrelaunchKill: "check sandbox SSH reachability with `databricks sandbox ssh <id> -- true`",
 	CodeStaleAgent:    "a previous buzz-acp was still shutting down and did not exit — run `status <sandbox-id>` to confirm, then `stop <sandbox-id>` followed by a redeploy; if it persists the old process is wedged and the sandbox needs a restart",

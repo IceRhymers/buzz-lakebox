@@ -108,10 +108,29 @@ const AliveCheckSnippet = `buzz_acp_alive() {
 // content, the latter under `set -a` — so this text has to survive both
 // sourcing contexts unconditionally. That drives every rule below:
 //
-//   - It is a no-op unless DATABRICKS_TOKEN is unset/empty AND
-//     ~/.databrickscfg is readable, so env_vars-supplied credentials (or
-//     a value some other mechanism already exported) always win —
-//     derivation is a fallback, never an override.
+//   - It is a no-op unless BOTH DATABRICKS_TOKEN and DATABRICKS_HOST are
+//     unset/empty AND ~/.databrickscfg is readable, so env_vars-supplied
+//     credentials (or a value some other mechanism already exported)
+//     always win — derivation is a fallback, never an override.
+//
+//     Requiring BOTH is a security property rather than tidiness. An
+//     earlier version gated only on the TOKEN, which let a
+//     payload supply DATABRICKS_HOST alone and inherit the sandbox's
+//     baked creator-identity token — pairing an endpoint the payload
+//     chose with a workspace-owner credential the payload never had to
+//     carry. Both runtime snippets then faithfully wired that pair up,
+//     and the deploy-time inference probe sent the token there itself
+//     before the agent ever ran. Derivation is therefore ALL-OR-NOTHING:
+//     supply neither and the sandbox's own credential is used, or supply
+//     both and this block stands aside entirely. Supplying exactly one
+//     now derives nothing, which surfaces as an "unset" inference-probe
+//     failure — loud, and before the agent launches.
+//
+//     payload.DeployRequest.Validate rejects that combination outright,
+//     so this is the second of two independent defenses; it is the one
+//     that still holds if a future caller reaches RenderEnv without
+//     going through payload validation.
+//
 //   - [DEFAULT]-section-scoped extraction only: a small awk state machine
 //     tracks whether the current line is inside "[DEFAULT]" and resets on
 //     any other "[section]" line, so profiles before/after DEFAULT (or a
@@ -120,10 +139,12 @@ const AliveCheckSnippet = `buzz_acp_alive() {
 //     tabs/spaces around "="); the value is taken verbatim (docs/M05
 //     precedent: host used as-is) with no scheme normalization or
 //     trimming beyond the delimiter's own surrounding whitespace.
+//
 //   - R3(a): every command substitution below ends `2>/dev/null || true`,
 //     AND the awk program itself always `exit 0`s from its END block —
 //     belt and suspenders — so a parse failure can never hand a non-zero
 //     status to the sourcing `set -eu` shell.
+//
 //   - R3(b): control flow is if/fi only; there is no top-level `&&` chain
 //     standing in for it (the `&&` inside the outer `if [ ... ] && [ ... ];
 //     then` is the condition of that if, which `set -e` always exempts,
@@ -131,6 +152,7 @@ const AliveCheckSnippet = `buzz_acp_alive() {
 //     whatever the last `if` decided, the `.` builtin's reported status
 //     (the status of the last command run) is always 0 — sourcing can
 //     never die here even when this is the last content in the file.
+//
 //   - R3(c): every scratch variable is `buzz_`-prefixed and explicitly
 //     `unset` before the final `:`. install.BuildVerifyCommand sources
 //     this content under `set -a`, which auto-exports every variable
@@ -138,10 +160,11 @@ const AliveCheckSnippet = `buzz_acp_alive() {
 //     buzz_token would leak into buzz-agent's own handshake environment.
 const SandboxAuthSnippet = `# Zero-token inference auth (provider_config.inference_auth="sandbox"):
 # derive DATABRICKS_HOST/DATABRICKS_TOKEN from the sandbox's baked
-# creator-identity ~/.databrickscfg, only if not already set above by
-# env_vars. This block is a fallback, never an override: env_vars are
-# rendered first and this only fires when DATABRICKS_TOKEN is still unset.
-if [ -z "${DATABRICKS_TOKEN:-}" ] && [ -r "$HOME/.databrickscfg" ]; then
+# creator-identity ~/.databrickscfg, only if NEITHER is already set above
+# by env_vars. This block is a fallback, never an override, and it is
+# ALL-OR-NOTHING: deriving only one of the pair would let a payload supply
+# the endpoint and inherit the sandbox's owner-level token.
+if [ -z "${DATABRICKS_TOKEN:-}" ] && [ -z "${DATABRICKS_HOST:-}" ] && [ -r "$HOME/.databrickscfg" ]; then
   buzz_awk_extract='
     BEGIN { insec = 0; found = 0 }
     /^\[/ {
@@ -153,6 +176,16 @@ if [ -z "${DATABRICKS_TOKEN:-}" ] && [ -r "$HOME/.databrickscfg" ]; then
       sub(/^[ \t]+/, "", line)
       if (line ~ ("^" want "[ \t]*=")) {
         sub(("^" want "[ \t]*=[ \t]*"), "", line)
+        # Trailing whitespace and CR are stripped as well as leading: the
+        # cfg is regenerated into /run on every start, and a trailing space
+        # or a CRLF line ending would otherwise yield a token that the
+        # inference probes charset-gate refuses, turning cosmetic
+        # contamination into a hard deploy failure.
+        # NOTE: no apostrophes in this awk program. It lives inside a
+        # single-quoted shell string, so one would close the string and turn
+        # the rest into shell syntax -- which is exactly how this comment
+        # broke every sandbox-mode launch once already.
+        sub(/[ \t\r]+$/, "", line)
         print line
         found = 1
       }
@@ -162,10 +195,13 @@ if [ -z "${DATABRICKS_TOKEN:-}" ] && [ -r "$HOME/.databrickscfg" ]; then
   buzz_host=$(awk -v want=host "$buzz_awk_extract" "$HOME/.databrickscfg" 2>/dev/null || true)
   buzz_token=$(awk -v want=token "$buzz_awk_extract" "$HOME/.databrickscfg" 2>/dev/null || true)
 
-  if [ -z "${DATABRICKS_HOST:-}" ] && [ -n "$buzz_host" ]; then
+  # Both or neither, matching the outer guard: a cfg carrying a token line
+  # and no host line must not export the token alone. In sandbox mode the
+  # auth probe catches that first, so this is the second of two defenses —
+  # but the comment above is the specification, and code that does not meet
+  # its own specification is what survives the next refactor.
+  if [ -n "$buzz_host" ] && [ -n "$buzz_token" ]; then
     export DATABRICKS_HOST="$buzz_host"
-  fi
-  if [ -n "$buzz_token" ]; then
     export DATABRICKS_TOKEN="$buzz_token"
   fi
 fi
@@ -198,6 +234,12 @@ func RenderEnv(agent payload.Agent, rt payload.Runtime, sandboxInferenceAuth boo
 	// This is safe ONLY because agent.EnvVars keys are validated upstream
 	// by payload.Agent.Validate() (^[A-Za-z_][A-Za-z0-9_]*$) before
 	// RenderEnv ever sees them; do not call RenderEnv on unvalidated input.
+	// shape decides which blocks below this runtime needs. Reading it once
+	// here, rather than testing the runtime at each site, is what keeps a
+	// future runtime from silently inheriting buzz-agent's wiring — see
+	// payload.EnvShape.
+	shape := rt.EnvShape()
+
 	emit := func(key, value string) {
 		b.WriteString("export ")
 		b.WriteString(key)
@@ -232,7 +274,13 @@ func RenderEnv(agent payload.Agent, rt payload.Runtime, sandboxInferenceAuth boo
 	// via ANTHROPIC_MODEL made the SDK rewrite it to a canonical Anthropic
 	// id the gateway does not serve, hard-failing every turn. The
 	// adapter's own default works, so emit nothing and let it choose.
-	if rt != payload.RuntimeClaude {
+	//
+	// The same holds for codex and for a different reason worth stating: its
+	// model lives in the generated config.toml (nest.CodexEnvSnippet), so a
+	// BUZZ_ACP_MODEL here would make buzz-acp attempt a per-session switch
+	// to a gateway id absent from codex's catalog — the unsupported_model
+	// frame described above, on every session.
+	if shape.BuzzAgentInference {
 		emit("BUZZ_ACP_MODEL", derefOrEmpty(agent.Model))
 	}
 	emit("BUZZ_ACP_RESPOND_TO", agent.RespondTo)
@@ -281,10 +329,35 @@ func RenderEnv(agent payload.Agent, rt payload.Runtime, sandboxInferenceAuth boo
 	// MCP_HOOK_SERVERS is buzz-agent's own variable (read by the agent,
 	// not by buzz-acp) and is meaningless to the adapter.
 	//
-	// Escape hatch: env_vars render after this block, so an owner who
-	// wants buzz tooling can still set BUZZ_ACP_MCP_COMMAND=buzz-dev-mcp.
-	if rt != payload.RuntimeClaude {
+	// CODEX IS NOT EXCLUDED, and the reasoning that would exclude it is
+	// wrong in a way worth recording. It is tempting to argue "codex ships
+	// its own tools, so the buzz-agent failure does not apply, same as
+	// Claude" — but upstream's discovery table sets mcp_command
+	// Some("buzz-dev-mcp") for codex and None only for claude. The
+	// difference is concrete: Claude Code's shell runs `buzz messages send`
+	// directly, while codex's tool calls execute under the ACP adapter's
+	// workspaceWrite sandbox with networkAccess:false
+	// (docs/M3_CODEX_PROBE_RESULTS.md S10), so its shell cannot reach the
+	// relay. The MCP subprocess is how a codex agent answers at all — which
+	// is also why buzz-acp injects CODEX_CONFIG network_access for exactly
+	// this runtime and no other.
+	//
+	// A related misreading is worth flagging for the next runtime: codex's
+	// initialize reply carries mcpCapabilities {acp:false, http:true,
+	// sse:false}, which looks like "no stdio MCP". It is not. stdio is the
+	// baseline ACP transport and appears in no capability flag at all — the
+	// adapter's own schema has a zMcpServerStdio with command/args. Reading
+	// that field as a stdio denial is what produced the wrong conclusion.
+	//
+	// MCP_HOOK_SERVERS is separate: upstream sets mcp_hooks true for
+	// buzz-agent ONLY, so codex takes the command without the hooks.
+	//
+	// Escape hatch: env_vars render after this block, so an owner who wants
+	// different tooling can still override BUZZ_ACP_MCP_COMMAND.
+	if shape.StdioMCPCommand {
 		emit("BUZZ_ACP_MCP_COMMAND", "buzz-dev-mcp")
+	}
+	if shape.MCPHookServers {
 		emit("MCP_HOOK_SERVERS", "*")
 	}
 	// Observer frames are the desktop's ONLY health signal for a
@@ -303,13 +376,15 @@ func RenderEnv(agent payload.Agent, rt payload.Runtime, sandboxInferenceAuth boo
 	// DATABRICKS_HOST/DATABRICKS_TOKEN arrive via env_vars below and
 	// override nothing here since those keys aren't set above.
 	//
-	// Both are buzz-agent's own configuration and mean nothing to the
-	// Claude adapter, which takes its endpoint from ANTHROPIC_BASE_URL
-	// (see ClaudeEnvSnippet, appended after everything below).
-	if rt != payload.RuntimeClaude {
+	// Both are buzz-agent's own configuration and mean nothing to an ACP
+	// adapter, which takes its endpoint from elsewhere: Claude from
+	// ANTHROPIC_BASE_URL (ClaudeEnvSnippet), codex from the config.toml
+	// under CODEX_HOME (CodexEnvSnippet) — both appended after everything
+	// below.
+	if shape.BuzzAgentInference {
 		emit("BUZZ_AGENT_PROVIDER", derefOrDefault(agent.Provider, DefaultBuzzAgentProvider))
 		emit("DATABRICKS_MODEL", derefOrEmpty(agent.Model))
-	} else {
+	} else if shape.PinACPPermissionMode {
 		// Pinned for parity with buzz-acp's own default, following the
 		// same "pin defaults so an upstream change can't silently
 		// diverge sandbox agents from desktop ones" doctrine used above.
@@ -340,9 +415,13 @@ func RenderEnv(agent payload.Agent, rt payload.Runtime, sandboxInferenceAuth boo
 	// DATABRICKS_HOST/DATABRICKS_TOKEN can come from, and this snippet
 	// derives from whichever won. Ordering is the whole reason one
 	// identical text serves both inference_auth modes.
-	if rt == payload.RuntimeClaude {
+	switch rt {
+	case payload.RuntimeClaude:
 		b.WriteString("\n")
 		b.WriteString(ClaudeEnvSnippet)
+	case payload.RuntimeCodex:
+		b.WriteString("\n")
+		b.WriteString(CodexEnvSnippet)
 	}
 
 	return b.String()

@@ -5,10 +5,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 
+	"github.com/IceRhymers/buzz-lakebox/internal/payload"
 	"github.com/IceRhymers/buzz-lakebox/internal/shellquote"
 )
 
@@ -207,6 +210,16 @@ func TestSandboxAuthSnippet_MissingFile(t *testing.T) {
 	}
 }
 
+// TestSandboxAuthSnippet_TokenLineMissing pins that a cfg carrying a host
+// line and no token line derives NEITHER.
+//
+// This assertion was inverted until the all-or-nothing fix: it required the
+// host to still be derived. That was the same half-pair shape as the
+// credential-egress defect on the inherited-value side — deriving one half
+// of a credential pair is never useful. A host with no token cannot
+// authenticate, so it produces an agent that fails at first mention rather
+// than at deploy time; deriving nothing makes the inference probe report
+// "unset" and fail the deploy loudly instead.
 func TestSandboxAuthSnippet_TokenLineMissing(t *testing.T) {
 	requireShAndAwk(t)
 	cfg := "[DEFAULT]\nhost = https://notoken.databricks.com\n"
@@ -214,11 +227,8 @@ func TestSandboxAuthSnippet_TokenLineMissing(t *testing.T) {
 	if res.exitCode != 0 {
 		t.Fatalf("expected exit 0, got %d", res.exitCode)
 	}
-	if res.host != "https://notoken.databricks.com" {
-		t.Fatalf("host = %q, want it still derived", res.host)
-	}
-	if res.token != "" {
-		t.Fatalf("token = %q, want empty when the cfg has no token line", res.token)
+	if res.host != "" || res.token != "" {
+		t.Fatalf("got host=%q token=%q, want NEITHER derived from a half-populated cfg", res.host, res.token)
 	}
 }
 
@@ -284,5 +294,284 @@ func TestSandboxAuthSnippet_NoScratchVarLeakUnderSetA(t *testing.T) {
 		if strings.HasPrefix(line, "buzz_") {
 			t.Fatalf("scratch variable leaked into the environment under set -a: %q (full env dump:\n%s)", line, res.env)
 		}
+	}
+}
+
+// sourceSnippetWithPresetHost sources SandboxAuthSnippet with an arbitrary
+// set of variables pre-exported — the ordering RenderEnv produces, since
+// agent env_vars are emitted BEFORE this snippet. The shared helper above
+// can only preset the token, and the case that matters here is the host.
+func sourceSnippetWithPresetHost(t *testing.T, cfg string, preset map[string]string) sourceResult {
+	t.Helper()
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, ".databrickscfg"), []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write fixture cfg: %v", err)
+	}
+	snippetPath := filepath.Join(home, "auth.sh")
+	if err := os.WriteFile(snippetPath, []byte(SandboxAuthSnippet), 0o600); err != nil {
+		t.Fatalf("write snippet: %v", err)
+	}
+
+	var script strings.Builder
+	script.WriteString("set -eu\n")
+	for k, v := range preset {
+		script.WriteString("export " + k + "=" + shellquote.Single(v) + "\n")
+	}
+	script.WriteString(". " + shellquote.Single(snippetPath) + "\n")
+	script.WriteString(`echo "BUZZ_TEST_HOST=${DATABRICKS_HOST:-}"` + "\n")
+	script.WriteString(`echo "BUZZ_TEST_TOKEN=${DATABRICKS_TOKEN:-}"` + "\n")
+
+	cmd := exec.Command("sh", "-c", script.String())
+	cmd.Env = []string{"HOME=" + home, "PATH=" + os.Getenv("PATH")}
+	out, err := cmd.Output()
+
+	res := sourceResult{}
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			res.exitCode = ee.ExitCode()
+		} else {
+			t.Fatalf("run shell: %v", err)
+		}
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if v, ok := strings.CutPrefix(line, "BUZZ_TEST_HOST="); ok {
+			res.host = v
+		}
+		if v, ok := strings.CutPrefix(line, "BUZZ_TEST_TOKEN="); ok {
+			res.token = v
+		}
+	}
+	return res
+}
+
+// TestSandboxAuthSnippet_DerivationIsAllOrNothing is the regression test for
+// a real credential-egress defect, and the asymmetry it pins is subtle
+// enough to be worth spelling out.
+//
+// The snippet used to gate derivation on DATABRICKS_TOKEN alone while
+// overwriting the token unconditionally. A payload that supplied only
+// DATABRICKS_HOST therefore kept its own endpoint AND received the
+// sandbox's baked creator-identity token — pairing an endpoint the payload
+// chose with a workspace-owner credential it never had to carry. The
+// runtime snippets wired that pair up faithfully, and the deploy-time
+// inference probe shipped the token to that endpoint itself, before the
+// agent ever launched, with the deploy reporting healthy.
+//
+// Deriving one half of a credential pair is never correct: either the
+// sandbox supplies both, or it supplies neither.
+func TestSandboxAuthSnippet_DerivationIsAllOrNothing(t *testing.T) {
+	const cfg = "[DEFAULT]\nhost = https://real.databricks.com\ntoken = dapi-OWNER-PAT\n"
+
+	t.Run("host alone derives NO token", func(t *testing.T) {
+		res := sourceSnippetWithPresetHost(t, cfg, map[string]string{
+			"DATABRICKS_HOST": "https://attacker.example",
+		})
+		if res.token != "" {
+			t.Errorf("payload-supplied host must not inherit the sandbox's owner token, got %q paired with host %q", res.token, res.host)
+		}
+		if res.host != "https://attacker.example" {
+			t.Errorf("an owner-supplied host must be left untouched, got %q", res.host)
+		}
+	})
+
+	t.Run("token alone derives no host", func(t *testing.T) {
+		res := sourceSnippetWithPresetHost(t, cfg, map[string]string{
+			"DATABRICKS_TOKEN": "dapi-owner-own",
+		})
+		if res.host != "" {
+			t.Errorf("supplying only a token must not derive a host, got %q", res.host)
+		}
+	})
+
+	t.Run("neither supplied derives both", func(t *testing.T) {
+		res := sourceSnippetWithPresetHost(t, cfg, nil)
+		if res.host != "https://real.databricks.com" || res.token != "dapi-OWNER-PAT" {
+			t.Errorf("with nothing supplied the sandbox must supply both, got host=%q token=%q", res.host, res.token)
+		}
+	})
+
+	t.Run("both supplied are both left alone", func(t *testing.T) {
+		res := sourceSnippetWithPresetHost(t, cfg, map[string]string{
+			"DATABRICKS_HOST":  "https://mine.example",
+			"DATABRICKS_TOKEN": "dapi-my-own",
+		})
+		if res.host != "https://mine.example" || res.token != "dapi-my-own" {
+			t.Errorf("owner-supplied credentials must both win, got host=%q token=%q", res.host, res.token)
+		}
+	})
+}
+
+// TestRenderEnv_SandboxAuthPrecedesRuntimeSnippets pins the ordering the
+// all-or-nothing derivation depends on, and it exists because that property
+// is weaker than it looks.
+//
+// "Derive both or neither" prevents a payload from pairing its own endpoint
+// with the sandbox's owner token only because nothing sets DATABRICKS_HOST
+// between the env_vars block and SandboxAuthSnippet. That is a REACHABILITY
+// argument, not a positive invariant: a provenance marker would survive
+// refactoring, whereas this holds only while the render order does. If a
+// future runtime snippet ever derived a host before SandboxAuthSnippet ran,
+// the guard would see a non-empty DATABRICKS_HOST, decline to derive, and
+// the property would die with no other test failing.
+//
+// So the order is asserted directly. If this test fails, do not reorder to
+// make it pass without re-checking TestSandboxAuthSnippet_DerivationIsAllOrNothing
+// against the new arrangement.
+func TestRenderEnv_SandboxAuthPrecedesRuntimeSnippets(t *testing.T) {
+	// Driven from runtimeSnippets rather than a literal list, so a future
+	// snippet-bearing runtime cannot be added without appearing here —
+	// TestRuntimeSnippets_CoverEveryRuntime enforces the mapping.
+	for _, tc := range runtimeSnippetCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := claudeTestAgent()
+			agent.AgentCommand = string(tc.rt)
+			env := RenderEnv(agent, tc.rt, true)
+
+			iAuth := strings.Index(env, SandboxAuthSnippet)
+			iRt := strings.Index(env, tc.snippet)
+			if iAuth < 0 {
+				t.Fatal("SandboxAuthSnippet must be rendered in sandbox mode")
+			}
+			if iRt < 0 {
+				t.Fatalf("%s snippet must be rendered", tc.name)
+			}
+			if iAuth > iRt {
+				t.Errorf("SandboxAuthSnippet (at %d) must precede the %s snippet (at %d): the all-or-nothing derivation guard assumes nothing has set DATABRICKS_HOST before it runs", iAuth, tc.name, iRt)
+			}
+
+			// And nothing may export DATABRICKS_HOST/TOKEN after
+			// SandboxAuthSnippet, which is the security half of the same
+			// assumption — pairing the derived token with a host set
+			// afterwards is the only shape that reproduces the original
+			// credential-egress defect.
+			//
+			// Two things this had to get right, both learned the hard way.
+			// The snippet's OWN exports must be excluded first: they are
+			// inside the derivation branch and would self-trip any
+			// whitespace-tolerant match. And the match must then BE
+			// whitespace-tolerant: an earlier version keyed on the literal
+			// "\nexport DATABRICKS_HOST=", which only matches at column 0,
+			// while every export in these snippets is indented inside an
+			// `if` — so it was structurally incapable of firing. Verified by
+			// mutation: adding an indented post-auth export to
+			// ClaudeEnvSnippet left the whole suite green.
+			tail := env[iAuth+len(SandboxAuthSnippet):]
+			if postAuthCredentialExport.MatchString(tail) {
+				t.Errorf("DATABRICKS_HOST/TOKEN is exported after SandboxAuthSnippet; the derivation guard would see it already set:\n%s", tail)
+			}
+		})
+	}
+}
+
+// postAuthCredentialExport matches an export of either half of the
+// credential pair, at any indentation. Whitespace tolerance is the whole
+// point: every export inside these snippets sits within an `if`, so a
+// column-0 pattern can never fire.
+var postAuthCredentialExport = regexp.MustCompile(`(?m)^[ \t]*export[ \t]+DATABRICKS_(HOST|TOKEN)=`)
+
+// runtimeSnippets maps each runtime to the snippet RenderEnv appends for
+// it. A runtime with no snippet is absent rather than mapped to "".
+var runtimeSnippets = map[payload.Runtime]string{
+	payload.RuntimeClaude: ClaudeEnvSnippet,
+	payload.RuntimeCodex:  CodexEnvSnippet,
+}
+
+type runtimeSnippetCase struct {
+	rt      payload.Runtime
+	snippet string
+	name    string
+}
+
+func runtimeSnippetCases() []runtimeSnippetCase {
+	out := make([]runtimeSnippetCase, 0, len(runtimeSnippets))
+	for rt, snippet := range runtimeSnippets {
+		out = append(out, runtimeSnippetCase{rt: rt, snippet: snippet, name: string(rt)})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
+	return out
+}
+
+// TestRuntimeSnippets_CoverEveryRuntime keeps the ordering guard from
+// silently skipping a runtime added later. A runtime whose RenderEnv
+// appends a snippet but which is missing from runtimeSnippets would have
+// its snippet ordering unasserted — and the ordering is what the
+// all-or-nothing derivation guard's reachability argument rests on.
+func TestRuntimeSnippets_CoverEveryRuntime(t *testing.T) {
+	agent := claudeTestAgent()
+	for _, rt := range []payload.Runtime{payload.RuntimeBuzzAgent, payload.RuntimeClaude, payload.RuntimeCodex} {
+		agent.AgentCommand = string(rt)
+		env := RenderEnv(agent, rt, true)
+		// Everything after SandboxAuthSnippet is a runtime snippet.
+		i := strings.Index(env, SandboxAuthSnippet)
+		if i < 0 {
+			t.Fatalf("%s: SandboxAuthSnippet must render in sandbox mode", rt)
+		}
+		hasSnippet := strings.TrimSpace(env[i+len(SandboxAuthSnippet):]) != ""
+		_, mapped := runtimeSnippets[rt]
+		if hasSnippet != mapped {
+			t.Errorf("%s: RenderEnv appends a snippet = %v, but runtimeSnippets has an entry = %v; add it so the ordering guard covers this runtime", rt, hasSnippet, mapped)
+		}
+	}
+}
+
+// TestSandboxAuthSnippet_HostLineMissing pins the INNER half of the
+// all-or-nothing derivation, which was shipped unpinned.
+//
+// The outer guard (both env vars unset) is covered by
+// TestSandboxAuthSnippet_DerivationIsAllOrNothing. This covers the cfg
+// side: a ~/.databrickscfg carrying a token line and NO host line must
+// derive neither. Reverting the inner guard to `[ -n "$buzz_token" ]` left
+// the entire suite green before this test existed — the exact unpinned-guard
+// failure mode that produced three defects earlier in this branch.
+func TestSandboxAuthSnippet_HostLineMissing(t *testing.T) {
+	requireShAndAwk(t)
+	cfg := "[DEFAULT]\ntoken = dapi-BAKED-OWNER-PAT\n"
+	res := sourceSnippet(t, &cfg, "", "set -eu", false, nil)
+	if res.exitCode != 0 {
+		t.Fatalf("expected exit 0, got %d", res.exitCode)
+	}
+	if res.host != "" || res.token != "" {
+		t.Fatalf("got host=%q token=%q, want NEITHER: exporting the baked owner token with no endpoint is half a credential pair", res.host, res.token)
+	}
+}
+
+// TestSnippets_AreSyntacticallyValidShell is the cheapest possible guard
+// against the most embarrassing failure mode this package has: a COMMENT
+// breaking the runtime.
+//
+// Every snippet here is a Go string containing shell, and SandboxAuthSnippet
+// embeds an awk program inside a single-quoted shell string. A single
+// apostrophe anywhere in that program — including in prose like "the probes'
+// charset gate" — closes the string and turns the remainder into shell
+// syntax. That shipped once: `sh -n` reported "Syntax error: word
+// unexpected" at the line after the comment, and because SandboxAuthSnippet
+// is sourced by launch.sh, EVERY sandbox-mode deploy would have failed at
+// launch.
+//
+// The behavioural tests below catch it too, but only for snippets that have
+// exec coverage and only in the configurations those tests exercise. This
+// catches it for all of them, unconditionally, in milliseconds — and it
+// fails with the offending line number rather than a downstream symptom.
+func TestSnippets_AreSyntacticallyValidShell(t *testing.T) {
+	requireShAndAwk(t)
+
+	for name, snippet := range map[string]string{
+		"SandboxAuthSnippet": SandboxAuthSnippet,
+		"ClaudeEnvSnippet":   ClaudeEnvSnippet,
+		"CodexEnvSnippet":    CodexEnvSnippet,
+		"AliveCheckSnippet":  AliveCheckSnippet,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "snippet.sh")
+			if err := os.WriteFile(path, []byte(snippet), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			// -n parses without executing, so this is safe for snippets
+			// whose side effects we do not want here.
+			out, err := exec.Command("sh", "-n", path).CombinedOutput()
+			if err != nil {
+				t.Errorf("%s is not valid shell: %v\n%s", name, err, out)
+			}
+		})
 	}
 }

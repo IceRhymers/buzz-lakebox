@@ -31,6 +31,77 @@ func TestRuntimeFor_BareClaudeRejected(t *testing.T) {
 	}
 }
 
+// TestRuntimeCodex_SpawnCommandNeverBareCodex pins the canonicalization the
+// codex runtime's safety rests on. The sandbox image ships
+// /usr/local/bin/codex — a Databricks `ucode` wrapper that takes no
+// arguments and launches an interactive TUI (probe S1) — and the adapter's
+// own node_modules/.bin ships a second, real `codex`. Neither speaks ACP on
+// stdio the way buzz-acp needs. Only "codex-acp" may ever be spawned.
+func TestRuntimeCodex_SpawnCommandNeverBareCodex(t *testing.T) {
+	if got := RuntimeCodex.SpawnCommand(); got != "codex-acp" {
+		t.Errorf("RuntimeCodex spawn command = %q, want codex-acp", got)
+	}
+}
+
+// TestEnvShapes_CoverEveryRuntime is the completeness gate on envShapes.
+// A runtime missing from that table still renders — it just silently gets
+// the zero shape, which withholds buzz-agent's wiring (safe) but also drops
+// the pinned BUZZ_ACP_PERMISSION_MODE (a bug). Failing safe is not the same
+// as being correct, so the omission must be caught here.
+func TestEnvShapes_CoverEveryRuntime(t *testing.T) {
+	for rt := range spawnCommands {
+		shape, ok := envShapes[rt]
+		if !ok {
+			t.Errorf("runtime %q has no envShapes entry; it would render with the zero shape and lose its permission-mode pin", rt)
+			continue
+		}
+		// Every runtime is either buzz-agent's own inference or an ACP
+		// adapter's; neither-nor means someone added a row without
+		// classifying it.
+		if !shape.BuzzAgentInference && !shape.PinACPPermissionMode {
+			t.Errorf("runtime %q has an empty EnvShape; classify it explicitly", rt)
+		}
+		if shape.BuzzAgentInference && shape.PinACPPermissionMode {
+			t.Errorf("runtime %q claims both buzz-agent inference and an ACP permission-mode pin; those are alternatives", rt)
+		}
+		// Hooks without the server that provides them is incoherent.
+		if shape.MCPHookServers && !shape.StdioMCPCommand {
+			t.Errorf("runtime %q enables MCP hook tools without an MCP command", rt)
+		}
+	}
+}
+
+// TestEnvShape_MatchesUpstreamDiscoveryTable pins each runtime's shape
+// against buzz desktop's own discovery table, which is the authority on
+// what a given runtime needs. The rows do NOT partition into
+// "buzz-agent vs. adapters", and assuming they did is what an earlier
+// version of this code got wrong:
+//
+//	runtime     mcp_command          mcp_hooks
+//	buzz-agent  Some(buzz-dev-mcp)   true
+//	claude      None                 false
+//	codex       Some(buzz-dev-mcp)   false
+//
+// Codex takes buzz-agent's MCP command and none of its inference wiring.
+// Claude is the only runtime with no MCP at all, because Claude Code ships
+// a shell that can run `buzz messages send` itself; codex's tool calls run
+// under the adapter's workspaceWrite/no-network sandbox, so the MCP
+// subprocess is how it talks back at all.
+func TestEnvShape_MatchesUpstreamDiscoveryTable(t *testing.T) {
+	for _, tc := range []struct {
+		rt    Runtime
+		shape EnvShape
+	}{
+		{RuntimeBuzzAgent, EnvShape{BuzzAgentInference: true, StdioMCPCommand: true, MCPHookServers: true}},
+		{RuntimeClaude, EnvShape{PinACPPermissionMode: true}},
+		{RuntimeCodex, EnvShape{StdioMCPCommand: true, PinACPPermissionMode: true}},
+	} {
+		if got := tc.rt.EnvShape(); got != tc.shape {
+			t.Errorf("%s EnvShape = %+v, want %+v", tc.rt, got, tc.shape)
+		}
+	}
+}
+
 func TestRuntimeFor_ExactCaseOnly(t *testing.T) {
 	for _, v := range []string{"Claude-Code", "CLAUDE-CODE", "Buzz-Agent", " claude-code"} {
 		if _, ok := RuntimeFor(v); ok {

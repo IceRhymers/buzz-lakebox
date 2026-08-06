@@ -306,35 +306,13 @@ func TestDeploy_SandboxAuth_CausesAreDistinguishable(t *testing.T) {
 	}
 }
 
-// TestDeploy_SandboxAuth_CauseStub_WithEnvVarsCredentials_NotesPrecedence
-// pins Critic note 3: when the payload's own env_vars ALSO supply
-// DATABRICKS_HOST/DATABRICKS_TOKEN, the stub-cause diagnosis should
-// mention that they'd take precedence over derivation anyway (the stub
-// is still the blocker for the derived path itself).
-func TestDeploy_SandboxAuth_CauseStub_WithEnvVarsCredentials_NotesPrecedence(t *testing.T) {
-	h := newHarness(t)
-	t.Setenv("FAKE_VERSION", "1.9.0")
-	t.Setenv("FAKE_LIST_JSON", "[]")
-	t.Setenv("FAKE_CREATE_STATUS", "Running")
-	t.Setenv("FAKE_AUTH_PROBE_EXIT", "1")
-	t.Setenv("FAKE_AUTH_PROBE_CAUSE", "stub")
-
-	req := buildReq(reqOpts{
-		inferenceAuth: "sandbox",
-		envVars: map[string]string{
-			"DATABRICKS_HOST":  "https://example.databricks.com",
-			"DATABRICKS_TOKEN": "MARKER-PRESET-TOKEN-VALUE",
-		},
-	})
-	_, err := h.dep.Deploy(req)
-	if err == nil {
-		t.Fatal("expected the deploy to fail")
-	}
-	if !strings.Contains(err.Error(), "take precedence anyway") {
-		t.Fatalf("expected the env_vars-precedence note, got: %v", err)
-	}
-}
-
+// The env_vars-precedence diagnostic that used to be pinned here is gone,
+// and so is the test: payload.validateOwnerPATEnvVars now rejects
+// env_vars.DATABRICKS_HOST/DATABRICKS_TOKEN under inference_auth="sandbox"
+// before any provisioning happens, because supplying one of the pair let a
+// payload couple its own endpoint to the sandbox's owner-level token. The
+// state that note described can no longer be reached. Coverage for the
+// rejection itself lives in internal/payload/ownerpat_test.go.
 // launchScriptStdin returns the launch.sh content the deploy shipped.
 func launchScriptStdin(t *testing.T, h *harness) string {
 	t.Helper()

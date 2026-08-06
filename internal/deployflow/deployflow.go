@@ -452,7 +452,7 @@ func (d *Deployer) provision(ctx context.Context, profile, sandboxID string, fre
 	// skip does).
 	switch {
 	case sandboxAuth:
-		if err := d.authProbe(ctx, profile, sandboxID, agent.EnvVars); err != nil {
+		if err := d.authProbe(ctx, profile, sandboxID); err != nil {
 			return err
 		}
 	case !req.ProviderConfig.KeepWorkspacePAT:
@@ -567,7 +567,7 @@ const authProbeCauseMarkerPrefix = "BUZZ_PROBE_CAUSE="
 // ctx bounded by deployTimeoutOrDefault() (Critic note 5) — identical to
 // every neighboring in-sandbox step in this flow; there is no separate,
 // tighter timeout to add here.
-func (d *Deployer) authProbe(ctx context.Context, profile, sandboxID string, envVars map[string]string) error {
+func (d *Deployer) authProbe(ctx context.Context, profile, sandboxID string) error {
 	out, err := d.SSH.RunWithStdin(ctx, profile, sandboxID,
 		step("auth-probe", authProbeScript()),
 		strings.NewReader(nest.SandboxAuthSnippet),
@@ -576,7 +576,7 @@ func (d *Deployer) authProbe(ctx context.Context, profile, sandboxID string, env
 		return nil
 	}
 	cause := authProbeCause(out)
-	msg := authProbeCauseMessage(cause, envVars)
+	msg := authProbeCauseMessage(cause)
 	return &preMutationFailure{err: failf(CodeSandboxAuth,
 		"zero-token auth probe failed: %s (probe output: %s)",
 		msg, remoteText(strings.TrimSpace(out)),
@@ -652,17 +652,21 @@ func probeCause(out, prefix string) string {
 
 // authProbeCauseMessage renders a human diagnosis for one of the probe's
 // three disambiguated causes (docs/PLAN.md zero-token design; Critic
-// notes 2 + 3). envVars is the agent's own env_vars map, checked for
-// cause "stub" so the diagnosis can note that explicit env_vars
-// credentials would have taken precedence over derivation anyway.
-func authProbeCauseMessage(cause string, envVars map[string]string) string {
+// note 2).
+//
+// It used to take the agent's env_vars and, for cause "stub", add a note
+// that explicit env_vars credentials would take precedence over derivation
+// anyway. That branch is gone because the combination it described can no
+// longer reach this code: payload.validateOwnerPATEnvVars now rejects
+// env_vars.DATABRICKS_HOST/DATABRICKS_TOKEN outright under
+// inference_auth="sandbox", since supplying one of the pair let a payload
+// couple its own endpoint to the sandbox's owner-level token. A diagnosis
+// for an unreachable state is worse than none — it would tell an operator
+// that a rejected configuration was merely redundant.
+func authProbeCauseMessage(cause string) string {
 	switch cause {
 	case "stub":
-		msg := "sandbox was previously deployed in env mode; its baked PAT is unrestorable — delete the sandbox and redeploy fresh in sandbox mode"
-		if envVars["DATABRICKS_HOST"] != "" || envVars["DATABRICKS_TOKEN"] != "" {
-			msg += "; note: your env_vars-supplied credentials would take precedence anyway"
-		}
-		return msg
+		return "sandbox was previously deployed in env mode; its baked PAT is unrestorable — delete the sandbox and redeploy fresh in sandbox mode"
 	case "parse":
 		return "~/.databrickscfg missing or unparseable by the derivation snippet"
 	case "credential":
@@ -733,8 +737,8 @@ func (d *Deployer) installAndVerify(ctx context.Context, profile, sandboxID stri
 		return failf(CodeInstallExec, "install: %w", err)
 	}
 
-	if rt == payload.RuntimeClaude {
-		if err := d.installClaudeAdapter(ctx, profile, sandboxID, cfg.ClaudeAdapterVersion); err != nil {
+	if spec, ok := install.AdapterSpecFor(rt.SpawnCommand()); ok {
+		if err := d.installACPAdapter(ctx, profile, sandboxID, spec, adapterVersionFor(rt, cfg)); err != nil {
 			return err
 		}
 	}
@@ -759,31 +763,55 @@ func (d *Deployer) installAndVerify(ctx context.Context, profile, sandboxID stri
 		return failf(CodeRuntimeVerify, "install verification: %s ACP initialize response did not contain %q: %s", rt.SpawnCommand(), install.AgentInfoMarker, remoteText(strings.TrimSpace(out)))
 	}
 
-	if rt == payload.RuntimeClaude {
+	switch rt {
+	case payload.RuntimeClaude:
 		if err := d.claudeInferenceProbe(ctx, profile, sandboxID, envContent); err != nil {
+			return err
+		}
+	case payload.RuntimeCodex:
+		if err := d.codexInferenceProbe(ctx, profile, sandboxID, envContent); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// installClaudeAdapter installs the npm ACP adapter the Claude runtime
-// spawns, as its own write+exec pair so a failure is attributable to the
-// adapter rather than to the .deb.
-func (d *Deployer) installClaudeAdapter(ctx context.Context, profile, sandboxID, adapterVersion string) error {
-	script, err := install.BuildAdapterInstallScript(adapterVersion)
+// adapterVersionFor picks the per-runtime adapter version override from
+// provider_config. A runtime with no override field yields "", which
+// BuildAdapterInstallScript reads as "use the spec's pinned default".
+func adapterVersionFor(rt payload.Runtime, cfg payload.ProviderConfig) string {
+	switch rt {
+	case payload.RuntimeClaude:
+		return cfg.ClaudeAdapterVersion
+	case payload.RuntimeCodex:
+		return cfg.CodexAdapterVersion
+	default:
+		return ""
+	}
+}
+
+// installACPAdapter installs the npm ACP adapter a runtime spawns, as its
+// own write+exec pair so a failure is attributable to the adapter rather
+// than to the .deb.
+//
+// The script path is shared across runtimes even though each adapter has
+// its own npm tree: it is written immediately before it is executed and
+// never read again, so it carries no runtime-specific state worth
+// partitioning.
+func (d *Deployer) installACPAdapter(ctx context.Context, profile, sandboxID string, spec install.AdapterSpec, adapterVersion string) error {
+	script, err := install.BuildAdapterInstallScript(spec.BinName, adapterVersion)
 	if err != nil {
-		return failf(CodeAdapterScript, "claude adapter install: %w", err)
+		return failf(CodeAdapterScript, "%s adapter install: %w", spec.Label, err)
 	}
 	const adapterScriptPath = "$HOME/.buzz-backend/install-adapter.sh"
 	if _, err := d.SSH.RunWithStdin(ctx, profile, sandboxID,
 		step("adapter-write", fmt.Sprintf(`set -eu; umask 077; mkdir -p "$HOME/.buzz-backend"; cat > %s`, dquote(adapterScriptPath))),
 		strings.NewReader(script),
 	); err != nil {
-		return failf(CodeAdapterWrite, "claude adapter install: write install script: %w", err)
+		return failf(CodeAdapterWrite, "%s adapter install: write install script: %w", spec.Label, err)
 	}
 	if _, err := d.SSH.Run(ctx, profile, sandboxID, step("adapter-exec", fmt.Sprintf(`sh %s`, dquote(adapterScriptPath)))); err != nil {
-		return failf(CodeAdapterExec, "claude adapter install: %w", err)
+		return failf(CodeAdapterExec, "%s adapter install: %w", spec.Label, err)
 	}
 	return nil
 }
@@ -824,6 +852,32 @@ func (d *Deployer) claudeInferenceProbe(ctx context.Context, profile, sandboxID,
 	}
 	return failf(CodeClaudeInference, "claude inference probe: %s (probe output: %s)",
 		claudeProbeCauseMessage(cause, out), remoteText(strings.TrimSpace(out)))
+}
+
+// codexInferenceProbe is the codex twin of claudeInferenceProbe: it closes
+// the same gap between "the agent process answers an ACP handshake" and
+// "the agent can actually reach an LLM", which neither install verification
+// nor launch verification touches.
+func (d *Deployer) codexInferenceProbe(ctx context.Context, profile, sandboxID, envContent string) error {
+	// Same shape as authProbe and claudeInferenceProbe: the script signals
+	// failure by exiting non-zero, so the error is the NORMAL failure path
+	// and the cause marker must be parsed from the output it still
+	// returned — returning early on err would make the diagnosis below
+	// dead code.
+	out, err := d.SSH.RunWithStdin(ctx, profile, sandboxID,
+		step("codex-inference-probe", codexInferenceProbeScript()),
+		strings.NewReader(envContent),
+	)
+	if err == nil {
+		return nil
+	}
+	cause := probeCause(out, codexProbeCauseMarkerPrefix)
+	if cause == "" {
+		// No marker: the transport itself failed before the script ran.
+		return failf(CodeCodexInference, "codex inference probe: %w", err)
+	}
+	return failf(CodeCodexInference, "codex inference probe: %s (probe output: %s)",
+		codexProbeCauseMessage(cause, out), remoteText(strings.TrimSpace(out)))
 }
 
 // verifyLaunch implements docs/PLAN.md §4.4 step 10's pass signal, waiting

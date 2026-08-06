@@ -133,6 +133,48 @@ func TestRenderEnv_BuzzAgentByteIdenticalToBaseline(t *testing.T) {
 	}
 }
 
+// claudeBaselineEnv is the EXACT fixed block the renderer produced for the
+// Claude runtime before RenderEnv was generalized from "Claude vs. the rest"
+// to per-runtime payload.EnvShape capabilities. Same doctrine as
+// buzzAgentBaselineEnv above, and needed for the same reason: that refactor
+// touched the render path for the secret-bearing env file of BOTH shipped
+// runtimes, and TestRenderEnv_ClaudeGolden is substring-only — which, as
+// buzzAgentBaselineEnv's own comment says, cannot detect a reordering, an
+// inserted line, or a changed value elsewhere in the file.
+//
+// If a deliberate change to the Claude rendering lands, update this constant
+// in the same commit — the diff to it IS the review artifact.
+const claudeBaselineEnv = `export BUZZ_PRIVATE_KEY='nsec1abc'
+export BUZZ_AUTH_TAG='tag-abc'
+export BUZZ_RELAY_URL='wss://relay.example.com'
+export BUZZ_ACP_AGENT_COMMAND='claude-agent-acp'
+export BUZZ_ACP_AGENT_ARGS=''
+export BUZZ_ACP_AGENTS='2'
+export BUZZ_ACP_SYSTEM_PROMPT='You are a reviewer.'
+export BUZZ_ACP_RESPOND_TO='owner-only'
+export NOSTR_PRIVATE_KEY='nsec1abc'
+export BUZZ_ACP_RELAY_OBSERVER='true'
+export BUZZ_ACP_DEDUP='queue'
+export BUZZ_ACP_MULTIPLE_EVENT_HANDLING='steer'
+export BUZZ_ACP_PERMISSION_MODE='bypass-permissions'
+export DATABRICKS_HOST='https://example.databricks.com'
+export DATABRICKS_TOKEN='dapi-marker-secret'
+`
+
+func TestRenderEnv_ClaudeByteIdenticalToBaseline(t *testing.T) {
+	agent := claudeTestAgent()
+
+	wantEnv := claudeBaselineEnv + "\n" + ClaudeEnvSnippet
+	if got := RenderEnv(agent, payload.RuntimeClaude, false); got != wantEnv {
+		t.Errorf("claude env-mode rendering changed.\n--- got ---\n%s\n--- want ---\n%s", got, wantEnv)
+	}
+
+	wantSandbox := claudeBaselineEnv + "\n" + SandboxAuthSnippet + "\n" + ClaudeEnvSnippet
+	if got := RenderEnv(agent, payload.RuntimeClaude, true); got != wantSandbox {
+		t.Errorf("claude sandbox-mode rendering changed.\n--- got ---\n%s\n--- want ---\n%s", got, wantSandbox)
+	}
+}
+
 // TestRenderEnv_ClaudeSnippetOrderedLast pins the ordering the whole
 // both-modes design rests on: ClaudeEnvSnippet must come after the env_vars
 // block AND after SandboxAuthSnippet, because those are the two places its
