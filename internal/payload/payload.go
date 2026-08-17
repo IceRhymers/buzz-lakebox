@@ -89,6 +89,22 @@ type ProviderConfig struct {
 	// (docs/M3_CODEX_PROBE_RESULTS.md S7/S10), so a new version must be
 	// re-verified against that finding rather than assumed equivalent.
 	CodexAdapterVersion string `json:"codex_adapter_version"`
+
+	// ExtraBinaries and McpServers are the #15/#16 capability channel: extra
+	// pinned binaries to install into the launch PATH dir, and MCP servers to
+	// wire up. Expert-only and deliberately NOT advertised in the provider's
+	// config_schema (same posture as KeepWorkspacePAT), so Buzz Desktop's
+	// create-agent dialog stays unchanged.
+	//
+	// Both are ARRAY-valued, which is why they can only ever arrive via a raw
+	// operator-CLI payload and never through Buzz Desktop: the desktop's
+	// validate_provider_config accepts scalar values only, so a non-scalar
+	// provider_config key is rejected upstream before it reaches us. This
+	// package defines only their VALIDATION (issue #18); the install/wire
+	// behavior is issues #15/#16, and a payload that sets these keys must
+	// validate/refuse correctly but otherwise does nothing here.
+	ExtraBinaries []ExtraBinary `json:"extra_binaries"`
+	McpServers    []string      `json:"mcp_servers"`
 }
 
 // SandboxInferenceAuth reports whether provider_config opts the deploy into
@@ -216,6 +232,12 @@ func (r DeployRequest) Validate() error {
 		)
 	}
 	if err := r.validateOwnerPATEnvVars(); err != nil {
+		return err
+	}
+	if err := r.validateCapabilityKeysOwnerPAT(); err != nil {
+		return err
+	}
+	if err := r.validateExtraBinaries(); err != nil {
 		return err
 	}
 	if err := r.validateClaudeInferenceSource(); err != nil {

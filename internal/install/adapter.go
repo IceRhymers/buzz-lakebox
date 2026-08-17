@@ -127,6 +127,20 @@ var adapterSpecs = map[string]AdapterSpec{
 	},
 }
 
+// AdapterBinNames returns the BinName of every adapterSpecs entry, sorted for
+// determinism. It exists so that the reserved-name set a payload's extra
+// binaries must not collide with (issue #18) can be built from install's own
+// source of truth rather than duplicating the adapter bin names in
+// internal/payload.
+func AdapterBinNames() []string {
+	out := make([]string, 0, len(adapterSpecs))
+	for _, spec := range adapterSpecs {
+		out = append(out, spec.BinName)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // AdapterSpecFor returns the adapter spec for a canonical spawn command.
 // The second result is false for runtimes that need no npm adapter at all
 // (buzz-agent ships in the .deb) and for unknown commands — callers must
