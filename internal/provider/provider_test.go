@@ -43,12 +43,11 @@ func TestInfo_FrozenShape(t *testing.T) {
 	m := decodeLine(t, line)
 
 	want := map[string]any{
-		"ok":          true,
-		"name":        "Databricks Lakebox",
-		"version":     version.Version,
-		"description": "Deploys Buzz agents into Databricks Lakebox sandboxes",
-		"protocol":    "v1",
-		"ops":         []any{"info", "deploy"},
+		"ok":               true,
+		"name":             "Databricks Lakebox",
+		"version":          version.Version,
+		"description":      "Deploys Buzz agents into Databricks Lakebox sandboxes",
+		"protocol_version": 1,
 		"config_schema": map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -83,6 +82,32 @@ func TestInfo_FrozenShape(t *testing.T) {
 			t.Fatalf("info response field %q = %#v, want %#v", k, gv, wv)
 		}
 	}
+
+	// Buzz Desktop's validate_provider_info rejects any field outside a strict
+	// whitelist, so the response must carry EXACTLY these keys — no legacy
+	// "protocol"/"ops" — or the desktop fails the probe with "unknown field".
+	if len(m) != len(want) {
+		t.Fatalf("info response has %d fields, want exactly %d (%v); got %#v", len(m), len(want), keysOf(want), m)
+	}
+
+	// protocol_version must decode as a JSON number (an integer), never the
+	// old "v1"-style string: the desktop reads it with as_u64 and a string
+	// yields "provider info response missing integer protocol_version".
+	pv, ok := m["protocol_version"].(float64)
+	if !ok {
+		t.Fatalf("protocol_version is not a JSON number: got %#v", m["protocol_version"])
+	}
+	if pv != 1 {
+		t.Fatalf("protocol_version = %v, want 1", pv)
+	}
+}
+
+func keysOf(m map[string]any) []string {
+	ks := make([]string, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
+	}
+	return ks
 }
 
 func TestInfo_WithRequestIDIgnoresIt(t *testing.T) {

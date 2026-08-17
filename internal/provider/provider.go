@@ -26,16 +26,25 @@ const (
 	// (docs/CONTRACT.md §4).
 	Description = "Deploys Buzz agents into Databricks Lakebox sandboxes"
 
-	// Protocol is the frozen provider protocol version.
-	Protocol = "v1"
+	// ProtocolVersion is the wire-contract version of the provider protocol,
+	// emitted as the INTEGER "protocol_version" field of the info response.
+	// Buzz Desktop's validate_provider_info (block/buzz
+	// desktop/src-tauri/src/managed_agents/backend.rs) rejects a provider
+	// whose protocol_version it does not speak — a missing field is an error,
+	// not a presumed 1 — so this must be present, integer-typed, and equal to
+	// the version the desktop requires (currently 1). It replaced the earlier
+	// cosmetic string "protocol":"v1", which Buzz now rejects as an unknown
+	// field (the info response is validated against a strict key whitelist).
+	ProtocolVersion = 1
 
 	opInfo   = "info"
 	opDeploy = "deploy"
 )
 
-// supportedOps is the frozen list advertised in the info response and in
-// the unknown-op error message. Order matters for the error string
-// (docs/CONTRACT.md §4 "Unknown op").
+// supportedOps is the frozen list used to build the unknown-op error message.
+// Order matters for the error string (docs/CONTRACT.md §4 "Unknown op"). It is
+// deliberately NOT advertised in the info response: Buzz validates that
+// response against a strict field whitelist and rejects an "ops" field.
 var supportedOps = []string{opInfo, opDeploy}
 
 // envelope is the minimal shape needed to route any request; deploy's
@@ -50,14 +59,18 @@ type envelope struct {
 // deploy is not implemented yet: every deploy op returns the M0 stub error.
 type DeployFunc func(req *payload.DeployRequest) (agentID string, err error)
 
+// infoResponse is the info-op response. Its fields are exactly the set Buzz
+// Desktop's validate_provider_info whitelists — ok, name, version,
+// protocol_version, description, config_schema — and no others: any extra
+// field is rejected as an unknown field (docs/CONTRACT.md §4). config_schema
+// is required (must be a JSON object), so it carries no omitempty.
 type infoResponse struct {
-	Ok           bool     `json:"ok"`
-	Name         string   `json:"name"`
-	Version      string   `json:"version"`
-	Description  string   `json:"description"`
-	Protocol     string   `json:"protocol"`
-	Ops          []string `json:"ops"`
-	ConfigSchema any      `json:"config_schema,omitempty"`
+	Ok              bool   `json:"ok"`
+	Name            string `json:"name"`
+	Version         string `json:"version"`
+	ProtocolVersion int    `json:"protocol_version"`
+	Description     string `json:"description"`
+	ConfigSchema    any    `json:"config_schema"`
 }
 
 // configSchema is the additive, static JSON-Schema-ish object advertised in
@@ -141,13 +154,12 @@ func route(data []byte, deploy DeployFunc) any {
 	switch env.Op {
 	case opInfo:
 		return infoResponse{
-			Ok:           true,
-			Name:         Name,
-			Version:      version.Version,
-			Description:  Description,
-			Protocol:     Protocol,
-			Ops:          supportedOps,
-			ConfigSchema: configSchema,
+			Ok:              true,
+			Name:            Name,
+			Version:         version.Version,
+			ProtocolVersion: ProtocolVersion,
+			Description:     Description,
+			ConfigSchema:    configSchema,
 		}
 	case opDeploy:
 		return handleDeploy(data, deploy)
