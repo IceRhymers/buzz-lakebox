@@ -1,0 +1,220 @@
+package payload
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/IceRhymers/buzz-lakebox/internal/install"
+)
+
+// capReq builds a deploy request whose provider_config carries the capability
+// keys under test, mirroring ownerPATReq. The runtime "codex-acp" is one
+// RuntimeFor accepts (see runtime.go).
+func capReq(cfg ProviderConfig) DeployRequest {
+	return DeployRequest{
+		Op: "deploy",
+		Agent: Agent{
+			RelayURL: "wss://r", PrivateKeyNsec: "nsec1x", AuthTag: "t",
+			AgentCommand: "codex-acp",
+		},
+		ProviderConfig: cfg,
+	}
+}
+
+// validExtraBinary is a structurally-valid entry reused across the tests that
+// need the structural checks to pass so a different check can be exercised.
+func validExtraBinary() ExtraBinary {
+	return ExtraBinary{
+		URL:    "https://example.com/shellbox-mcp",
+		SHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		Bin:    "shellbox-mcp",
+	}
+}
+
+// TestValidate_CapabilityKeysRefusedUnderOwnerPAT pins the gate: either
+// capability key is refused whenever the sandbox holds a workspace-owner
+// credential, under BOTH inference_auth="sandbox" and keep_workspace_pat=true.
+// The error must name the key and point at the inference_auth="env" remedy.
+func TestValidate_CapabilityKeysRefusedUnderOwnerPAT(t *testing.T) {
+	cases := []struct {
+		name    string
+		cfg     ProviderConfig
+		wantKey string
+	}{
+		{"extra_binaries under sandbox", ProviderConfig{InferenceAuth: "sandbox", ExtraBinaries: []ExtraBinary{validExtraBinary()}}, "extra_binaries"},
+		{"mcp_servers under sandbox", ProviderConfig{InferenceAuth: "sandbox", McpServers: []string{"shellbox"}}, "mcp_servers"},
+		{"extra_binaries under keep_workspace_pat", ProviderConfig{KeepWorkspacePAT: true, ExtraBinaries: []ExtraBinary{validExtraBinary()}}, "extra_binaries"},
+		{"mcp_servers under keep_workspace_pat", ProviderConfig{KeepWorkspacePAT: true, McpServers: []string{"shellbox"}}, "mcp_servers"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := capReq(tc.cfg).Validate()
+			if err == nil {
+				t.Fatalf("%s: capability key must be refused when the sandbox holds an owner credential", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.wantKey) {
+				t.Errorf("%s: rejection should name %s, got: %v", tc.name, tc.wantKey, err)
+			}
+			if !strings.Contains(err.Error(), `inference_auth="env"`) {
+				t.Errorf("%s: rejection should point at the inference_auth=\"env\" remedy, got: %v", tc.name, err)
+			}
+		})
+	}
+}
+
+// TestValidate_CapabilityKeysGateDeterministic pins that a payload setting
+// BOTH keys always reports extra_binaries first.
+func TestValidate_CapabilityKeysGateDeterministic(t *testing.T) {
+	cfg := ProviderConfig{
+		InferenceAuth: "sandbox",
+		ExtraBinaries: []ExtraBinary{validExtraBinary()},
+		McpServers:    []string{"shellbox"},
+	}
+	err := capReq(cfg).Validate()
+	if err == nil {
+		t.Fatal("expected rejection")
+	}
+	if !strings.Contains(err.Error(), "extra_binaries") {
+		t.Errorf("with both keys set the gate must report extra_binaries first, got: %v", err)
+	}
+}
+
+// TestValidate_CapabilityKeysPermittedUnderEnv pins the asymmetry: under
+// inference_auth="env" the owner-PAT gate does not fire, so the capability
+// keys are permitted by that gate. (A structurally-valid extra_binaries entry
+// is used so validateExtraBinaries does not fire either.)
+func TestValidate_CapabilityKeysPermittedUnderEnv(t *testing.T) {
+	env := map[string]string{"DATABRICKS_HOST": "https://mine.example", "DATABRICKS_TOKEN": "dapi-own"}
+	req := capReq(ProviderConfig{
+		InferenceAuth: "env",
+		ExtraBinaries: []ExtraBinary{validExtraBinary()},
+		McpServers:    []string{"shellbox"},
+	})
+	req.Agent.EnvVars = env
+	if err := req.Validate(); err != nil {
+		t.Errorf("env mode uses the owner's own credential and must permit the capability keys: %v", err)
+	}
+}
+
+// envReq builds an env-mode request carrying the given extra_binaries, so the
+// owner-PAT gate never fires and validateExtraBinaries is exercised in
+// isolation.
+func envReq(bins ...ExtraBinary) DeployRequest {
+	req := capReq(ProviderConfig{InferenceAuth: "env", ExtraBinaries: bins})
+	req.Agent.EnvVars = map[string]string{"DATABRICKS_HOST": "https://mine.example", "DATABRICKS_TOKEN": "dapi-own"}
+	return req
+}
+
+// TestValidate_ExtraBinariesURL covers the url structural rule: https only,
+// and with a host (a hostless "https://" must fail loud here, not at fetch).
+func TestValidate_ExtraBinariesURL(t *testing.T) {
+	for _, bad := range []string{"", "http://example.com/x", "ftp://example.com/x", "://nohost", "https://", "https:///path"} {
+		eb := validExtraBinary()
+		eb.URL = bad
+		if err := envReq(eb).Validate(); err == nil {
+			t.Errorf("extra_binaries.url %q must be rejected", bad)
+		}
+	}
+}
+
+// TestValidate_ExtraBinariesSHA256 covers the sha256 structural rule: required,
+// lowercase 64-hex only.
+func TestValidate_ExtraBinariesSHA256(t *testing.T) {
+	cases := map[string]string{
+		"missing":       "",
+		"too short":     "0123456789abcdef",
+		"non-hex chars": "z123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		"uppercase":     "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF",
+	}
+	for name, sha := range cases {
+		eb := validExtraBinary()
+		eb.SHA256 = sha
+		if err := envReq(eb).Validate(); err == nil {
+			t.Errorf("extra_binaries.sha256 %q (%s) must be rejected", sha, name)
+		}
+	}
+}
+
+// TestValidate_ExtraBinariesBinTraversal covers the bare-filename rule: path
+// separators, traversal names, empty, and leading-dash (option-injection)
+// names are all rejected.
+func TestValidate_ExtraBinariesBinTraversal(t *testing.T) {
+	for _, bad := range []string{"foo/bar", "..", ".", "a\\b", "", "sub/../x", "-rf", "-n"} {
+		eb := validExtraBinary()
+		eb.Bin = bad
+		if err := envReq(eb).Validate(); err == nil {
+			t.Errorf("extra_binaries.bin %q must be rejected", bad)
+		}
+	}
+}
+
+// TestValidate_ExtraBinariesBinCollision table-drives over EVERY reserved
+// name: install.BinNames plus both install.AdapterBinNames() entries. Each
+// must be refused because it would shadow a real binary in the launch PATH.
+func TestValidate_ExtraBinariesBinCollision(t *testing.T) {
+	var reserved []string
+	reserved = append(reserved, install.BinNames...)
+	reserved = append(reserved, install.AdapterBinNames()...)
+	// "codex" is not installed by the provider but is deliberately preserved
+	// (the image's /usr/local/bin ucode wrapper); a bin named "codex" must be
+	// refused too so it cannot shadow that wrapper.
+	reserved = append(reserved, "codex")
+	for _, name := range reserved {
+		eb := validExtraBinary()
+		eb.Bin = name
+		err := envReq(eb).Validate()
+		if err == nil {
+			t.Errorf("extra_binaries.bin %q must be rejected: it collides with an installed binary", name)
+			continue
+		}
+		if !strings.Contains(err.Error(), name) {
+			t.Errorf("collision rejection for %q should name the bin, got: %v", name, err)
+		}
+	}
+}
+
+// TestValidate_ExtraBinariesStructuralRunsInEveryMode pins that the structural
+// checks are UNCONDITIONAL: a malformed entry is rejected even in env mode,
+// where the owner-PAT gate does not fire.
+func TestValidate_ExtraBinariesStructuralRunsInEveryMode(t *testing.T) {
+	eb := validExtraBinary()
+	eb.URL = "http://example.com/x"
+	if err := envReq(eb).Validate(); err == nil {
+		t.Error("structural checks must run in env mode too")
+	}
+}
+
+// TestValidate_NoCapabilityKeysNoError is the regression guard: a request with
+// neither capability key validates cleanly under an owner-PAT mode.
+func TestValidate_NoCapabilityKeysNoError(t *testing.T) {
+	req := capReq(ProviderConfig{InferenceAuth: "sandbox"})
+	if err := req.Validate(); err != nil {
+		t.Errorf("a request with neither capability key must validate: %v", err)
+	}
+}
+
+// TestValidate_SingleValidExtraBinaryPasses is the positive regression: a
+// single well-formed entry in env mode passes full Validate().
+func TestValidate_SingleValidExtraBinaryPasses(t *testing.T) {
+	if err := envReq(validExtraBinary()).Validate(); err != nil {
+		t.Errorf("a valid extra_binaries entry in env mode must pass Validate(): %v", err)
+	}
+}
+
+// TestCapabilityKeyNamesPassSecretWordFilter documents (#18 item 4) why these
+// keys are Desktop-shaped-safe on the NAME axis: Buzz's validate_provider_config
+// rejects any provider_config key whose name contains a secret-like word
+// segment (token|key|secret|password|credential). None of our capability key
+// names or the extra_binaries sub-field names contain such a segment, so they
+// pass that name filter — the reason a payload is rejected on these keys is
+// their ARRAY value (scalar-only), never their name.
+func TestCapabilityKeyNamesPassSecretWordFilter(t *testing.T) {
+	forbidden := []string{"token", "key", "secret", "password", "credential"}
+	for _, name := range []string{"extra_binaries", "mcp_servers", "url", "sha256", "bin"} {
+		for _, word := range forbidden {
+			if strings.Contains(name, word) {
+				t.Errorf("key name %q contains secret-word segment %q; it would be rejected by Buzz's validate_provider_config name filter", name, word)
+			}
+		}
+	}
+}
