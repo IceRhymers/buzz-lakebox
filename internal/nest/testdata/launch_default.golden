@@ -1,0 +1,66 @@
+#!/bin/sh
+set -eu
+
+# Re-assert the PAT stub on every launch (deploy, `start`, and any future
+# supervisor all funnel through this script) — covers the unverified
+# "does sandbox start restore the baked PAT file?" case by construction.
+# Skipped entirely when provider_config.keep_workspace_pat=true, so the
+# owner's retained PAT survives every relaunch, not just the initial
+# deploy (BUG 3 fix: this used to run unconditionally here). Also
+# skipped when provider_config.inference_auth="sandbox": that mode
+# needs the baked cfg intact for SandboxAuthSnippet to derive
+# credentials from, and it supersedes keep_workspace_pat.
+umask 077
+cat > "$HOME/.databrickscfg" <<'BUZZ_PAT_STUB_EOF'
+# Databricks CLI config managed by buzz-backend-databricks-lakebox.
+#
+# The baked creator-identity PAT has been intentionally removed by this
+# provider (docs/PLAN.md §4.4 step 4, §5): the sandbox's in-image
+# ~/.databrickscfg granted owner-level workspace access, which the agent
+# must not retain. Inference credentials (if any) are supplied explicitly
+# via the DATABRICKS_HOST / DATABRICKS_TOKEN environment instead.
+#
+# This file intentionally contains no profile sections or credentials.
+BUZZ_PAT_STUB_EOF
+
+# shellcheck disable=SC1090
+. "$HOME/.buzz-backend/env"
+
+# Installed Buzz binaries must be on PATH: buzz-acp spawns the agent
+# command (BUZZ_ACP_AGENT_COMMAND="buzz-agent") by bare name, and the
+# agent itself shells out to `buzz` and git-credential-nostr — none of
+# which the sandbox's default PATH can see (live-bitten: every worker
+# died at spawn with "No such file or directory"; only buzz-acp itself
+# survived because this script launches it by absolute path).
+export PATH="$HOME/.buzz-backend/bin:$PATH"
+
+mkdir -p "$HOME/.buzz" "$HOME/.buzz/REPOS" "$HOME/.buzz/OUTBOX" "$HOME/.buzz-backend"
+cd "$HOME/.buzz"
+
+# flock + pidfile + pgrep guard against a double-launch (redeploy /
+# concurrent start racing an already-running buzz-acp).
+LOCK="$HOME/.buzz-backend/launch.lock"
+exec 9>"$LOCK"
+if ! flock -n 9; then
+  echo "launch.sh already running (flock held); exiting" >&2
+  exit 0
+fi
+
+buzz_acp_alive() {
+  for pid in $(pgrep -f '[b]uzz-acp' 2>/dev/null); do
+    st=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ')
+    case "$st" in
+      Z*|"") continue ;;
+      *) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+if buzz_acp_alive; then
+  echo "buzz-acp already running; not relaunching" >&2
+  exit 0
+fi
+
+setsid nohup "$HOME/.buzz-backend/bin/buzz-acp" >> "$HOME/.buzz-backend/acp.log" 2>&1 9>&- &
+echo $! > "$HOME/.buzz-backend/acp.pid"

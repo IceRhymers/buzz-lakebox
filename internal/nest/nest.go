@@ -462,7 +462,14 @@ func RenderEnv(agent payload.Agent, rt payload.Runtime, sandboxInferenceAuth boo
 // It is written by the same shell that spawns buzz-acp and only AFTER the
 // double-launch guards have passed, so its presence means "this run really
 // did start an agent" — not merely "this run happened".
-func RenderLaunchScript(keepWorkspacePAT, sandboxInferenceAuth bool, launchID string) string {
+//
+// hasExtraBinaries mirrors len(provider_config.extra_binaries) > 0 (#15): when
+// true, the PATH export APPENDS $HOME/.buzz-backend/extra-bin (the dir
+// install.BuildExtraBinariesInstallScript places binaries into) so novel names
+// resolve while never shadowing a system or provider binary — the appended dir
+// comes AFTER $PATH and after the prepended $HOME/.buzz-backend/bin. When
+// false, the PATH line is byte-identical to before this parameter existed.
+func RenderLaunchScript(keepWorkspacePAT, sandboxInferenceAuth bool, launchID string, hasExtraBinaries bool) string {
 	var b strings.Builder
 	b.WriteString("#!/bin/sh\n")
 	b.WriteString("set -eu\n\n")
@@ -492,7 +499,15 @@ func RenderLaunchScript(keepWorkspacePAT, sandboxInferenceAuth bool, launchID st
 	b.WriteString("# which the sandbox's default PATH can see (live-bitten: every worker\n")
 	b.WriteString("# died at spawn with \"No such file or directory\"; only buzz-acp itself\n")
 	b.WriteString("# survived because this script launches it by absolute path).\n")
-	b.WriteString(`export PATH="$HOME/.buzz-backend/bin:$PATH"` + "\n\n")
+	if hasExtraBinaries {
+		// Extra binaries (#15) are APPENDED after $PATH, never prepended: an
+		// operator's pinned binary must not be able to shadow a system binary
+		// (system dirs stay first) nor a provider binary ($HOME/.buzz-backend/bin
+		// stays first) — only resolve a name nothing else provides.
+		b.WriteString(`export PATH="$HOME/.buzz-backend/bin:$PATH:$HOME/.buzz-backend/extra-bin"` + "\n\n")
+	} else {
+		b.WriteString(`export PATH="$HOME/.buzz-backend/bin:$PATH"` + "\n\n")
+	}
 
 	b.WriteString(`mkdir -p "$HOME/.buzz" "$HOME/.buzz/REPOS" "$HOME/.buzz/OUTBOX" "$HOME/.buzz-backend"` + "\n")
 	b.WriteString(`cd "$HOME/.buzz"` + "\n\n")

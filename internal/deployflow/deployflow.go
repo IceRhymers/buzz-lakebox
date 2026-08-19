@@ -516,7 +516,7 @@ func (d *Deployer) provision(ctx context.Context, profile, sandboxID string, fre
 	launchID := d.newLaunchID()
 	if _, err := d.SSH.RunWithStdin(ctx, profile, sandboxID,
 		step("launch-write", fmt.Sprintf(`set -eu; umask 077; cat > %s && chmod 700 %s`, dquote(nest.LaunchScriptPath), dquote(nest.LaunchScriptPath))),
-		strings.NewReader(nest.RenderLaunchScript(req.ProviderConfig.KeepWorkspacePAT, sandboxAuth, launchID)),
+		strings.NewReader(nest.RenderLaunchScript(req.ProviderConfig.KeepWorkspacePAT, sandboxAuth, launchID, len(req.ProviderConfig.ExtraBinaries) > 0)),
 	); err != nil {
 		return failf(CodeLaunchWrite, "write launch.sh: %w", err)
 	}
@@ -743,6 +743,16 @@ func (d *Deployer) installAndVerify(ctx context.Context, profile, sandboxID stri
 		}
 	}
 
+	// Extra binaries (#15): fetch/verify/place the operator's pinned single-file
+	// executables into the appended extra-bin PATH dir. Sequenced AFTER the
+	// adapter and BEFORE runtime verification, and ONLY when present — a deploy
+	// with no extra_binaries issues no round trip at all (regression-safe).
+	if len(cfg.ExtraBinaries) > 0 {
+		if err := d.installExtraBinaries(ctx, profile, sandboxID, cfg.ExtraBinaries); err != nil {
+			return err
+		}
+	}
+
 	// Runtime verification: ACP initialize handshake with the agent env
 	// sourced (docs/M05_PROBE_RESULTS.md §6), env content shipped via
 	// stdin only. The binary differs per runtime; the frame and the
@@ -812,6 +822,33 @@ func (d *Deployer) installACPAdapter(ctx context.Context, profile, sandboxID str
 	}
 	if _, err := d.SSH.Run(ctx, profile, sandboxID, step("adapter-exec", fmt.Sprintf(`sh %s`, dquote(adapterScriptPath)))); err != nil {
 		return failf(CodeAdapterExec, "%s adapter install: %w", spec.Label, err)
+	}
+	return nil
+}
+
+// installExtraBinaries installs the operator's pinned extra_binaries (#15) as
+// its own write+exec pair, mirroring installACPAdapter so a failure is
+// attributable to this step rather than to the .deb or the adapter. The
+// payload structs are mapped to install-local ones at the boundary, keeping
+// internal/install free of an internal/payload dependency (P2).
+func (d *Deployer) installExtraBinaries(ctx context.Context, profile, sandboxID string, ebs []payload.ExtraBinary) error {
+	specs := make([]install.ExtraBinaryInstall, len(ebs))
+	for i, eb := range ebs {
+		specs[i] = install.ExtraBinaryInstall{URL: eb.URL, SHA256: eb.SHA256, Bin: eb.Bin}
+	}
+	script, err := install.BuildExtraBinariesInstallScript(specs)
+	if err != nil {
+		return failf(CodeExtraBinScript, "extra binaries install: %w", err)
+	}
+	const extraBinScriptPath = "$HOME/.buzz-backend/install-extra-bins.sh"
+	if _, err := d.SSH.RunWithStdin(ctx, profile, sandboxID,
+		step("extra-bins-write", fmt.Sprintf(`set -eu; umask 077; mkdir -p "$HOME/.buzz-backend"; cat > %s`, dquote(extraBinScriptPath))),
+		strings.NewReader(script),
+	); err != nil {
+		return failf(CodeExtraBinWrite, "extra binaries install: write install script: %w", err)
+	}
+	if _, err := d.SSH.Run(ctx, profile, sandboxID, step("extra-bins-exec", fmt.Sprintf(`sh %s`, dquote(extraBinScriptPath)))); err != nil {
+		return failf(CodeExtraBinExec, "extra binaries install: %w", err)
 	}
 	return nil
 }

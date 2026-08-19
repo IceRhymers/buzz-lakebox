@@ -146,6 +146,9 @@ case "$1" in
           adapter-exec)
             exit "${FAKE_ADAPTER_EXIT:-0}"
             ;;
+          extra-bins-exec)
+            exit "${FAKE_EXTRA_BIN_EXIT:-0}"
+            ;;
           prelaunch-kill)
             printf '%s' "${FAKE_PRELAUNCH_OUTPUT:-}"
             exit 0
