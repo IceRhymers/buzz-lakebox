@@ -82,6 +82,11 @@ type infoResponse struct {
 //
 // keep_workspace_pat and buzz_version are deliberately NOT advertised here
 // — they stay expert-only, documented in docs/CONTRACT.md.
+//
+// extra_binaries and mcp_servers are likewise intentionally omitted: they are
+// expert-only, non-scalar (array-valued) operator-CLI keys that Buzz Desktop's
+// scalar-only validate_provider_config would reject anyway, so advertising them
+// here would only surface an input the desktop cannot submit.
 var configSchema = map[string]any{
 	"type": "object",
 	"properties": map[string]any{

@@ -220,7 +220,7 @@ func TestRenderEnv_NonSandboxMode_ByteIdenticalToBaseline(t *testing.T) {
 }
 
 func TestRenderLaunchScript_GoldenInvariants(t *testing.T) {
-	script := RenderLaunchScript(false, false, "")
+	script := RenderLaunchScript(false, false, "", false)
 
 	if !strings.Contains(script, "set -eu") {
 		t.Fatal("launch.sh must set -eu")
@@ -260,7 +260,7 @@ func TestRenderLaunchScript_KeepWorkspacePAT_OmitsStub(t *testing.T) {
 	// supervisor relaunch, so unconditionally re-asserting the PAT stub
 	// defeated provider_config.keep_workspace_pat=true by clobbering the
 	// kept PAT on the very next relaunch.
-	script := RenderLaunchScript(true, false, "")
+	script := RenderLaunchScript(true, false, "", false)
 
 	if strings.Contains(script, `cat > "$HOME/.databrickscfg"`) {
 		t.Fatalf("launch.sh (keep_workspace_pat=true) must NOT re-assert the PAT stub, got:\n%s", script)
@@ -282,7 +282,7 @@ func TestRenderLaunchScript_NoSecrets(t *testing.T) {
 	// no secret value can ever appear in it structurally — this test
 	// pins that invariant, for both keep_workspace_pat variants.
 	for _, keep := range []bool{false, true} {
-		script := RenderLaunchScript(keep, false, "")
+		script := RenderLaunchScript(keep, false, "", false)
 		for _, marker := range []string{"nsec1", "BUZZ_PRIVATE_KEY=", "DATABRICKS_TOKEN="} {
 			if strings.Contains(script, marker) {
 				t.Fatalf("launch.sh (keepWorkspacePAT=%v) unexpectedly contains %q", keep, marker)
@@ -336,7 +336,7 @@ func TestRenderLaunchScript_StubOmittedMatrix(t *testing.T) {
 		{keepPAT: true, sandbox: true, wantStub: false},
 	}
 	for _, tc := range cases {
-		script := RenderLaunchScript(tc.keepPAT, tc.sandbox, "")
+		script := RenderLaunchScript(tc.keepPAT, tc.sandbox, "", false)
 		hasStub := strings.Contains(script, `cat > "$HOME/.databrickscfg"`)
 		if hasStub != tc.wantStub {
 			t.Fatalf("RenderLaunchScript(keepPAT=%v, sandbox=%v): stub present=%v, want %v", tc.keepPAT, tc.sandbox, hasStub, tc.wantStub)
@@ -368,7 +368,7 @@ func evalEnvVar(t *testing.T, env, key string) string {
 // production — both found by the executable proofs in
 // launch_exec_test.go.
 func TestRenderLaunchScript_LivenessGuardInvariants(t *testing.T) {
-	script := RenderLaunchScript(false, false, "")
+	script := RenderLaunchScript(false, false, "", false)
 
 	// A zombie buzz-acp must not count as running (see AliveCheckSnippet).
 	if !strings.Contains(script, "buzz_acp_alive") {

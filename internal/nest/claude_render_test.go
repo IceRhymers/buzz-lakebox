@@ -220,7 +220,7 @@ func TestRenderEnv_ClaudeAliasesCanonicalized(t *testing.T) {
 // launch, which is exactly the false-positive deploy verification exists to
 // catch.
 func TestRenderLaunchScript_LaunchEpochStamp(t *testing.T) {
-	withID := RenderLaunchScript(false, false, "abc123")
+	withID := RenderLaunchScript(false, false, "abc123", false)
 	if !strings.Contains(withID, LaunchEpochPrefix+"abc123") {
 		t.Fatal("launch script should stamp the launch id into acp.log")
 	}
@@ -232,7 +232,7 @@ func TestRenderLaunchScript_LaunchEpochStamp(t *testing.T) {
 	}
 
 	// Empty id preserves the previous rendering exactly.
-	withoutID := RenderLaunchScript(false, false, "")
+	withoutID := RenderLaunchScript(false, false, "", false)
 	if strings.Contains(withoutID, LaunchEpochPrefix) {
 		t.Fatal("empty launch id should omit the stamp entirely")
 	}

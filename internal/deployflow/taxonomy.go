@@ -78,6 +78,13 @@ const (
 	// fail-closed consequence — a codex agent with no config falls back to
 	// the image's ~/.codex symlink and its baked workspace credential.
 	CodeCodexInference Code = "install.codex_inference"
+	// Extra-binaries install — the #15 capability channel. Only reached when
+	// provider_config.extra_binaries is non-empty; a deploy without it never
+	// emits these. Script is the render/validation failure (e.g. a duplicate
+	// bin), write/exec mirror the .deb and adapter write/exec pairs.
+	CodeExtraBinScript Code = "install.extra_bin_script"
+	CodeExtraBinWrite  Code = "install.extra_bin_write"
+	CodeExtraBinExec   Code = "install.extra_bin_exec"
 	CodeEnvWrite       Code = "provision.env_write"
 	CodePrelaunchKill  Code = "launch.prelaunch_kill"
 	// CodeStaleAgent fires when a previous buzz-acp is still alive after
@@ -121,6 +128,7 @@ var AllCodes = []Code{
 	CodeSandboxList, CodeSandboxCreate, CodeSandboxStart, CodeSandboxWait, CodeSandboxStatus, CodeSandboxStop, CodeSandboxDelete,
 	CodePATReset, CodeSandboxAuth, CodeInstallScript, CodeInstallWrite, CodeInstallExec,
 	CodeAdapterScript, CodeAdapterWrite, CodeAdapterExec, CodeRuntimeVerify, CodeClaudeInference, CodeCodexInference,
+	CodeExtraBinScript, CodeExtraBinWrite, CodeExtraBinExec,
 	CodeEnvWrite, CodePrelaunchKill, CodeStaleAgent, CodeLaunchWrite, CodeLaunchExec,
 	CodeVerifySSH, CodeVerifyUnparseable, CodeVerifyProcessDead, CodeVerifyRelayDenied, CodeVerifyNotReady,
 	CodeAutostopConfig,
@@ -164,11 +172,14 @@ var remedies = map[Code]string{
 	CodeCodexInference: "the agent installed and handshook, but could not reach the AI Gateway: confirm the workspace serves `{host}/ai-gateway/codex/v1/responses` and that the credential is accepted there — " +
 		"in `inference_auth: \"env\"` check env_vars DATABRICKS_HOST/DATABRICKS_TOKEN, in `\"sandbox\"` mode retry or fall back to env mode for this agent. " +
 		"An \"unset\" cause means no config.toml was generated at all, which is the fail-closed path working: the agent was deliberately NOT launched",
-	CodeEnvWrite:      "check sandbox SSH reachability and that $HOME is writable in the sandbox",
-	CodePrelaunchKill: "check sandbox SSH reachability with `databricks sandbox ssh <id> -- true`",
-	CodeStaleAgent:    "a previous buzz-acp was still shutting down and did not exit — run `status <sandbox-id>` to confirm, then `stop <sandbox-id>` followed by a redeploy; if it persists the old process is wedged and the sandbox needs a restart",
-	CodeLaunchWrite:   "check sandbox SSH reachability and that $HOME is writable in the sandbox",
-	CodeLaunchExec:    "run `logs <sandbox-id>` for the agent's own output, then `start <sandbox-id>` to retry the launch",
+	CodeExtraBinScript: "the extra-binaries install script could not be rendered — a `provider_config.extra_binaries` entry is malformed or two entries share the same `bin`; fix the payload and redeploy",
+	CodeExtraBinWrite:  "check sandbox SSH reachability with `databricks sandbox ssh <id> -- true`",
+	CodeExtraBinExec:   "read the install output above: a sha256 mismatch means the pinned URL served different bytes than `provider_config.extra_binaries[].sha256` (do NOT retry — re-pin the sha256 or the URL); a fetch failure means the sandbox lost egress to the download host",
+	CodeEnvWrite:       "check sandbox SSH reachability and that $HOME is writable in the sandbox",
+	CodePrelaunchKill:  "check sandbox SSH reachability with `databricks sandbox ssh <id> -- true`",
+	CodeStaleAgent:     "a previous buzz-acp was still shutting down and did not exit — run `status <sandbox-id>` to confirm, then `stop <sandbox-id>` followed by a redeploy; if it persists the old process is wedged and the sandbox needs a restart",
+	CodeLaunchWrite:    "check sandbox SSH reachability and that $HOME is writable in the sandbox",
+	CodeLaunchExec:     "run `logs <sandbox-id>` for the agent's own output, then `start <sandbox-id>` to retry the launch",
 
 	CodeVerifySSH:         "the sandbox stopped responding right after launch — run `status <sandbox-id>`, then `start <sandbox-id>`",
 	CodeVerifyUnparseable: "run `status <sandbox-id>` and `logs <sandbox-id>` to see the agent's real state before redeploying",
