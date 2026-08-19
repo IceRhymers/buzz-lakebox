@@ -26,6 +26,16 @@ const (
 	extraBinMarkerDir = "$HOME/.buzz-backend/extra-bin-markers"
 )
 
+// ExtraBinWarningsFile is the durable, in-sandbox record of any PATH-shadow
+// warnings from the most recent extra-binaries install. The shadow warning is
+// non-fatal, so a successful deploy exits 0 — and this whole install subsystem
+// is silent-on-success (sshx.Run returns only stdout on success, which
+// deployflow discards), so a warning emitted only to stderr would reach no one.
+// Persisting it to this file lets an operator inspect it after the fact
+// (docs/CONTRACT.md §3 names this path). Truncated at the start of every run so
+// it reflects the current deploy, not an accumulation across redeploys.
+const ExtraBinWarningsFile = "$HOME/.buzz-backend/extra-bin-warnings.log"
+
 // extraBinNameCharset is the install-local re-validation of a bin name. #18's
 // payload validator already enforces this at the boundary, but internal/install
 // must not trust its caller blindly (belt-and-suspenders): the name is expanded
@@ -96,8 +106,13 @@ func BuildExtraBinariesInstallScript(bins []ExtraBinaryInstall) (string, error) 
 	b.WriteString("set -eu\n")
 	b.WriteString("umask 077\n\n")
 	b.WriteString(`EXTRA_BIN_DIR="` + ExtraBinDir + `"` + "\n")
-	b.WriteString(`EXTRA_BIN_MARKER_DIR="` + extraBinMarkerDir + `"` + "\n\n")
+	b.WriteString(`EXTRA_BIN_MARKER_DIR="` + extraBinMarkerDir + `"` + "\n")
+	b.WriteString(`WARN_LOG="` + ExtraBinWarningsFile + `"` + "\n\n")
 	b.WriteString(`mkdir -p "$EXTRA_BIN_DIR" "$EXTRA_BIN_MARKER_DIR"` + "\n")
+	// Truncate the warnings file up front so it records only THIS deploy's
+	// shadow warnings (the shadow check below runs on every deploy, outside the
+	// marker skip). An empty file after a clean deploy means "checked, none".
+	b.WriteString(`: > "$WARN_LOG"` + "\n")
 
 	for _, eb := range bins {
 		fmt.Fprintf(&b, "\nURL=%s\n", shellquote.Single(eb.URL))
@@ -107,14 +122,27 @@ func BuildExtraBinariesInstallScript(bins []ExtraBinaryInstall) (string, error) 
 		b.WriteString(`MARKER="$EXTRA_BIN_MARKER_DIR/$BIN"` + "\n")
 
 		// Skip branch keyed on the sha content (stamp semantics): a re-pin
-		// forces a refetch, an identical pin skips. The fetch trio is
-		// byte-identical to install.go's .deb download.
-		b.WriteString(`if [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$SHA" ]; then` + "\n")
+		// forces a refetch, an identical pin skips. The `-x "$TARGET"` clause
+		// makes the skip self-healing: if the marker survives but the binary
+		// is gone (partial FS loss, external cleanup), we refetch instead of
+		// skipping into the post-install `-x` check and failing the deploy
+		// permanently until the marker is hand-removed. install.go achieves the
+		// same atomicity by co-locating its marker in DIST_DIR and rm -rf-ing on
+		// refetch; the marker here lives in a sibling dir, so the target-exists
+		// clause is what closes the orphaned-marker gap.
+		b.WriteString(`if [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$SHA" ] && [ -x "$TARGET" ]; then` + "\n")
 		b.WriteString(`  echo "$BIN already installed; skipping"` + "\n")
 		b.WriteString("else\n")
 		b.WriteString(`  TMP=$(mktemp "${TMPDIR:-/tmp}/buzz-extrabin-XXXXXX")` + "\n")
 		b.WriteString(`  trap 'rm -f "$TMP"' EXIT` + "\n")
-		b.WriteString(`  curl -q -fL --retry 2 -o "$TMP" "$URL"` + "\n")
+		// --proto/--proto-redir pin the transport to https across redirects: the
+		// URL is validated https at the payload boundary, but plain -fL would
+		// silently follow a 30x down to http. The sha256 check still protects
+		// content integrity regardless; this preserves the transport guarantee
+		// the validator advertises. (install.go/adapter.go fetch trusted
+		// constant URLs, so they don't carry this; the extra-bin URL is operator
+		// payload.)
+		b.WriteString(`  curl -q -fL --proto '=https' --proto-redir '=https' --retry 2 -o "$TMP" "$URL"` + "\n")
 		b.WriteString(`  echo "$SHA  $TMP" | sha256sum -c -` + "\n")
 		b.WriteString(`  chmod +x "$TMP"` + "\n")
 		b.WriteString(`  mv "$TMP" "$TARGET"` + "\n")
@@ -139,10 +167,15 @@ func BuildExtraBinariesInstallScript(bins []ExtraBinaryInstall) (string, error) 
 		// observed loudly rather than silently swallowed.
 		// SHADOW is captured ONCE (|| true so a non-resolving name never trips
 		// set -e here) and reused, so no command substitution runs unguarded in
-		// the echo argument under set -e.
+		// the echo argument under set -e. The warning goes to BOTH stderr (for a
+		// failure-path deploy, where sshx folds stderr into the error) and the
+		// durable WARN_LOG (for the success path, where stderr is discarded) — so
+		// the operator can always recover it. MSG is built once and reused.
 		b.WriteString(`SHADOW=$(command -v "$BIN" 2>/dev/null || true)` + "\n")
 		b.WriteString(`if [ -n "$SHADOW" ] && [ "$SHADOW" != "$TARGET" ]; then` + "\n")
-		b.WriteString(`  echo "warning: extra binary $BIN is shadowed on PATH by $SHADOW and will be unreachable by that name" >&2` + "\n")
+		b.WriteString(`  MSG="warning: extra binary $BIN is shadowed on PATH by $SHADOW and will be unreachable by that name"` + "\n")
+		b.WriteString(`  echo "$MSG" >&2` + "\n")
+		b.WriteString(`  printf '%s\n' "$MSG" >> "$WARN_LOG"` + "\n")
 		b.WriteString("fi\n")
 	}
 

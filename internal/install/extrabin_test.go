@@ -88,7 +88,7 @@ func TestBuildExtraBinariesInstallScript_FetchAndVerify(t *testing.T) {
 	for _, want := range []string{
 		`TMP=$(mktemp "${TMPDIR:-/tmp}/buzz-extrabin-XXXXXX")`,
 		`trap 'rm -f "$TMP"' EXIT`,
-		`curl -q -fL --retry 2 -o "$TMP" "$URL"`,
+		`curl -q -fL --proto '=https' --proto-redir '=https' --retry 2 -o "$TMP" "$URL"`,
 		`echo "$SHA  $TMP" | sha256sum -c -`,
 		`chmod +x "$TMP"`,
 		`mv "$TMP" "$TARGET"`,
@@ -106,8 +106,8 @@ func TestBuildExtraBinariesInstallScript_SkipKeyedOnSha(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build error: %v", err)
 	}
-	if !strings.Contains(script, `if [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$SHA" ]; then`) {
-		t.Fatal("skip branch must be keyed on the marker containing the pinned sha")
+	if !strings.Contains(script, `if [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$SHA" ] && [ -x "$TARGET" ]; then`) {
+		t.Fatal("skip branch must be keyed on the marker sha AND the target still existing (self-heal)")
 	}
 	if !strings.Contains(script, `echo "$BIN already installed; skipping"`) {
 		t.Fatal("skip branch must echo a per-bin already-installed line")
@@ -155,6 +155,21 @@ func TestBuildExtraBinariesInstallScript_ShadowWarningNonFatal(t *testing.T) {
 	}
 	if !strings.Contains(rest[:fi], "warning:") || !strings.Contains(rest[:fi], ">&2") {
 		t.Fatal("shadow warning must echo a warning to stderr")
+	}
+	// The warning must ALSO be persisted to the durable WARN_LOG, because a
+	// successful deploy discards stderr (sshx returns only stdout on success and
+	// deployflow discards that) — stderr alone would reach no one. The operator
+	// recovers it from the file.
+	if !strings.Contains(rest[:fi], `>> "$WARN_LOG"`) {
+		t.Fatalf("shadow warning must be appended to the durable WARN_LOG, got:\n%s", rest[:fi])
+	}
+	// WARN_LOG is bound to the exported path and truncated once up front, so it
+	// reflects only the current deploy rather than accumulating across redeploys.
+	if !strings.Contains(script, `WARN_LOG="`+ExtraBinWarningsFile+`"`) {
+		t.Fatal("script must bind WARN_LOG to ExtraBinWarningsFile")
+	}
+	if !strings.Contains(script, `: > "$WARN_LOG"`) {
+		t.Fatal("script must truncate WARN_LOG once up front so it reflects the current deploy")
 	}
 }
 
