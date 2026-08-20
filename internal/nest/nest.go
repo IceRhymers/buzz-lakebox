@@ -224,7 +224,15 @@ unset buzz_awk_extract buzz_host buzz_token
 // byte-identical to the pre-Claude behavior; for payload.RuntimeClaude the
 // buzz-agent-specific tool and inference wiring is omitted and
 // ClaudeEnvSnippet is appended last. See the per-variable rationale inline.
-func RenderEnv(agent payload.Agent, rt payload.Runtime, sandboxInferenceAuth bool) string {
+//
+// mcpCommand is the resolved BUZZ_ACP_MCP_COMMAND from
+// provider_config.mcp_servers (issue #16), or "" for "no override". When set
+// it is emitted for EVERY runtime — including claude, which emits nothing by
+// default — overriding the runtime's EnvShape.StdioMCPCommand default. When ""
+// the shape default decides, so the output is byte-identical to the pre-#16
+// behavior. Either way agent.EnvVars render LAST, so an owner who sets
+// BUZZ_ACP_MCP_COMMAND via env_vars still wins over this.
+func RenderEnv(agent payload.Agent, rt payload.Runtime, sandboxInferenceAuth bool, mcpCommand string) string {
 	var b strings.Builder
 	// emit writes KEY unquoted/raw (only VALUE is shellquote'd) into a file
 	// that RenderLaunchScript's `. "$HOME/.buzz-backend/env"` line
@@ -353,8 +361,20 @@ func RenderEnv(agent payload.Agent, rt payload.Runtime, sandboxInferenceAuth boo
 	// buzz-agent ONLY, so codex takes the command without the hooks.
 	//
 	// Escape hatch: env_vars render after this block, so an owner who wants
-	// different tooling can still override BUZZ_ACP_MCP_COMMAND.
-	if shape.StdioMCPCommand {
+	// different tooling can still override BUZZ_ACP_MCP_COMMAND — and so can a
+	// caller-resolved mcpCommand below, which itself is still beaten by
+	// env_vars (rendered last).
+	//
+	// mcpCommand (from provider_config.mcp_servers, #16) takes precedence over
+	// the runtime's shape default when non-empty: it is emitted for EVERY
+	// runtime, so a single-entry mcp_servers introduces the slot for claude
+	// (which has no shape default — issue #14) and a ≥2-entry deploy points it
+	// at the multiplexer. When "" the shape default decides exactly as before,
+	// keeping mcpNone byte-identical to the pre-#16 behavior.
+	switch {
+	case mcpCommand != "":
+		emit("BUZZ_ACP_MCP_COMMAND", mcpCommand)
+	case shape.StdioMCPCommand:
 		emit("BUZZ_ACP_MCP_COMMAND", "buzz-dev-mcp")
 	}
 	if shape.MCPHookServers {

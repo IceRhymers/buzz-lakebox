@@ -131,6 +131,66 @@ func (c ProviderConfig) OwnerPATInSandbox() bool {
 	return c.SandboxInferenceAuth() || c.KeepWorkspacePAT
 }
 
+// MaxMcpServers caps provider_config.mcp_servers, mirroring buzz-agent's
+// MAX_MCP_SERVERS. Enforced by validateMcpServers.
+const MaxMcpServers = 16
+
+// MuxBinaryName is the on-disk name of this provider's MCP multiplexer, the
+// program a ≥2-entry mcp_servers deploy points BUZZ_ACP_MCP_COMMAND at (issue
+// #16, McpMux). It is the single source of truth for the reserved name across
+// BOTH capability channels — validateMcpServers refuses an mcp_servers entry
+// with this name and validateExtraBinaries refuses an extra_binaries bin with
+// it — so an operator payload can never shadow the multiplexer.
+//
+// It is kept here as a local const rather than imported from internal/mux
+// (which delivers the binary itself in issue #16 Increment 2) to avoid an
+// import cycle; the two must stay in sync.
+const MuxBinaryName = "bzmux"
+
+// McpMode classifies how provider_config.mcp_servers wires the agent's single
+// BUZZ_ACP_MCP_COMMAND slot, by entry count. Callers (nest.RenderEnv,
+// deployflow) branch on this intent rather than re-deriving it from len() at
+// each site, the same spirit as EnvShape.
+type McpMode int
+
+const (
+	// McpNone (0 entries): BUZZ_ACP_MCP_COMMAND is left to the runtime's
+	// EnvShape default (buzz-agent/codex emit buzz-dev-mcp; claude emits
+	// nothing). Byte-identical to the pre-#16 behavior.
+	McpNone McpMode = iota
+	// McpDirect (1 entry): BUZZ_ACP_MCP_COMMAND points straight at that single
+	// command, for EVERY runtime — including claude, which emits nothing by
+	// default (issue #14).
+	McpDirect
+	// McpMux (≥2 entries): BUZZ_ACP_MCP_COMMAND points at the embedded
+	// multiplexer (MuxBinaryName), which fans out to each child. Issue #16
+	// Increment 1 wires the mode and the emission; the multiplexer binary and
+	// its mcp-mux.json config are delivered by Increment 2.
+	McpMux
+)
+
+// McpMode returns the mode implied by the number of mcp_servers entries.
+func (c ProviderConfig) McpMode() McpMode {
+	switch len(c.McpServers) {
+	case 0:
+		return McpNone
+	case 1:
+		return McpDirect
+	default:
+		return McpMux
+	}
+}
+
+// McpDirectCommand returns the single mcp_servers entry when McpMode is
+// McpDirect, and "" otherwise. In McpDirect mode this is the value the
+// resolved BUZZ_ACP_MCP_COMMAND takes.
+func (c ProviderConfig) McpDirectCommand() string {
+	if c.McpMode() == McpDirect {
+		return c.McpServers[0]
+	}
+	return ""
+}
+
 // ParseDeployRequest unmarshals a raw deploy request body (the "agent" and
 // "provider_config" sub-objects of the envelope already routed by
 // internal/provider). Unknown fields anywhere are tolerated by default
@@ -238,6 +298,9 @@ func (r DeployRequest) Validate() error {
 		return err
 	}
 	if err := r.validateExtraBinaries(); err != nil {
+		return err
+	}
+	if err := r.validateMcpServers(); err != nil {
 		return err
 	}
 	if err := r.validateClaudeInferenceSource(); err != nil {

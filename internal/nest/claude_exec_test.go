@@ -303,7 +303,7 @@ func TestClaudeEnv_RenderedEnvSourcesCleanly(t *testing.T) {
 	for _, sandboxMode := range []bool{false, true} {
 		home := t.TempDir()
 		envPath := filepath.Join(home, "env")
-		if err := os.WriteFile(envPath, []byte(RenderEnv(agent, payload.RuntimeClaude, sandboxMode)), 0o600); err != nil {
+		if err := os.WriteFile(envPath, []byte(RenderEnv(agent, payload.RuntimeClaude, sandboxMode, "")), 0o600); err != nil {
 			t.Fatalf("write env: %v", err)
 		}
 		script := "set -eu\n. " + shellquote.Single(envPath) + "\n" +

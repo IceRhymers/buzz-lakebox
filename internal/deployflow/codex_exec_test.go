@@ -38,7 +38,7 @@ func codexProbeEnv(host string) string {
 		agent.EnvVars["DATABRICKS_HOST"] = host
 		agent.EnvVars["DATABRICKS_TOKEN"] = "dapi-test"
 	}
-	return nest.RenderEnv(agent, payload.RuntimeCodex, false)
+	return nest.RenderEnv(agent, payload.RuntimeCodex, false, "")
 }
 
 // runCodexProbe executes the probe with a curl stub that records the URL it

@@ -425,7 +425,7 @@ func TestRenderEnv_SandboxAuthPrecedesRuntimeSnippets(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := claudeTestAgent()
 			agent.AgentCommand = string(tc.rt)
-			env := RenderEnv(agent, tc.rt, true)
+			env := RenderEnv(agent, tc.rt, true, "")
 
 			iAuth := strings.Index(env, SandboxAuthSnippet)
 			iRt := strings.Index(env, tc.snippet)
@@ -500,7 +500,7 @@ func TestRuntimeSnippets_CoverEveryRuntime(t *testing.T) {
 	agent := claudeTestAgent()
 	for _, rt := range []payload.Runtime{payload.RuntimeBuzzAgent, payload.RuntimeClaude, payload.RuntimeCodex} {
 		agent.AgentCommand = string(rt)
-		env := RenderEnv(agent, rt, true)
+		env := RenderEnv(agent, rt, true, "")
 		// Everything after SandboxAuthSnippet is a runtime snippet.
 		i := strings.Index(env, SandboxAuthSnippet)
 		if i < 0 {

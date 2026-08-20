@@ -124,6 +124,12 @@ func (r DeployRequest) validateExtraBinaries() error {
 	// class belongs to #15's install step — it must place extra binaries so an
 	// unlisted name cannot shadow a system binary — not to this name check.
 	reserved["codex"] = true
+	// Reserve the MCP multiplexer's on-disk name (issue #16). A ≥2-entry
+	// mcp_servers deploy installs the multiplexer into the same prepended
+	// $HOME/.buzz-backend/bin dir, so an extra_binaries bin named MuxBinaryName
+	// would shadow it. Reserved on both capability channels — here and in
+	// validateMcpServers — so neither can introduce the name.
+	reserved[MuxBinaryName] = true
 
 	for i, eb := range bins {
 		// url: non-empty, parseable, https only. No unpinned/insecure fetch.
@@ -193,6 +199,92 @@ func (r DeployRequest) validateExtraBinaries() error {
 				i, eb.Bin,
 			)
 		}
+	}
+	return nil
+}
+
+// validateMcpServers enforces the STRUCTURAL rules on every
+// provider_config.mcp_servers entry, UNCONDITIONALLY — in every mode,
+// independent of OwnerPATInSandbox — mirroring validateExtraBinaries. An
+// empty entry, a name with a path separator, or a count past the receiver's
+// limit is a defect regardless of the inference-auth mode, so these checks are
+// not gated on the owner-PAT condition the way validateCapabilityKeysOwnerPAT
+// is.
+//
+// Each entry is a bare command name the agent resolves on PATH (issue #16):
+// with one entry the name becomes BUZZ_ACP_MCP_COMMAND directly (mcpDirect,
+// #14); with two or more it names a child of the embedded multiplexer
+// (mcpMux). The charset, traversal, and leading-dash rules are exactly those
+// validateExtraBinaries applies to a bin name, and for the same reason — the
+// name is invoked by bare command.
+//
+// Error text names the field and offending index/value and never leaks a
+// secret.
+func (r DeployRequest) validateMcpServers() error {
+	servers := r.ProviderConfig.McpServers
+	if len(servers) == 0 {
+		return nil
+	}
+	// Count cap first, so a wildly oversized list fails on the count rather
+	// than on whichever entry happens to trip a per-entry rule.
+	if len(servers) > MaxMcpServers {
+		return fmt.Errorf(
+			"provider_config.mcp_servers has %d entries, more than the maximum of %d (mirrors buzz-agent's MAX_MCP_SERVERS)",
+			len(servers), MaxMcpServers,
+		)
+	}
+	// Checks are ordered most-specific to most-general so each rejection
+	// carries a message naming its actual cause — "." / ".." and a leading
+	// "-" all match the charset pattern, so they must be caught before it.
+	seen := make(map[string]bool, len(servers))
+	for i, name := range servers {
+		if name == "" {
+			return fmt.Errorf("provider_config.mcp_servers[%d] must not be empty", i)
+		}
+		if name == "." || name == ".." {
+			return fmt.Errorf(
+				"provider_config.mcp_servers[%d] %q is the current- or parent-directory entry, not a server name",
+				i, name,
+			)
+		}
+		if strings.HasPrefix(name, "-") {
+			return fmt.Errorf(
+				"provider_config.mcp_servers[%d] %q must not start with '-'; a leading dash is parsed as a command-line option when the server is invoked",
+				i, name,
+			)
+		}
+		if !extraBinaryNamePattern.MatchString(name) {
+			return fmt.Errorf(
+				"provider_config.mcp_servers[%d] %q is not a bare name; only names matching ^[A-Za-z0-9._-]+$ are allowed (which excludes path separators)",
+				i, name,
+			)
+		}
+		// The charset above permits a single "_", but the doubled "__" sequence
+		// is buzz-agent's server/tool qualified-name separator: it hard-rejects
+		// any server name containing "__" and fails the whole session/new, which
+		// deployed as a silently broken agent. Reject it here so the misconfig
+		// fails loud at deploy instead. A server name becomes the file stem of
+		// BUZZ_ACP_MCP_COMMAND (mcpDirect) or a multiplexer child name (mcpMux),
+		// both of which the receiver namespaces with "__".
+		if strings.Contains(name, "__") {
+			return fmt.Errorf(
+				"provider_config.mcp_servers[%d] %q must not contain \"__\"; buzz-agent uses it as the server/tool name separator and rejects the whole session for a name that contains it",
+				i, name,
+			)
+		}
+		if name == MuxBinaryName {
+			return fmt.Errorf(
+				"provider_config.mcp_servers[%d] %q is reserved for this provider's MCP multiplexer and must not be used as a server name",
+				i, name,
+			)
+		}
+		if seen[name] {
+			return fmt.Errorf(
+				"provider_config.mcp_servers[%d] %q is a duplicate; each mcp_servers entry must be unique",
+				i, name,
+			)
+		}
+		seen[name] = true
 	}
 	return nil
 }
