@@ -1,6 +1,7 @@
 package payload
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -216,5 +217,143 @@ func TestCapabilityKeyNamesPassSecretWordFilter(t *testing.T) {
 				t.Errorf("key name %q contains secret-word segment %q; it would be rejected by Buzz's validate_provider_config name filter", name, word)
 			}
 		}
+	}
+}
+
+// mcpServersReq builds a deploy request that carries the given mcp_servers
+// list without triggering the owner-PAT gate — the default InferenceAuth=""
+// leaves OwnerPATInSandbox()=false — so validateMcpServers is exercised in
+// isolation. Mirrors envReq for extra_binaries.
+func mcpServersReq(servers []string) DeployRequest {
+	return capReq(ProviderConfig{McpServers: servers})
+}
+
+// nServers returns a slice of n unique, structurally-valid server names of the
+// form "srv-0", "srv-1", …, used to hit the count cap without touching other
+// validation rules.
+func nServers(n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = fmt.Sprintf("srv-%d", i)
+	}
+	return out
+}
+
+// TestValidate_McpServers is the structural-validation table for
+// provider_config.mcp_servers, mirroring the extra_binaries suite. Each
+// sub-test exercises exactly one rule; passing cases confirm the happy path
+// at each boundary.
+func TestValidate_McpServers(t *testing.T) {
+	// --- passing cases ---
+	t.Run("empty list ok", func(t *testing.T) {
+		if err := mcpServersReq(nil).Validate(); err != nil {
+			t.Fatalf("empty mcp_servers must validate: %v", err)
+		}
+	})
+	t.Run("single valid entry ok", func(t *testing.T) {
+		if err := mcpServersReq([]string{"shellbox-mcp"}).Validate(); err != nil {
+			t.Fatalf("single valid entry must validate: %v", err)
+		}
+	})
+	t.Run("entries at the count limit ok", func(t *testing.T) {
+		if err := mcpServersReq(nServers(MaxMcpServers)).Validate(); err != nil {
+			t.Fatalf("%d entries (at the cap) must validate: %v", MaxMcpServers, err)
+		}
+	})
+
+	// --- rejection cases ---
+	t.Run("count cap exceeded", func(t *testing.T) {
+		err := mcpServersReq(nServers(MaxMcpServers + 1)).Validate()
+		if err == nil {
+			t.Fatalf("%d entries (one over cap) must be rejected", MaxMcpServers+1)
+		}
+		if !strings.Contains(err.Error(), "provider_config.mcp_servers") {
+			t.Errorf("rejection must name provider_config.mcp_servers, got: %v", err)
+		}
+	})
+	t.Run("duplicate entry rejected", func(t *testing.T) {
+		err := mcpServersReq([]string{"buzz-dev-mcp", "buzz-dev-mcp"}).Validate()
+		if err == nil {
+			t.Fatal("duplicate mcp_servers entry must be rejected")
+		}
+		if !strings.Contains(err.Error(), "duplicate") {
+			t.Errorf("rejection must name 'duplicate', got: %v", err)
+		}
+	})
+	t.Run("dot traversal rejected", func(t *testing.T) {
+		err := mcpServersReq([]string{"."}).Validate()
+		if err == nil {
+			t.Fatal("mcp_servers entry '.' must be rejected")
+		}
+	})
+	t.Run("dotdot traversal rejected", func(t *testing.T) {
+		err := mcpServersReq([]string{".."}).Validate()
+		if err == nil {
+			t.Fatal("mcp_servers entry '..' must be rejected")
+		}
+	})
+	t.Run("path separator rejected", func(t *testing.T) {
+		// A name with a "/" must be rejected by the bare-name charset — the
+		// entry is invoked by bare command, so a path is never a valid name.
+		err := mcpServersReq([]string{"some/server"}).Validate()
+		if err == nil {
+			t.Fatal("mcp_servers entry with a path separator must be rejected")
+		}
+		if !strings.Contains(err.Error(), "some/server") {
+			t.Errorf("rejection must name the offending entry, got: %v", err)
+		}
+	})
+	t.Run("leading dash rejected", func(t *testing.T) {
+		err := mcpServersReq([]string{"-x"}).Validate()
+		if err == nil {
+			t.Fatal("mcp_servers entry '-x' (leading dash) must be rejected")
+		}
+		if !strings.Contains(err.Error(), "-x") {
+			t.Errorf("rejection must name the offending entry, got: %v", err)
+		}
+	})
+	t.Run("double-underscore name rejected", func(t *testing.T) {
+		// buzz-agent uses "__" as its server/tool qualified-name separator and
+		// hard-rejects a server name containing it, failing the whole session.
+		// A single "_" is still allowed by the charset; only the doubled
+		// sequence is illegal.
+		err := mcpServersReq([]string{"bad__name"}).Validate()
+		if err == nil {
+			t.Fatal("mcp_servers entry containing '__' must be rejected")
+		}
+		if !strings.Contains(err.Error(), "__") {
+			t.Errorf("rejection must name the '__' separator, got: %v", err)
+		}
+		// A single underscore must remain valid.
+		if err := mcpServersReq([]string{"buzz_dev_mcp"}).Validate(); err != nil {
+			t.Errorf("a single-underscore name must validate: %v", err)
+		}
+	})
+	t.Run("reserved bzmux name rejected", func(t *testing.T) {
+		err := mcpServersReq([]string{MuxBinaryName}).Validate()
+		if err == nil {
+			t.Fatalf("mcp_servers entry %q (the multiplexer's reserved name) must be rejected", MuxBinaryName)
+		}
+		if !strings.Contains(err.Error(), MuxBinaryName) {
+			t.Errorf("rejection must name %q, got: %v", MuxBinaryName, err)
+		}
+	})
+}
+
+// TestValidate_ExtraBinariesBinRejectsMuxBinaryName pins that the MCP
+// multiplexer's reserved name (MuxBinaryName = "bzmux") cannot be used as an
+// extra_binaries bin name. Such an entry would shadow the embedded multiplexer
+// in the $HOME/.buzz-backend/bin dir that launch.sh prepends to PATH, breaking
+// any mcp_servers deploy that routes through it. This mirrors the "codex" guard
+// in TestValidate_ExtraBinariesBinCollision.
+func TestValidate_ExtraBinariesBinRejectsMuxBinaryName(t *testing.T) {
+	eb := validExtraBinary()
+	eb.Bin = MuxBinaryName
+	err := envReq(eb).Validate()
+	if err == nil {
+		t.Fatalf("extra_binaries.bin %q must be rejected: it collides with the MCP multiplexer's reserved name", MuxBinaryName)
+	}
+	if !strings.Contains(err.Error(), MuxBinaryName) {
+		t.Errorf("rejection must name %q, got: %v", MuxBinaryName, err)
 	}
 }

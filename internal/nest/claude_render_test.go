@@ -34,7 +34,7 @@ func claudeTestAgent() payload.Agent {
 // deliberate decision with a live-probe or upstream-parity reason behind
 // it, and each would fail in a different, quiet way if it crept back in.
 func TestRenderEnv_ClaudeGolden(t *testing.T) {
-	env := RenderEnv(claudeTestAgent(), payload.RuntimeClaude, false)
+	env := RenderEnv(claudeTestAgent(), payload.RuntimeClaude, false, "")
 
 	wantLines := []string{
 		`export BUZZ_PRIVATE_KEY='nsec1abc'`,
@@ -121,14 +121,14 @@ func TestRenderEnv_BuzzAgentByteIdenticalToBaseline(t *testing.T) {
 	agent.AgentCommand = "buzz-agent"
 
 	// env mode: byte-for-byte identical to the pre-Claude rendering.
-	if got := RenderEnv(agent, payload.RuntimeBuzzAgent, false); got != buzzAgentBaselineEnv {
+	if got := RenderEnv(agent, payload.RuntimeBuzzAgent, false, ""); got != buzzAgentBaselineEnv {
 		t.Errorf("buzz-agent env-mode rendering changed.\n--- got ---\n%s\n--- want ---\n%s", got, buzzAgentBaselineEnv)
 	}
 
 	// sandbox mode: the same bytes plus exactly the zero-token snippet,
 	// which is what the pre-Claude renderer produced too.
 	wantSandbox := buzzAgentBaselineEnv + "\n" + SandboxAuthSnippet
-	if got := RenderEnv(agent, payload.RuntimeBuzzAgent, true); got != wantSandbox {
+	if got := RenderEnv(agent, payload.RuntimeBuzzAgent, true, ""); got != wantSandbox {
 		t.Errorf("buzz-agent sandbox-mode rendering changed.\n--- got ---\n%s\n--- want ---\n%s", got, wantSandbox)
 	}
 }
@@ -165,12 +165,12 @@ func TestRenderEnv_ClaudeByteIdenticalToBaseline(t *testing.T) {
 	agent := claudeTestAgent()
 
 	wantEnv := claudeBaselineEnv + "\n" + ClaudeEnvSnippet
-	if got := RenderEnv(agent, payload.RuntimeClaude, false); got != wantEnv {
+	if got := RenderEnv(agent, payload.RuntimeClaude, false, ""); got != wantEnv {
 		t.Errorf("claude env-mode rendering changed.\n--- got ---\n%s\n--- want ---\n%s", got, wantEnv)
 	}
 
 	wantSandbox := claudeBaselineEnv + "\n" + SandboxAuthSnippet + "\n" + ClaudeEnvSnippet
-	if got := RenderEnv(agent, payload.RuntimeClaude, true); got != wantSandbox {
+	if got := RenderEnv(agent, payload.RuntimeClaude, true, ""); got != wantSandbox {
 		t.Errorf("claude sandbox-mode rendering changed.\n--- got ---\n%s\n--- want ---\n%s", got, wantSandbox)
 	}
 }
@@ -181,7 +181,7 @@ func TestRenderEnv_ClaudeByteIdenticalToBaseline(t *testing.T) {
 // inputs can come from. If it ever moved earlier it would silently derive
 // nothing in sandbox mode.
 func TestRenderEnv_ClaudeSnippetOrderedLast(t *testing.T) {
-	env := RenderEnv(claudeTestAgent(), payload.RuntimeClaude, true)
+	env := RenderEnv(claudeTestAgent(), payload.RuntimeClaude, true, "")
 
 	envVarIdx := strings.LastIndex(env, `export DATABRICKS_TOKEN='dapi-marker-secret'`)
 	sandboxIdx := strings.Index(env, SandboxAuthSnippet)
@@ -206,7 +206,7 @@ func TestRenderEnv_ClaudeAliasesCanonicalized(t *testing.T) {
 		if !ok {
 			t.Fatalf("alias %q should resolve to a runtime", alias)
 		}
-		env := RenderEnv(agent, rt, false)
+		env := RenderEnv(agent, rt, false, "")
 		if !strings.Contains(env, `export BUZZ_ACP_AGENT_COMMAND='claude-agent-acp'`) {
 			t.Errorf("alias %q did not canonicalize to claude-agent-acp", alias)
 		}

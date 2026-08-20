@@ -441,7 +441,19 @@ func (d *Deployer) provision(ctx context.Context, profile, sandboxID string, fre
 	// here; default to buzz-agent rather than panicking if a future caller
 	// reaches provision() without validating.
 	rt := runtimeOf(agent)
-	envContent := nest.RenderEnv(agent, rt, sandboxAuth)
+	// Resolve the single BUZZ_ACP_MCP_COMMAND value from
+	// provider_config.mcp_servers (#16) before rendering the env. McpNone
+	// leaves the runtime's own default in place (byte-identical to pre-#16);
+	// McpDirect points it straight at the one entry (introducing it for
+	// claude — #14); McpMux points it at the multiplexer. This is Increment 1:
+	// the value is wired so the emission is exercised, but the mux binary and
+	// its mcp-mux.json config are Increment 2 — no install/verify steps are
+	// added here.
+	mcpCommand, err := resolveMcpCommand(req.ProviderConfig)
+	if err != nil {
+		return err
+	}
+	envContent := nest.RenderEnv(agent, rt, sandboxAuth, mcpCommand)
 
 	// Step 4: either the PAT reset (default/env mode; the first in-sandbox
 	// action of every deploy, unless the owner opted out) or, in zero-token
@@ -546,6 +558,47 @@ func (d *Deployer) provision(ctx context.Context, profile, sandboxID string, fre
 	}
 
 	return nil
+}
+
+// resolveMcpCommand maps provider_config.mcp_servers to the single
+// BUZZ_ACP_MCP_COMMAND value nest.RenderEnv should emit, or "" to leave the
+// runtime's own default in place (McpNone). See payload.ProviderConfig.McpMode.
+//
+// The fail-loud guard on McpDirect is deliberate. buzz-agent spawns its MCP
+// child on session/new, NOT on the initialize verify handshake (Spike 1), so
+// an empty-but-set command would NOT be caught by deploy-time verification —
+// it would surface only at the first live mention. A validated single
+// mcp_servers entry is always non-empty (validateMcpServers rejects ""), so
+// this is defense-in-depth for a caller that reaches provision() without
+// validating (the same posture runtimeOf's default takes); it fails at deploy
+// time with a clear message rather than shipping an agent that silently
+// renders an empty BUZZ_ACP_MCP_COMMAND and can never answer.
+//
+// McpMux (2+ entries) is REFUSED at deploy time in Increment 1. The multiplexer
+// binary (payload.MuxBinaryName) and its mcp-mux.json config are delivered by
+// Increment 2; until then, emitting BUZZ_ACP_MCP_COMMAND=bzmux would point the
+// agent at a command that does not exist on the sandbox. Because buzz-agent
+// spawns its MCP child on session/new and NOT on the initialize verify
+// handshake (Spike 1), such a deploy could pass verification and then ship a
+// permanently silent agent — the exact failure class this repo has been
+// live-bitten by twice. So we fail loud here instead of relying on prose. When
+// Increment 2 lands it replaces this refusal with the bzmux emission plus the
+// install/verify sequencing at the same seam.
+func resolveMcpCommand(cfg payload.ProviderConfig) (string, error) {
+	switch cfg.McpMode() {
+	case payload.McpDirect:
+		cmd := cfg.McpDirectCommand()
+		if cmd == "" {
+			return "", failf(CodeValidation,
+				"provider_config.mcp_servers has a single entry but it resolved to an empty MCP command; a single-entry mcp_servers must name a non-empty command")
+		}
+		return cmd, nil
+	case payload.McpMux:
+		return "", failf(CodeValidation,
+			"provider_config.mcp_servers has 2 or more entries, which requires the MCP multiplexer that is not yet available (pending issue #16 Increment 2); deploy at most one mcp_servers entry for now")
+	default: // payload.McpNone
+		return "", nil
+	}
 }
 
 // authProbeCauseMarkerPrefix is the line authProbeScript echoes to stdout

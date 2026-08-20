@@ -886,3 +886,44 @@ func TestParsePgrepCheck_MissingMarker_DistinctError(t *testing.T) {
 		t.Fatalf("error should name the missing marker, got: %v", err)
 	}
 }
+
+// TestResolveMcpCommand pins the provider_config.mcp_servers → BUZZ_ACP_MCP_COMMAND
+// mapping (issue #16 Increment 1): 0 entries leave the runtime default (""),
+// 1 entry points straight at that command, and 2+ entries are REFUSED at deploy
+// time until the multiplexer ships (Increment 2) — never emitted as a "bzmux"
+// command that does not exist on the sandbox.
+func TestResolveMcpCommand(t *testing.T) {
+	t.Run("McpNone yields empty, no error", func(t *testing.T) {
+		got, err := resolveMcpCommand(payload.ProviderConfig{})
+		if err != nil {
+			t.Fatalf("McpNone must not error: %v", err)
+		}
+		if got != "" {
+			t.Fatalf("McpNone must resolve to \"\", got %q", got)
+		}
+	})
+	t.Run("McpDirect points at the single command", func(t *testing.T) {
+		got, err := resolveMcpCommand(payload.ProviderConfig{McpServers: []string{"shellbox-mcp"}})
+		if err != nil {
+			t.Fatalf("McpDirect must not error: %v", err)
+		}
+		if got != "shellbox-mcp" {
+			t.Fatalf("McpDirect must resolve to the single entry, got %q", got)
+		}
+	})
+	t.Run("McpMux is refused at deploy time (Increment 2 pending)", func(t *testing.T) {
+		got, err := resolveMcpCommand(payload.ProviderConfig{McpServers: []string{"buzz-dev-mcp", "shellbox-mcp"}})
+		if err == nil {
+			t.Fatal("2+ mcp_servers entries must be refused until the multiplexer ships (Increment 2)")
+		}
+		if got != "" {
+			t.Fatalf("a refused McpMux deploy must resolve to \"\", not a bogus command, got %q", got)
+		}
+		if !strings.Contains(err.Error(), "Increment 2") {
+			t.Errorf("refusal message should reference the pending Increment 2, got: %v", err)
+		}
+		if strings.Contains(err.Error(), payload.MuxBinaryName) && !strings.Contains(err.Error(), "multiplexer") {
+			t.Errorf("refusal should explain the multiplexer is unavailable, got: %v", err)
+		}
+	})
+}

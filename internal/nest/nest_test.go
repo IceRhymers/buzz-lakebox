@@ -54,7 +54,7 @@ func TestRenderEnv_GoldenFields(t *testing.T) {
 		},
 	}
 
-	env := RenderEnv(agent, payload.RuntimeBuzzAgent, false)
+	env := RenderEnv(agent, payload.RuntimeBuzzAgent, false, "")
 
 	wantLines := []string{
 		`export BUZZ_PRIVATE_KEY='nsec1abc'`,
@@ -112,7 +112,7 @@ func TestRenderEnv_GoldenFields(t *testing.T) {
 // exporting a `0` whose semantics upstream owns.
 func TestRenderEnv_ZeroTimeouts_Omitted(t *testing.T) {
 	agent := payload.Agent{AgentCommand: "buzz-agent"}
-	env := RenderEnv(agent, payload.RuntimeBuzzAgent, false)
+	env := RenderEnv(agent, payload.RuntimeBuzzAgent, false, "")
 	if strings.Contains(env, "BUZZ_ACP_IDLE_TIMEOUT") || strings.Contains(env, "BUZZ_ACP_MAX_TURN_DURATION") {
 		t.Fatalf("zero timeouts must be omitted entirely, got:\n%s", env)
 	}
@@ -120,7 +120,7 @@ func TestRenderEnv_ZeroTimeouts_Omitted(t *testing.T) {
 
 func TestRenderEnv_EmptyAllowlist_OmitsEnvVar(t *testing.T) {
 	agent := payload.Agent{AgentCommand: "buzz-agent"}
-	env := RenderEnv(agent, payload.RuntimeBuzzAgent, false)
+	env := RenderEnv(agent, payload.RuntimeBuzzAgent, false, "")
 	if strings.Contains(env, "BUZZ_ACP_RESPOND_TO_ALLOWLIST") {
 		t.Fatalf("expected BUZZ_ACP_RESPOND_TO_ALLOWLIST to be omitted entirely when the allowlist is empty (the desktop only sets it in allowlist mode), got:\n%s", env)
 	}
@@ -128,7 +128,7 @@ func TestRenderEnv_EmptyAllowlist_OmitsEnvVar(t *testing.T) {
 
 func TestRenderEnv_ProviderDefaultsWhenEmpty(t *testing.T) {
 	agent := payload.Agent{AgentCommand: "buzz-agent"}
-	env := RenderEnv(agent, payload.RuntimeBuzzAgent, false)
+	env := RenderEnv(agent, payload.RuntimeBuzzAgent, false, "")
 	if !strings.Contains(env, `export BUZZ_AGENT_PROVIDER='databricks_v2'`) {
 		t.Fatalf("expected default provider databricks_v2, got:\n%s", env)
 	}
@@ -137,7 +137,7 @@ func TestRenderEnv_ProviderDefaultsWhenEmpty(t *testing.T) {
 func TestRenderEnv_ExplicitProviderWins(t *testing.T) {
 	provider := "databricks"
 	agent := payload.Agent{AgentCommand: "buzz-agent", Provider: &provider}
-	env := RenderEnv(agent, payload.RuntimeBuzzAgent, false)
+	env := RenderEnv(agent, payload.RuntimeBuzzAgent, false, "")
 	if !strings.Contains(env, `export BUZZ_AGENT_PROVIDER='databricks'`) {
 		t.Fatalf("expected explicit provider to be used, got:\n%s", env)
 	}
@@ -148,7 +148,7 @@ func TestRenderEnv_QuotingEmbeddedQuotesAndNewlines(t *testing.T) {
 		AgentCommand: "buzz-agent",
 		SystemPrompt: "Line one.\nSay 'hello' and \"goodbye\".\nLine three.",
 	}
-	env := RenderEnv(agent, payload.RuntimeBuzzAgent, false)
+	env := RenderEnv(agent, payload.RuntimeBuzzAgent, false, "")
 
 	// The rendered assignment must be shell-safe: verify by sourcing the
 	// *entire* rendered env (since the quoted value itself contains
@@ -167,9 +167,9 @@ func TestRenderEnv_Deterministic(t *testing.T) {
 		AgentCommand: "buzz-agent",
 		EnvVars:      map[string]string{"Z_VAR": "z", "A_VAR": "a", "M_VAR": "m"},
 	}
-	first := RenderEnv(agent, payload.RuntimeBuzzAgent, false)
+	first := RenderEnv(agent, payload.RuntimeBuzzAgent, false, "")
 	for i := 0; i < 5; i++ {
-		if got := RenderEnv(agent, payload.RuntimeBuzzAgent, false); got != first {
+		if got := RenderEnv(agent, payload.RuntimeBuzzAgent, false, ""); got != first {
 			t.Fatalf("RenderEnv is not deterministic across calls")
 		}
 	}
@@ -190,7 +190,7 @@ func TestRenderEnv_SandboxMode_AppendsSnippetAfterEnvVars(t *testing.T) {
 		EnvVars:      map[string]string{"Z_VAR": "z", "A_VAR": "a"},
 	}
 
-	env := RenderEnv(agent, payload.RuntimeBuzzAgent, true)
+	env := RenderEnv(agent, payload.RuntimeBuzzAgent, true, "")
 
 	if !strings.Contains(env, SandboxAuthSnippet) {
 		t.Fatalf("sandbox mode must append SandboxAuthSnippet verbatim, got:\n%s", env)
@@ -213,7 +213,7 @@ func TestRenderEnv_NonSandboxMode_ByteIdenticalToBaseline(t *testing.T) {
 		AgentCommand: "buzz-agent",
 		EnvVars:      map[string]string{"DATABRICKS_HOST": "https://example.databricks.com"},
 	}
-	env := RenderEnv(agent, payload.RuntimeBuzzAgent, false)
+	env := RenderEnv(agent, payload.RuntimeBuzzAgent, false, "")
 	if strings.Contains(env, "SandboxAuthSnippet") || strings.Contains(env, "buzz_awk_extract") {
 		t.Fatalf("sandboxInferenceAuth=false must never render the snippet, got:\n%s", env)
 	}

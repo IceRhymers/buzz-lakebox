@@ -295,3 +295,50 @@ func TestValidate_EnvVarsAllValidKeysStillPasses(t *testing.T) {
 		t.Fatalf("Validate() should accept a payload with only valid env_vars keys, got: %v", err)
 	}
 }
+
+// TestProviderConfig_McpMode exercises the McpMode() helper: 0 entries →
+// McpNone, 1 entry → McpDirect, ≥2 entries → McpMux. Callers (nest.RenderEnv,
+// deployflow) branch on this intent value rather than re-deriving it from
+// len() at each site.
+func TestProviderConfig_McpMode(t *testing.T) {
+	cases := []struct {
+		name     string
+		servers  []string
+		wantMode McpMode
+	}{
+		{"no entries is McpNone", nil, McpNone},
+		{"one entry is McpDirect", []string{"shellbox-mcp"}, McpDirect},
+		{"two entries is McpMux", []string{"a", "b"}, McpMux},
+		{"many entries is still McpMux", []string{"a", "b", "c"}, McpMux},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := ProviderConfig{McpServers: tc.servers}
+			if got := cfg.McpMode(); got != tc.wantMode {
+				t.Errorf("McpMode() = %v, want %v (for %d entries)", got, tc.wantMode, len(tc.servers))
+			}
+		})
+	}
+}
+
+// TestProviderConfig_McpDirectCommand exercises McpDirectCommand(): returns the
+// single entry when McpMode() == McpDirect, and "" in McpNone or McpMux.
+func TestProviderConfig_McpDirectCommand(t *testing.T) {
+	cases := []struct {
+		name    string
+		servers []string
+		want    string
+	}{
+		{"no entries returns empty string", nil, ""},
+		{"one entry returns that entry", []string{"shellbox-mcp"}, "shellbox-mcp"},
+		{"two entries returns empty string", []string{"a", "b"}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := ProviderConfig{McpServers: tc.servers}
+			if got := cfg.McpDirectCommand(); got != tc.want {
+				t.Errorf("McpDirectCommand() = %q, want %q (for %d entries)", got, tc.want, len(tc.servers))
+			}
+		})
+	}
+}
