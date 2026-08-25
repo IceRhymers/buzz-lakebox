@@ -5,6 +5,9 @@ project_name: buzz-backend-databricks-lakebox
 before:
   hooks:
     - go mod tidy
+    # Regenerate the committed bzmux artifact before a release so the
+    # embedded binary is always freshly cross-compiled at release time.
+    - make bzmux
 
 builds:
   - id: buzz-backend-databricks-lakebox

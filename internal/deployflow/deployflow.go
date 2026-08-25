@@ -7,6 +7,7 @@
 package deployflow
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -17,6 +18,8 @@ import (
 	"github.com/IceRhymers/buzz-lakebox/internal/identity"
 	"github.com/IceRhymers/buzz-lakebox/internal/install"
 	"github.com/IceRhymers/buzz-lakebox/internal/lakebox"
+	"github.com/IceRhymers/buzz-lakebox/internal/muxbin"
+	"github.com/IceRhymers/buzz-lakebox/internal/muxcfg"
 	"github.com/IceRhymers/buzz-lakebox/internal/nest"
 	"github.com/IceRhymers/buzz-lakebox/internal/payload"
 	"github.com/IceRhymers/buzz-lakebox/internal/redact"
@@ -445,10 +448,9 @@ func (d *Deployer) provision(ctx context.Context, profile, sandboxID string, fre
 	// provider_config.mcp_servers (#16) before rendering the env. McpNone
 	// leaves the runtime's own default in place (byte-identical to pre-#16);
 	// McpDirect points it straight at the one entry (introducing it for
-	// claude — #14); McpMux points it at the multiplexer. This is Increment 1:
-	// the value is wired so the emission is exercised, but the mux binary and
-	// its mcp-mux.json config are Increment 2 — no install/verify steps are
-	// added here.
+	// claude — #14); McpMux points it at "bzmux" (the multiplexer). Increment 2
+	// completes this path: installMux (called from installAndVerify) writes the
+	// bzmux binary + mcp-mux.json config + runs a deploy-time self-test.
 	mcpCommand, err := resolveMcpCommand(req.ProviderConfig)
 	if err != nil {
 		return err
@@ -574,16 +576,13 @@ func (d *Deployer) provision(ctx context.Context, profile, sandboxID string, fre
 // time with a clear message rather than shipping an agent that silently
 // renders an empty BUZZ_ACP_MCP_COMMAND and can never answer.
 //
-// McpMux (2+ entries) is REFUSED at deploy time in Increment 1. The multiplexer
-// binary (payload.MuxBinaryName) and its mcp-mux.json config are delivered by
-// Increment 2; until then, emitting BUZZ_ACP_MCP_COMMAND=bzmux would point the
-// agent at a command that does not exist on the sandbox. Because buzz-agent
-// spawns its MCP child on session/new and NOT on the initialize verify
-// handshake (Spike 1), such a deploy could pass verification and then ship a
-// permanently silent agent — the exact failure class this repo has been
-// live-bitten by twice. So we fail loud here instead of relying on prose. When
-// Increment 2 lands it replaces this refusal with the bzmux emission plus the
-// install/verify sequencing at the same seam.
+// McpMux (2+ entries): Increment 2 delivers the bzmux binary and its
+// mcp-mux.json config via installMux (called from installAndVerify). This
+// function returns payload.MuxBinaryName ("bzmux") for this mode so
+// BUZZ_ACP_MCP_COMMAND points at the multiplexer after installMux has placed
+// it on PATH. The deploy-time self-test (mux-selftest) ensures bzmux boots
+// before the agent is launched — preventing the live-bitten failure class
+// where a deploy passes ACP verification but the agent is permanently tool-less.
 func resolveMcpCommand(cfg payload.ProviderConfig) (string, error) {
 	switch cfg.McpMode() {
 	case payload.McpDirect:
@@ -594,8 +593,11 @@ func resolveMcpCommand(cfg payload.ProviderConfig) (string, error) {
 		}
 		return cmd, nil
 	case payload.McpMux:
-		return "", failf(CodeValidation,
-			"provider_config.mcp_servers has 2 or more entries, which requires the MCP multiplexer that is not yet available (pending issue #16 Increment 2); deploy at most one mcp_servers entry for now")
+		// Increment 2: return the multiplexer's bare name. MuxBinDir equals
+		// the .deb BinDir ($HOME/.buzz-backend/bin) which is on the sandbox
+		// PATH, so "bzmux" resolves without an absolute path. installMux
+		// writes the binary and config before this command is ever used.
+		return payload.MuxBinaryName, nil
 	default: // payload.McpNone
 		return "", nil
 	}
@@ -806,6 +808,16 @@ func (d *Deployer) installAndVerify(ctx context.Context, profile, sandboxID stri
 		}
 	}
 
+	// MCP multiplexer (#16 Increment 2): write the embedded bzmux binary and
+	// its mcp-mux.json config, then run a deploy-time self-test. Only on the
+	// McpMux (≥2 entries) branch — never perturbs McpNone/McpDirect paths
+	// (byte-identical guard locked by TestDeploy_McpMux_AbsentFor*).
+	if cfg.McpMode() == payload.McpMux {
+		if err := d.installMux(ctx, profile, sandboxID, cfg, envContent); err != nil {
+			return err
+		}
+	}
+
 	// Runtime verification: ACP initialize handshake with the agent env
 	// sourced (docs/M05_PROBE_RESULTS.md §6), env content shipped via
 	// stdin only. The binary differs per runtime; the frame and the
@@ -903,6 +915,114 @@ func (d *Deployer) installExtraBinaries(ctx context.Context, profile, sandboxID 
 	if _, err := d.SSH.Run(ctx, profile, sandboxID, step("extra-bins-exec", fmt.Sprintf(`sh %s`, dquote(extraBinScriptPath)))); err != nil {
 		return failf(CodeExtraBinExec, "extra binaries install: %w", err)
 	}
+	return nil
+}
+
+// installMux installs the embedded bzmux MCP multiplexer binary and its
+// mcp-mux.json configuration into the sandbox (issue #16 Increment 2). It is
+// modeled on installExtraBinaries and is called only when
+// cfg.McpMode() == payload.McpMux (≥2 mcp_servers entries).
+//
+// Steps mirror the extrabin idiom (write bytes over stdin, never argv):
+//   - mux-bin-write: write muxbin.Binary to install.MuxBinPath, chmod 755.
+//   - mux-cfg-write: write BuildMuxConfigJSON output to install.MuxConfigPath, chmod 600.
+//   - mux-selftest:  source envContent so BUZZ_* vars reach bzmux's children,
+//     export the same PATH launch.sh uses, and run the ABSOLUTE install.MuxBinPath
+//     with --selftest — prevents shipping a live-bitten agent (Critic #8).
+//
+// Per-server env allowlist (plan §5C, Critic #7 — least-privilege):
+// buzz-dev-mcp receives the Buzz relay secrets via Env.Inherit; all other
+// servers get an empty allowlist. Per-server env declaration for arbitrary
+// servers requires a schema change beyond the frozen contract and is a future
+// extension; today only the known buzz-dev-mcp consumer receives secrets.
+func (d *Deployer) installMux(ctx context.Context, profile, sandboxID string, cfg payload.ProviderConfig, envContent string) error {
+	// Map mcp_servers entries to muxcfg.Config servers with the per-server
+	// env allowlist. Only buzz-dev-mcp receives Buzz relay credentials by
+	// inheritance; every other server gets an empty Env (no secret forwarding
+	// this increment — per-server env declaration for arbitrary servers is a
+	// future extension requiring a schema change beyond the frozen contract).
+	servers := make([]muxcfg.Server, len(cfg.McpServers))
+	for i, name := range cfg.McpServers {
+		srv := muxcfg.Server{Name: name, Command: name}
+		if name == "buzz-dev-mcp" {
+			// buzz-dev-mcp reads these relay credentials from its environment
+			// and scrubs them on startup. Forward them via the allowlist so
+			// this server can authenticate to the relay.
+			srv.Env.Inherit = []string{
+				"BUZZ_PRIVATE_KEY",
+				"BUZZ_AUTH_TAG",
+				"BUZZ_RELAY_URL",
+				"NOSTR_PRIVATE_KEY",
+			}
+		}
+		servers[i] = srv
+	}
+	muxCfg := muxcfg.Config{Servers: servers}
+
+	cfgBytes, err := install.BuildMuxConfigJSON(muxCfg)
+	if err != nil {
+		return failf(CodeMuxWrite, "mcp multiplexer: build config: %w", err)
+	}
+
+	// Step mux-bin-write: write the embedded bzmux binary over stdin and
+	// chmod 755 in the same command, so binary bytes never appear in argv.
+	if _, err := d.SSH.RunWithStdin(ctx, profile, sandboxID,
+		step("mux-bin-write", fmt.Sprintf(
+			`set -eu; umask 077; mkdir -p %s; cat > %s && chmod 755 %s`,
+			dquote(install.MuxBinDir), dquote(install.MuxBinPath), dquote(install.MuxBinPath),
+		)),
+		bytes.NewReader(muxbin.Binary),
+	); err != nil {
+		return failf(CodeMuxWrite, "mcp multiplexer: write binary: %w", err)
+	}
+
+	// Step mux-cfg-write: write the JSON config over stdin and chmod 600
+	// (mirrors the env-file write pattern — secrets in Set values never
+	// reach argv or logs). set -eu + umask 077 prevent the file from being
+	// briefly world-readable before chmod 600 applies.
+	if _, err := d.SSH.RunWithStdin(ctx, profile, sandboxID,
+		step("mux-cfg-write", fmt.Sprintf(
+			`set -eu; umask 077; cat > %s && chmod 600 %s`,
+			dquote(install.MuxConfigPath), dquote(install.MuxConfigPath),
+		)),
+		bytes.NewReader(cfgBytes),
+	); err != nil {
+		return failf(CodeMuxWrite, "mcp multiplexer: write config: %w", err)
+	}
+
+	// Step mux-selftest: pipe envContent to a script that writes it to the
+	// TRANSIENT verifyEnvFilePath (NOT nest.EnvFilePath — Critic note 1: the
+	// probe/install path must never leave the permanent secret env file on
+	// disk), removes it via a trap on EXIT, sources it under `set -a` (so the
+	// BUZZ_* relay secrets reach bzmux's children), exports the same PATH
+	// launch.sh uses (so bzmux and its children resolve by bare name), and
+	// runs the ABSOLUTE MuxBinPath with --selftest. The absolute path avoids
+	// command-not-found in a non-interactive SSH shell whose PATH does not
+	// include BinDir. A non-zero exit fails the deploy rather than shipping a
+	// live-bitten agent. This mirrors claudeInferenceProbe/verify-exec: the
+	// env travels over stdin, is sourced, and is trap-removed — no secret is
+	// interpolated into the command string or argv, and a failed self-test
+	// leaves no secret env file behind.
+	selftestCmd := "set -eu\n" +
+		"umask 077\n" +
+		"trap 'rm -f " + dquote(verifyEnvFilePath) + "' EXIT\n" +
+		"cat > " + dquote(verifyEnvFilePath) + "\n" +
+		"chmod 600 " + dquote(verifyEnvFilePath) + "\n" +
+		"set -a\n" +
+		"# shellcheck disable=SC1090\n" +
+		". " + dquote(verifyEnvFilePath) + "\n" +
+		"set +a\n" +
+		"export PATH=" + dquote(install.MuxBinDir+":$PATH") + "\n" +
+		dquote(install.MuxBinPath) + " --selftest"
+	if _, err := d.SSH.RunWithStdin(ctx, profile, sandboxID,
+		step("mux-selftest", selftestCmd),
+		strings.NewReader(envContent),
+	); err != nil {
+		return failf(CodeMuxSelftest,
+			"mcp multiplexer self-test failed: %w; check each entry in provider_config.mcp_servers is a valid, installed MCP command on the sandbox",
+			err)
+	}
+
 	return nil
 }
 

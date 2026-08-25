@@ -149,6 +149,9 @@ case "$1" in
           extra-bins-exec)
             exit "${FAKE_EXTRA_BIN_EXIT:-0}"
             ;;
+          mux-selftest)
+            exit "${FAKE_MUX_SELFTEST_EXIT:-0}"
+            ;;
           prelaunch-kill)
             printf '%s' "${FAKE_PRELAUNCH_OUTPUT:-}"
             exit 0
@@ -911,19 +914,13 @@ func TestResolveMcpCommand(t *testing.T) {
 			t.Fatalf("McpDirect must resolve to the single entry, got %q", got)
 		}
 	})
-	t.Run("McpMux is refused at deploy time (Increment 2 pending)", func(t *testing.T) {
+	t.Run("McpMux resolves to bzmux (Increment 2 landed)", func(t *testing.T) {
 		got, err := resolveMcpCommand(payload.ProviderConfig{McpServers: []string{"buzz-dev-mcp", "shellbox-mcp"}})
-		if err == nil {
-			t.Fatal("2+ mcp_servers entries must be refused until the multiplexer ships (Increment 2)")
+		if err != nil {
+			t.Fatalf("McpMux must not error after Increment 2: %v", err)
 		}
-		if got != "" {
-			t.Fatalf("a refused McpMux deploy must resolve to \"\", not a bogus command, got %q", got)
-		}
-		if !strings.Contains(err.Error(), "Increment 2") {
-			t.Errorf("refusal message should reference the pending Increment 2, got: %v", err)
-		}
-		if strings.Contains(err.Error(), payload.MuxBinaryName) && !strings.Contains(err.Error(), "multiplexer") {
-			t.Errorf("refusal should explain the multiplexer is unavailable, got: %v", err)
+		if got != payload.MuxBinaryName {
+			t.Fatalf("McpMux must resolve to %q, got %q", payload.MuxBinaryName, got)
 		}
 	})
 }

@@ -54,6 +54,22 @@ jobs:
       - name: go test
         run: go test ./... -race
 
+      - name: bzmux srchash drift check
+        # Belt-and-suspenders: re-runs the source-hash tool and diffs only the
+        # .srchash file (NOT the binary). The source hash is computed over .go
+        # file bytes, which are Go-version-independent, so this comparison is
+        # safe even though CI pins Go 1.22 while local may use a newer toolchain.
+        # We deliberately do NOT diff bzmux.linux-amd64 here — compiled output
+        # varies by Go toolchain version, so a binary byte-diff would be
+        # non-reproducible across versions and would false-positive on every
+        # toolchain bump. The TestEmbeddedBzmux_IsLinuxAmd64ELF test above
+        # validates the binary shape; the source hash covers staleness.
+        # If this step fails, run `make bzmux` and commit the updated files.
+        run: |
+          go run ./internal/muxbin/srchash > /tmp/bzmux.srchash.want
+          diff /tmp/bzmux.srchash.want internal/muxbin/bzmux.srchash || \
+            (echo "bzmux.srchash is stale — run 'make bzmux' and commit the updated files" && exit 1)
+
   # Dependency advisories. This provider's entire threat model is credential
   # handling, so a vulnerable dependency in either ecosystem is directly on
   # the path of a workspace-owner PAT.

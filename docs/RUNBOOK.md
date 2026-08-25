@@ -193,6 +193,9 @@ Match on the code, not the prose.
 | `install.extra_bin_script` | the extra-binaries install script could not be rendered — a `provider_config.extra_binaries` entry is malformed or two entries share the same `bin`; fix the payload and redeploy |
 | `install.extra_bin_write` | check sandbox SSH reachability with `databricks sandbox ssh <id> -- true` |
 | `install.extra_bin_exec` | read the install output above: a sha256 mismatch means the pinned URL served different bytes than `provider_config.extra_binaries[].sha256` (do NOT retry — re-pin the sha256 or the URL); a fetch failure means the sandbox lost egress to the download host |
+| `install.mux_write` | check sandbox SSH reachability with `databricks sandbox ssh <id> -- true`; the MCP multiplexer binary or config could not be written to the sandbox |
+| `install.mux_exec` | check sandbox SSH reachability and that `$HOME/.buzz-backend/bin` is writable; re-running the deploy usually fixes a transient permission failure |
+| `install.mux_selftest` | the MCP multiplexer failed its deploy-time self-test — check each entry in `provider_config.mcp_servers` is a valid, installed MCP command on the sandbox; run `databricks sandbox ssh <id> -- $HOME/.buzz-backend/bin/bzmux --selftest` for the full error |
 | `provision.env_write` | check sandbox SSH reachability and that $HOME is writable in the sandbox |
 | `launch.prelaunch_kill` | check sandbox SSH reachability with `databricks sandbox ssh <id> -- true` |
 | `launch.stale_agent` | a previous buzz-acp was still shutting down and did not exit — run `status <sandbox-id>` to confirm, then `stop <sandbox-id>` followed by a redeploy; if it persists the old process is wedged and the sandbox needs a restart |

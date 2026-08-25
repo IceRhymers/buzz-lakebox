@@ -235,6 +235,12 @@ Two related non-claims. **Nothing here asserts anything about network posture.**
 - **Not yet verified live:** an end-to-end provider deploy of a codex agent. The probe drove the adapter directly against the real gateway (`stopReason: end_turn`), but the provider's own deploy path has not been run against a real sandbox with a real relay. Two things to confirm there specifically: that buzz-acp's `CODEX_CONFIG` network injection actually opens egress for codex's tool path on **Linux** (upstream documents the mechanism in macOS Seatbelt terms — `docs/UPSTREAM_BUZZ_GAPS.md`), and that the S6 metadata warning remains cosmetic in a real session transcript.
 - **Accept**: deploy with `agent_command: codex-acp` in both `inference_auth` modes → adapter installed, ACP handshake passes, `install.codex_inference` passes, agent answers a relay mention; a deploy naming any adapter env var under `inference_auth: "sandbox"` is rejected at the payload boundary.
 
+**#16 Increment 2 — `bzmux` MCP multiplexer — code complete, live acceptance pending**
+- `provider_config.mcp_servers` with ≥2 entries now deploys the embedded `bzmux` MCP multiplexer + a 0600 `mcp-mux.json` per-child config (no wire-field change; `mcp_servers []string` is unchanged — see `docs/CONTRACT.md §3`). Install sequence at deploy time: `mux-bin-write` → `mux-cfg-write` → `mux-selftest`. All CI-verifiable acceptance criteria (plan §6 of `.omc/plans/16-bzmux-multiplexer.md`) are green.
+- Ships: `cmd/bzmux` (the stdio JSON-RPC multiplexer); `internal/muxbin` (embedded linux/amd64 binary + staleness guard); `internal/muxcfg` (frozen shared schema); `internal/install` `BuildMuxConfigJSON`/`BuildMuxInstallScript`; `internal/deployflow` `resolveMcpCommand` McpMux flip + `installMux` sequencing + three new taxonomy codes (`install.mux_write`, `install.mux_exec`, `install.mux_selftest`).
+- **Not yet verified live:** an end-to-end provider deploy of a buzz-agent with `mcp_servers: [buzz-dev-mcp, shellbox-mcp]`. Live acceptance is infrastructure-gated (requires two real registered MCP commands on the sandbox) and feeds #17. Record in `docs/ACCEPTANCE.md` when observed.
+- **Accept (live, infrastructure-gated):** deploy with two `mcp_servers` entries → both tool sets appear in one merged catalog; agent answers a relay mention; `_Stop` fan-out fires correctly to all children.
+
 ---
 
 ## 7. Testing strategy

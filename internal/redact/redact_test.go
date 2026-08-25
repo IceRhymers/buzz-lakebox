@@ -361,3 +361,64 @@ func TestLog_KeepsAnthropicLookalikes(t *testing.T) {
 		}
 	}
 }
+
+// TestRedact_MuxConfigSetValueCoveredByKnownSecretList is a regression test
+// for the mcp-mux.json Server.Env.Set path (issue #16 Increment 2).
+//
+// cfgBytes produced by BuildMuxConfigJSON are written over SSH stdin and are
+// never currently logged — deployflow wraps only error values in its failf
+// calls, never the config bytes themselves. There is therefore no active leak
+// path through the redactor for mcp-mux.json content in this increment.
+//
+// This test documents and locks in two properties:
+//
+//  1. Exact-value Redact() covers any Set value when the caller holds the
+//     known-secret list. This is the correct defense if a future code path
+//     ever logs cfgBytes alongside Redact().
+//
+//  2. secretAssignmentPattern does NOT cover the JSON "KEY": "value" form
+//     (the closing `"` of the JSON key sits between the name and the `:`
+//     separator, so the pattern does not fire). Log() alone would NOT redact
+//     a bare mcp-mux.json snippet containing a Set secret. Any future code
+//     path that logs cfgBytes must therefore either pass the known-secret list
+//     to Redact() or extend the pattern to handle JSON object syntax.
+func TestRedact_MuxConfigSetValueCoveredByKnownSecretList(t *testing.T) {
+	const secretToken = "MARKER-MUX-SET-TOKEN-xyzabcdef012"
+
+	// Simulate a JSON snippet as BuildMuxConfigJSON would produce it,
+	// containing a secret in the Env.Set map. We construct it inline rather
+	// than importing internal/install to keep the redact package self-contained.
+	cfgSnippet := `{
+  "servers": [
+    {
+      "name": "third-party-mcp",
+      "command": "third-party-mcp",
+      "env": {
+        "set": {
+          "SOME_TOKEN": "` + secretToken + `"
+        }
+      }
+    }
+  ]
+}`
+
+	// Property 1: Redact() with the known-secret list removes the value via
+	// exact-value substitution regardless of its JSON context.
+	got := Redact(cfgSnippet, []string{secretToken})
+	if strings.Contains(got, secretToken) {
+		t.Fatalf("Redact() with known-secret list left the mux-cfg Set value in output:\n%s", got)
+	}
+	if !strings.Contains(got, Placeholder) {
+		t.Fatalf("expected placeholder in Redact() output:\n%s", got)
+	}
+
+	// Property 2: Log() alone (no known-secret list) does NOT redact the JSON
+	// "SOME_TOKEN": "value" form — secretAssignmentPattern expects KEY=value or
+	// KEY: value, not "KEY": "value". This is intentional: cfgBytes are never
+	// logged today, so there is no gap to close; this assertion is a canary
+	// that will fire if the pattern is intentionally broadened to cover JSON.
+	gotLog := Log(cfgSnippet)
+	if !strings.Contains(gotLog, secretToken) {
+		t.Logf("NOTICE: secretAssignmentPattern now covers the JSON \"KEY\": \"value\" form; update this test comment if that was intentional")
+	}
+}

@@ -56,6 +56,20 @@ func TestRenderEnv_McpDirectOverridesShapeDefault(t *testing.T) {
 	}
 }
 
+// TestRenderEnv_McpMuxEmitsBzmux asserts that RenderEnv emits
+// BUZZ_ACP_MCP_COMMAND='bzmux' when called with the MCP-mux command
+// (payload.MuxBinaryName = "bzmux").  Matches the assertion style of
+// TestRenderEnv_McpDirectEmitsCommandForAllRuntimes.
+func TestRenderEnv_McpMuxEmitsBzmux(t *testing.T) {
+	agent := claudeTestAgent()
+	agent.AgentCommand = "buzz-agent"
+	const wantLine = `export BUZZ_ACP_MCP_COMMAND='bzmux'`
+	env := RenderEnv(agent, payload.RuntimeBuzzAgent, false, payload.MuxBinaryName)
+	if !strings.Contains(env, wantLine) {
+		t.Errorf("env missing %q when mcpCommand=%q:\n%s", wantLine, payload.MuxBinaryName, env)
+	}
+}
+
 // TestRenderEnv_OwnerEnvVarsWinOverMcpCommand asserts that an agent whose
 // env_vars supplies BUZZ_ACP_MCP_COMMAND renders it AFTER the provider-emitted
 // mcpCommand, so sourcing the file leaves the owner's value as the effective

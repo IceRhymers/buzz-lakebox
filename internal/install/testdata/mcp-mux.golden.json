@@ -1,0 +1,25 @@
+{
+  "servers": [
+    {
+      "name": "buzz-dev-mcp",
+      "command": "buzz-dev-mcp",
+      "env": {
+        "inherit": [
+          "BUZZ_PRIVATE_KEY",
+          "BUZZ_AUTH_TAG",
+          "BUZZ_RELAY_URL",
+          "NOSTR_PRIVATE_KEY"
+        ]
+      }
+    },
+    {
+      "name": "shellbox-mcp",
+      "command": "shellbox-mcp",
+      "env": {
+        "set": {
+          "SOME_TOKEN": "PLACEHOLDER"
+        }
+      }
+    }
+  ]
+}
