@@ -126,7 +126,11 @@ func TestAdapterSpecs_Coherent(t *testing.T) {
 // elsewhere in a 54 KB script. The diff to this constant IS the review
 // artifact — if it changes, either the claude install genuinely changed (say
 // so in the commit message) or the refactor was not the no-op it claimed.
-const claudeInstallScriptDigest0_63_0 = "6375ecae3180516488b8028a49db6c4edae08f96592852bdb2f8436ee73213a9"
+// Refreshed 2026-08-26 (issue #27): the embedded 0.63.0 lockfile was
+// regenerated to clear fast-uri GHSA-7p8r-x3mc-p8w7 (high) and the hono
+// moderates. Same adapter version pin; the transitive tree re-resolved to
+// current within-range releases, so the rendered script's bytes changed.
+const claudeInstallScriptDigest0_63_0 = "0ca168a18fb4ed8b7d4d010a6b3d876d5e2597e9e64a50bd7e9b8cf8077f9d72"
 
 func TestBuildAdapterInstallScript_ClaudeByteIdenticalToBaseline(t *testing.T) {
 	script, err := BuildAdapterInstallScript("claude-agent-acp", "0.63.0")
