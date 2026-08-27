@@ -55,6 +55,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 )
 
 // logw is the writer for bzmux's own log lines (§5C.11: "bzmux: …" prefix).
@@ -68,11 +69,25 @@ func logf(format string, a ...any) { _, _ = fmt.Fprintf(logw, format, a...) }
 
 func main() {
 	selftest := flag.Bool("selftest", false, "load mcp-mux.json, spawn+initialize every child, merge one tools/list, validate the catalog, and exit without connecting to the agent")
+	verifyMCP := flag.Bool("verify-mcp", false, "verify the MCP slot occupant at deploy time: run a real initialize+tools/list handshake and assert a non-empty catalog (plus known tool names where the server is known). With --command, verify that single command (direct mode); without it, read mcp-mux.json and verify the multiplexer (mux mode)")
+	command := flag.String("command", "", "direct-mode target for --verify-mcp: the single MCP command to spawn and verify; empty selects mux mode (read mcp-mux.json)")
+	timeout := flag.Int("timeout", 15, "--verify-mcp handshake budget in seconds (bounds child cold-start + the initialize+tools/list round trips)")
 	flag.Parse()
 
 	if *selftest {
 		runSelftest()
 		// runSelftest calls os.Exit; this return is unreachable but keeps vet happy.
+		return
+	}
+
+	if *verifyMCP {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*timeout)*time.Second)
+		defer cancel()
+		if err := runVerifyMCP(ctx, *command); err != nil {
+			logf("bzmux --verify-mcp: FAIL: %v\n", err)
+			os.Exit(1)
+		}
+		logf("bzmux --verify-mcp: OK\n")
 		return
 	}
 

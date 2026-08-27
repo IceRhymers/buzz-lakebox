@@ -117,9 +117,15 @@ func (c *child) markDead(err error) {
 }
 
 // copyStderr reads from r and writes each line to logw prefixed with the child name.
-// Secret values must never appear in stderr; this is guaranteed by the per-child
-// env allowlist (§5C.11 — bzmux never passes secret env to children that don't
-// list them, so they can't accidentally echo them).
+//
+// Secret containment in child stderr depends on the mode. In mux/selftest mode it
+// is guaranteed by the per-child env allowlist (§5C.11 — bzmux never passes secret
+// env to children that don't list them, so they can't accidentally echo them). In
+// --verify-mcp DIRECT mode the child is spawned with the full os.Environ() (no
+// allowlist applies — see runVerifyMCP), so containment there rests instead on the
+// deploy-boundary redaction floor (redact.Redact/redact.Log in internal/deployflow)
+// plus the tail -c cap on captured output; this is the accepted at-parity posture
+// with the existing ACP verify-exec (plan §8), not a widened exposure.
 func (c *child) copyStderr(r io.Reader) {
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
@@ -172,11 +178,13 @@ func (c *child) readLoop(p *proxy) {
 // initialize performs the MCP initialization handshake with the child:
 // sends initialize, waits for the response, sends notifications/initialized,
 // then fetches the tool catalog with tools/list.
-// All of this happens within childInitTimeout.
-func (c *child) initialize(p *proxy, protocolVersion string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), childInitTimeout)
-	defer cancel()
-
+//
+// The read deadline is the caller's ctx (issue #17, plan Question D): the
+// live proxy and --selftest pass context.WithTimeout(context.Background(),
+// childInitTimeout) to preserve the historical 30s isolation, while
+// --verify-mcp passes a context bounded by the short deploy budget so a
+// silent server fails fast rather than blocking 30s.
+func (c *child) initialize(ctx context.Context, p *proxy, protocolVersion string) error {
 	// Build initialize params.
 	initParams, _ := json.Marshal(map[string]interface{}{
 		"protocolVersion": protocolVersion,

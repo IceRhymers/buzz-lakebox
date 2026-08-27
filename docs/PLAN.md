@@ -241,6 +241,12 @@ Two related non-claims. **Nothing here asserts anything about network posture.**
 - **Not yet verified live:** an end-to-end provider deploy of a buzz-agent with `mcp_servers: [buzz-dev-mcp, shellbox-mcp]`. Live acceptance is infrastructure-gated (requires two real registered MCP commands on the sandbox) and feeds #17. Record in `docs/ACCEPTANCE.md` when observed.
 - **Accept (live, infrastructure-gated):** deploy with two `mcp_servers` entries → both tool sets appear in one merged catalog; agent answers a relay mention; `_Stop` fan-out fires correctly to all children.
 
+**#17 — deploy-time MCP slot verification (`bzmux --verify-mcp`) — code complete, live acceptance pending**
+- The deploy now verifies whatever `BUZZ_ACP_MCP_COMMAND` resolves to with a real MCP handshake (`initialize` → `notifications/initialized` → `tools/list`), asserting a **non-empty tool catalog** always and **known tool names where the server is known** (`buzz-dev-mcp`, `shellbox-mcp`). It covers `McpDirect` (single command) and `McpMux` (multiplexer) with the same verification contract, and leaves `McpNone` byte-identical to pre-#17. No wire-shape change (`docs/CONTRACT.md §3`).
+- Implemented as a new `bzmux --verify-mcp` mode reusing bzmux's own MCP client: **direct** (`--command <cmd>`) spawns the single command with the full inherited env; **mux** (no `--command`) reads `mcp-mux.json`, spawns the children directly, and runs the selftest's full check set (collision/`__`/64-byte budget + protocolVersion) **plus** the expected-names union — a superset of `--selftest`. In the deploy flow mux-mode `mcp-verify` **replaces** `mux-selftest`; `McpDirect` gains `mcp-bin-write` → `mcp-verify`. `child.initialize` gained a `context` parameter (two callers preserve the historical 30s).
+- Ships: `cmd/bzmux/verify.go` (`runVerifyMCP` + `knownServerTools`), the `initialize(ctx,…)` refactor, `internal/install/mcpverify.go` (`BuildMcpVerifyCommand`), `internal/deployflow` `mcpVerify`/`installMcpDirect` wiring + the new `install.mcp_verify` taxonomy code (`CodeMuxSelftest` kept reserved). Budget `mcpVerifyTimeoutSeconds` is **provisional 15s** pending the live measurement.
+- **Not yet verified live:** deploy an MCP entry that starts-then-exits → `install.mcp_verify` fail + remedy; deploy real `mcp_servers: [buzz-dev-mcp, shellbox-mcp]` → `mcp-verify` passes end-to-end and records the measured MCP cold-start/handshake latency to finalize the budget. Infrastructure-gated; record in `docs/ACCEPTANCE.md` when observed.
+
 ---
 
 ## 7. Testing strategy

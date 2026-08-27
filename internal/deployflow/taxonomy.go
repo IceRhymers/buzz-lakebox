@@ -92,9 +92,19 @@ const (
 	// reserved for chmod/setup step failures (currently inlined; kept for
 	// RUNBOOK completeness). Selftest fires when `bzmux --selftest` exits
 	// non-zero at deploy time (prevents shipping a live-bitten agent).
-	CodeMuxWrite      Code = "install.mux_write"
-	CodeMuxExec       Code = "install.mux_exec"
-	CodeMuxSelftest   Code = "install.mux_selftest"
+	CodeMuxWrite    Code = "install.mux_write"
+	CodeMuxExec     Code = "install.mux_exec"
+	CodeMuxSelftest Code = "install.mux_selftest"
+	// CodeMcpVerify fires when the deploy-time MCP slot verification (#17)
+	// fails: bzmux --verify-mcp runs a real initialize+tools/list handshake
+	// against whatever BUZZ_ACP_MCP_COMMAND resolves to (McpDirect: the single
+	// command; McpMux: the multiplexer's children) and asserts a non-empty tool
+	// catalog plus the expected tool names where the server is known. It closes
+	// the silent-failure class where a deploy passes ACP verification but the
+	// agent is permanently tool-less. CodeMuxSelftest stays reserved (the
+	// --selftest subcommand + its RUNBOOK remedy remain valid); mux-mode
+	// mcp-verify is a superset of it and replaces it in the deploy flow.
+	CodeMcpVerify     Code = "install.mcp_verify"
 	CodeEnvWrite      Code = "provision.env_write"
 	CodePrelaunchKill Code = "launch.prelaunch_kill"
 	// CodeStaleAgent fires when a previous buzz-acp is still alive after
@@ -139,7 +149,7 @@ var AllCodes = []Code{
 	CodePATReset, CodeSandboxAuth, CodeInstallScript, CodeInstallWrite, CodeInstallExec,
 	CodeAdapterScript, CodeAdapterWrite, CodeAdapterExec, CodeRuntimeVerify, CodeClaudeInference, CodeCodexInference,
 	CodeExtraBinScript, CodeExtraBinWrite, CodeExtraBinExec,
-	CodeMuxWrite, CodeMuxExec, CodeMuxSelftest,
+	CodeMuxWrite, CodeMuxExec, CodeMuxSelftest, CodeMcpVerify,
 	CodeEnvWrite, CodePrelaunchKill, CodeStaleAgent, CodeLaunchWrite, CodeLaunchExec,
 	CodeVerifySSH, CodeVerifyUnparseable, CodeVerifyProcessDead, CodeVerifyRelayDenied, CodeVerifyNotReady,
 	CodeAutostopConfig,
@@ -189,6 +199,7 @@ var remedies = map[Code]string{
 	CodeMuxWrite:       "check sandbox SSH reachability with `databricks sandbox ssh <id> -- true`; the MCP multiplexer binary or config could not be written to the sandbox",
 	CodeMuxExec:        "check sandbox SSH reachability and that $HOME/.buzz-backend/bin is writable; re-running the deploy usually fixes a transient permission failure",
 	CodeMuxSelftest:    "the MCP multiplexer failed its deploy-time self-test — check each entry in `provider_config.mcp_servers` is a valid, installed MCP command on the sandbox; run `databricks sandbox ssh <id> -- $HOME/.buzz-backend/bin/bzmux --selftest` for the full error",
+	CodeMcpVerify:      "the MCP server the agent will use failed a deploy-time initialize+tools/list check — the error text distinguishes a server that is slow to start (raise the verify budget) from one that is broken or exports the wrong/too-few tools (fix the command): confirm `BUZZ_ACP_MCP_COMMAND` (resolved from `provider_config.mcp_servers`) names a valid, installed MCP server that returns its expected tools, and run `databricks sandbox ssh <id> -- $HOME/.buzz-backend/bin/bzmux --verify-mcp --command <cmd>` for the full error",
 	CodeEnvWrite:       "check sandbox SSH reachability and that $HOME is writable in the sandbox",
 	CodePrelaunchKill:  "check sandbox SSH reachability with `databricks sandbox ssh <id> -- true`",
 	CodeStaleAgent:     "a previous buzz-acp was still shutting down and did not exit — run `status <sandbox-id>` to confirm, then `stop <sandbox-id>` followed by a redeploy; if it persists the old process is wedged and the sandbox needs a restart",

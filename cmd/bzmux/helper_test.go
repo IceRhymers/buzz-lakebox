@@ -12,6 +12,8 @@ package main
 //	FAKE_ECHO_ENV_FILE       path — write os.Environ() immediately on startup
 //	FAKE_SLEEP_BEFORE_CALL_MS  ms to sleep before responding to any tools/call
 //	FAKE_EXIT_ON_TOOLS_CALL  "1" → os.Exit(0) when tools/call is received (before reply)
+//	FAKE_EXIT_BEFORE_INIT    "1" → os.Exit(0) on the initialize request (before reply)
+//	FAKE_NEVER_REPLY         "1" → read stdin but never answer anything (silent child)
 //	FAKE_TOOLS_CALL_ERROR    "1" → reply to tools/call with a JSON-RPC error
 //	FAKE_SEND_SAMPLING       "1" → send sampling/createMessage id:42 after notifications/initialized
 //	FAKE_SAMPLING_ACK_FILE   path — write "ack" when we receive a response to id:42
@@ -86,6 +88,12 @@ func fakeChildMain() {
 			continue
 		}
 
+		// Silent child: consume stdin but never answer anything, so the
+		// caller hits its (short, injected) read deadline.
+		if os.Getenv("FAKE_NEVER_REPLY") == "1" {
+			continue
+		}
+
 		// Response from upstream (no method, has non-null id): check for
 		// the sampling ack id:42.
 		if m.Method == "" && len(m.ID) > 0 && string(m.ID) != "null" {
@@ -100,6 +108,9 @@ func fakeChildMain() {
 
 		switch m.Method {
 		case "initialize":
+			if os.Getenv("FAKE_EXIT_BEFORE_INIT") == "1" {
+				os.Exit(0)
+			}
 			sendRaw(map[string]interface{}{
 				"jsonrpc": "2.0",
 				"id":      m.ID,

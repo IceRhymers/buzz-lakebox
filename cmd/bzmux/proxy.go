@@ -180,7 +180,14 @@ func (p *proxy) initChildren(ctx context.Context, protocolVersion string) {
 				return
 			}
 			go c.readLoop(p)
-			if err := c.initialize(p, protocolVersion); err != nil {
+			// Keep today's per-child isolation: the initialize handshake is
+			// bounded by a fresh context.Background()+childInitTimeout rather
+			// than the parent connection ctx (issue #17, plan step 1b — a
+			// deliberate non-change to preserve the live path's byte-behaviour).
+			initCtx, cancel := context.WithTimeout(context.Background(), childInitTimeout)
+			err = c.initialize(initCtx, p, protocolVersion)
+			cancel()
+			if err != nil {
 				c.markDead(err)
 				ch <- childResult{c: c, err: err}
 				return

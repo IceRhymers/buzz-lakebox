@@ -142,6 +142,22 @@ every row below is LIVE.
 
 ---
 
+## §17 — deploy-time MCP slot verification
+
+Per `.omc/plans/17-mcp-slot-verify.md` §4 (the infra-gated / live split). All
+CI-verifiable behaviour is green; the rows below are infrastructure-gated
+(require real registered MCP commands on a sandbox) and also finalize the
+provisional 15s `mcpVerifyTimeoutSeconds` budget.
+
+| Check | Status | Evidence | Date | Sandbox id |
+|---|---|---|---|---|
+| Deploy an `mcp_servers` entry that starts then exits → deploy fails with `install.mcp_verify` + remedy | NOT RUN | infra-gated (needs a real broken MCP command on the sandbox) | — | — |
+| Deploy with a wrong-sha256 extra-binary MCP artifact → deploy fails (at #15's extra-bin exec, or at `install.mcp_verify` if present-but-broken) with an actionable code | NOT RUN | infra-gated | — | — |
+| Deploy real `mcp_servers: [buzz-dev-mcp, shellbox-mcp]` → `mcp-verify` passes end-to-end AND records the measured MCP cold-start/handshake latency (backfills the `// measured:` comment + finalizes the budget) | NOT RUN | infra-gated (feeds the #16 live-pending row) | — | — |
+| Deploy a single `mcp_servers: [buzz-dev-mcp]` (McpDirect) → `mcp-bin-write` + `mcp-verify` run, the direct child receives the sourced `BUZZ_*` env, and the agent answers a relay mention | NOT RUN | infra-gated | — | — |
+
+---
+
 ## Pre-merge undeploy probe
 
 | Check | Status | Evidence | Date | Sandbox id |
