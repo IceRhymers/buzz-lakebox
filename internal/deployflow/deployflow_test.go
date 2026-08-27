@@ -152,6 +152,9 @@ case "$1" in
           mux-selftest)
             exit "${FAKE_MUX_SELFTEST_EXIT:-0}"
             ;;
+          mcp-verify)
+            exit "${FAKE_MCP_VERIFY_EXIT:-0}"
+            ;;
           prelaunch-kill)
             printf '%s' "${FAKE_PRELAUNCH_OUTPUT:-}"
             exit 0

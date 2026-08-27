@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/IceRhymers/buzz-lakebox/internal/muxcfg"
 )
 
 // runSelftest implements --selftest mode (§5C, plan step 3 "mux-selftest"):
@@ -25,7 +28,52 @@ func runSelftest() {
 		os.Exit(1)
 	}
 
-	// Spawn and initialize all children.
+	// runSelftest has no ctx of its own, so it preserves the historical 30s
+	// per-child isolation by bounding runCatalogCheck with childInitTimeout
+	// (issue #17, plan step 1b).
+	ctx, cancel := context.WithTimeout(context.Background(), childInitTimeout)
+	defer cancel()
+
+	children, catalog, err := runCatalogCheck(ctx, cfg, selftestProtocolVersion)
+	// Kill all spawned children on exit (selftest is a one-shot check).
+	defer func() {
+		for _, c := range children {
+			if c.cmd.Process != nil {
+				_ = c.cmd.Process.Kill()
+			}
+		}
+	}()
+	if err != nil {
+		logf("bzmux --selftest: FAIL: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Success: print summary.
+	names := make([]string, len(children))
+	for i, c := range children {
+		names[i] = fmt.Sprintf("%s (%d tools)", c.name, len(c.tools))
+	}
+	logf("bzmux --selftest: OK: %d tools merged from %d children: %s\n",
+		len(catalog), len(children), strings.Join(names, ", "))
+}
+
+// selftestProtocolVersion is the MCP protocolVersion bzmux offers its children
+// during --selftest and --verify-mcp handshakes (mirrors the live proxy's
+// default in handleInitialize).
+const selftestProtocolVersion = "2024-11-05"
+
+// runCatalogCheck is the shared spawn+initialize+merge+validate core used by
+// BOTH runSelftest and runVerifyMCP (mux mode), so their checks cannot drift
+// apart and mux-mode verify stays a literal superset of the selftest (issue
+// #17, plan Question A/E). It spawns and initializes every server in cfg
+// concurrently (each bounded by ctx), then runs the §5B collision/`__`/64-byte
+// budget validations (via initialize+mergeCatalogs), the protocolVersion
+// mismatch gate, and the buildToolsListResult JSON smoke check.
+//
+// It returns the spawned children (ALWAYS, even on error, so the caller can
+// kill them) and the merged catalog. A non-nil error carries a clear,
+// operator-facing message naming the violation.
+func runCatalogCheck(ctx context.Context, cfg *muxcfg.Config, protocolVersion string) ([]*child, []toolEntry, error) {
 	type childResult struct {
 		c   *child
 		err error
@@ -33,15 +81,13 @@ func runSelftest() {
 	ch := make(chan childResult, len(cfg.Servers))
 
 	// We need a minimal proxy for the inflight machinery used by childCall.
-	// In selftest mode we don't connect to an agent, so agentIn/Out are nil.
+	// No agent is connected, so agentIn/Out are nil.
 	p := &proxy{
 		cfg:           cfg,
 		catalogReady:  make(chan struct{}),
 		inflightByID:  make(map[int64]*inflightEntry),
 		inflightByKey: make(map[string]int64),
 	}
-
-	protocolVersion := "2024-11-05"
 
 	for _, srv := range cfg.Servers {
 		srv := srv
@@ -53,7 +99,7 @@ func runSelftest() {
 				return
 			}
 			go c.readLoop(p)
-			if err := c.initialize(p, protocolVersion); err != nil {
+			if err := c.initialize(ctx, p, protocolVersion); err != nil {
 				c.markDead(err)
 				ch <- childResult{c: c, err: err}
 				return
@@ -74,31 +120,17 @@ func runSelftest() {
 		}
 	}
 
-	// Kill all spawned children on exit (selftest is a one-shot check).
-	defer func() {
-		for _, c := range children {
-			if c.cmd.Process != nil {
-				_ = c.cmd.Process.Kill()
-			}
-		}
-	}()
-
 	if len(errParts) > 0 {
-		logf("bzmux --selftest: FAIL: child initialization errors:\n")
-		for _, e := range errParts {
-			logf("  - %s\n", e)
-		}
-		os.Exit(1)
+		return children, nil, fmt.Errorf("child initialization errors: %s", strings.Join(errParts, "; "))
 	}
 
 	// §5B validations: collision, __, 64-byte budget.
 	_, catalog, err := mergeCatalogs(children)
 	if err != nil {
-		logf("bzmux --selftest: FAIL: catalog validation: %v\n", err)
-		os.Exit(1)
+		return children, nil, fmt.Errorf("catalog validation: %w", err)
 	}
 
-	// Check protocolVersion mismatches.
+	// Check protocolVersion mismatches (the gate mux-mode verify must keep).
 	var versionIssues []string
 	for _, c := range children {
 		if c.protocolVersion != "" && c.protocolVersion != protocolVersion {
@@ -108,24 +140,13 @@ func runSelftest() {
 		}
 	}
 	if len(versionIssues) > 0 {
-		logf("bzmux --selftest: FAIL: protocolVersion mismatch:\n")
-		for _, v := range versionIssues {
-			logf("  - %s\n", v)
-		}
-		os.Exit(1)
+		return children, nil, fmt.Errorf("protocolVersion mismatch: %s", strings.Join(versionIssues, "; "))
 	}
 
 	// Check that the merged catalog JSON is valid (smoke check).
 	if _, err := buildToolsListResult(catalog); err != nil {
-		logf("bzmux --selftest: FAIL: build tools/list: %v\n", err)
-		os.Exit(1)
+		return children, nil, fmt.Errorf("build tools/list: %w", err)
 	}
 
-	// Success: print summary.
-	names := make([]string, len(children))
-	for i, c := range children {
-		names[i] = fmt.Sprintf("%s (%d tools)", c.name, len(c.tools))
-	}
-	logf("bzmux --selftest: OK: %d tools merged from %d children: %s\n",
-		len(catalog), len(children), strings.Join(names, ", "))
+	return children, catalog, nil
 }

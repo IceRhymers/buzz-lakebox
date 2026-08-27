@@ -50,6 +50,15 @@ const (
 	// (docs/M05_PROBE_RESULTS.md §6: "<1s ... without touching the LLM").
 	installVerifyTimeoutSeconds = 10
 
+	// mcpVerifyTimeoutSeconds bounds the deploy-time MCP slot verification
+	// (#17): a two-round-trip initialize+tools/list handshake plus child
+	// cold-start (N children cold-start concurrently in mux mode). PROVISIONAL
+	// at 15s — a touch above the ACP 10s to absorb cold-start — pending the
+	// live #14/#16 two-real-servers measurement (plan Driver 3 / the
+	// `// measured:` comment in cmd/bzmux/verify.go). A slow server is a
+	// budget concern; a broken one fails regardless of budget.
+	mcpVerifyTimeoutSeconds = 15
+
 	// Log vocabulary verified live (docs/M05_PROBE_RESULTS.md §3).
 	agentPoolReadyMarker = "agent_pool_ready"
 	terminalErrorLine    = "initial relay connect failed with terminal error"
@@ -818,6 +827,17 @@ func (d *Deployer) installAndVerify(ctx context.Context, profile, sandboxID stri
 		}
 	}
 
+	// MCP direct verification (#17): for a single-entry mcp_servers (McpDirect),
+	// write the embedded bzmux and run a deploy-time initialize+tools/list check
+	// against the resolved command. Sequenced beside the other capability
+	// installs, BEFORE the ACP verify-exec. Never perturbs McpNone (byte-
+	// identical) or McpMux (which verifies via installMux's mux-mode step).
+	if cfg.McpMode() == payload.McpDirect {
+		if err := d.installMcpDirect(ctx, profile, sandboxID, cfg.McpDirectCommand(), envContent); err != nil {
+			return err
+		}
+	}
+
 	// Runtime verification: ACP initialize handshake with the agent env
 	// sourced (docs/M05_PROBE_RESULTS.md §6), env content shipped via
 	// stdin only. The binary differs per runtime; the frame and the
@@ -990,40 +1010,66 @@ func (d *Deployer) installMux(ctx context.Context, profile, sandboxID string, cf
 		return failf(CodeMuxWrite, "mcp multiplexer: write config: %w", err)
 	}
 
-	// Step mux-selftest: pipe envContent to a script that writes it to the
-	// TRANSIENT verifyEnvFilePath (NOT nest.EnvFilePath — Critic note 1: the
-	// probe/install path must never leave the permanent secret env file on
-	// disk), removes it via a trap on EXIT, sources it under `set -a` (so the
-	// BUZZ_* relay secrets reach bzmux's children), exports the same PATH
-	// launch.sh uses (so bzmux and its children resolve by bare name), and
-	// runs the ABSOLUTE MuxBinPath with --selftest. The absolute path avoids
-	// command-not-found in a non-interactive SSH shell whose PATH does not
-	// include BinDir. A non-zero exit fails the deploy rather than shipping a
-	// live-bitten agent. This mirrors claudeInferenceProbe/verify-exec: the
-	// env travels over stdin, is sourced, and is trap-removed — no secret is
-	// interpolated into the command string or argv, and a failed self-test
-	// leaves no secret env file behind.
-	selftestCmd := "set -eu\n" +
-		"umask 077\n" +
-		"trap 'rm -f " + dquote(verifyEnvFilePath) + "' EXIT\n" +
-		"cat > " + dquote(verifyEnvFilePath) + "\n" +
-		"chmod 600 " + dquote(verifyEnvFilePath) + "\n" +
-		"set -a\n" +
-		"# shellcheck disable=SC1090\n" +
-		". " + dquote(verifyEnvFilePath) + "\n" +
-		"set +a\n" +
-		"export PATH=" + dquote(install.MuxBinDir+":$PATH") + "\n" +
-		dquote(install.MuxBinPath) + " --selftest"
-	if _, err := d.SSH.RunWithStdin(ctx, profile, sandboxID,
-		step("mux-selftest", selftestCmd),
-		strings.NewReader(envContent),
-	); err != nil {
-		return failf(CodeMuxSelftest,
-			"mcp multiplexer self-test failed: %w; check each entry in provider_config.mcp_servers is a valid, installed MCP command on the sandbox",
-			err)
+	// Step mcp-verify (#17, mux mode): replaces the former mux-selftest step.
+	// It reuses the exact env-sourcing idiom (transient verifyEnvFilePath,
+	// trap-rm on EXIT, `set -a` source so BUZZ_* relay secrets reach bzmux's
+	// children, launch.sh PATH export, ABSOLUTE MuxBinPath) but runs
+	// `bzmux --verify-mcp` (no --command) instead of `--selftest`. mux-mode
+	// verify is a SUPERSET of the selftest — same collision/`__`/budget +
+	// protocolVersion checks — PLUS the expected-names union of the known
+	// children, so it catches the initialized-but-under-exports / wrong-server
+	// case the selftest misses. env travels over stdin only; no secret is
+	// interpolated into the command string, and a failed check leaves no
+	// secret env file behind.
+	if err := d.mcpVerify(ctx, profile, sandboxID, install.McpVerifyModeMux, "", envContent); err != nil {
+		return err
 	}
 
 	return nil
+}
+
+// mcpVerify runs the deploy-time MCP slot verification step (#17): it ships
+// envContent over stdin to the BuildMcpVerifyCommand script (which sources the
+// env into the transient verifyEnvFilePath, exports the launch.sh PATH, and
+// runs the ABSOLUTE bzmux --verify-mcp under a timeout), and maps any failure
+// to CodeMcpVerify. mode is install.McpVerifyModeMux (no slotCommand) or
+// install.McpVerifyModeDirect (slotCommand = the resolved single command).
+func (d *Deployer) mcpVerify(ctx context.Context, profile, sandboxID, mode, slotCommand, envContent string) error {
+	verifyCmd, err := install.BuildMcpVerifyCommand(verifyEnvFilePath, mcpVerifyTimeoutSeconds, install.MuxBinPath, mode, slotCommand)
+	if err != nil {
+		return failf(CodeMcpVerify, "mcp verify: %w", err)
+	}
+	if _, err := d.SSH.RunWithStdin(ctx, profile, sandboxID,
+		step("mcp-verify", verifyCmd),
+		strings.NewReader(envContent),
+	); err != nil {
+		return failf(CodeMcpVerify,
+			"mcp verify: the MCP server the agent will use failed a deploy-time initialize+tools/list check: %w",
+			err)
+	}
+	return nil
+}
+
+// installMcpDirect implements the McpDirect half of #17: it writes the embedded
+// bzmux binary (mcp-bin-write, mirroring mux-bin-write — bzmux is inert unless
+// invoked, since BUZZ_ACP_MCP_COMMAND still points at the direct command) and
+// then runs the mcp-verify step in direct mode against the resolved single
+// command. Gated by the caller on cfg.McpMode() == payload.McpDirect.
+func (d *Deployer) installMcpDirect(ctx context.Context, profile, sandboxID, slotCommand, envContent string) error {
+	// Step mcp-bin-write: write the embedded bzmux binary over stdin and chmod
+	// 755 in the same command, so binary bytes never appear in argv (mirrors
+	// mux-bin-write).
+	if _, err := d.SSH.RunWithStdin(ctx, profile, sandboxID,
+		step("mcp-bin-write", fmt.Sprintf(
+			`set -eu; umask 077; mkdir -p %s; cat > %s && chmod 755 %s`,
+			dquote(install.MuxBinDir), dquote(install.MuxBinPath), dquote(install.MuxBinPath),
+		)),
+		bytes.NewReader(muxbin.Binary),
+	); err != nil {
+		return failf(CodeMuxWrite, "mcp multiplexer: write binary: %w", err)
+	}
+
+	return d.mcpVerify(ctx, profile, sandboxID, install.McpVerifyModeDirect, slotCommand, envContent)
 }
 
 // claudeInferenceProbe closes the gap between "the agent process answers
