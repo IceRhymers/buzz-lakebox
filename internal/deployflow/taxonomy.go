@@ -85,8 +85,18 @@ const (
 	CodeExtraBinScript Code = "install.extra_bin_script"
 	CodeExtraBinWrite  Code = "install.extra_bin_write"
 	CodeExtraBinExec   Code = "install.extra_bin_exec"
-	CodeEnvWrite       Code = "provision.env_write"
-	CodePrelaunchKill  Code = "launch.prelaunch_kill"
+	// MCP multiplexer install — the #16 Increment 2 capability channel. Only
+	// reached when provider_config.mcp_servers has ≥2 entries (McpMux mode);
+	// a deploy with 0 or 1 entries never emits these.
+	// Write covers both binary and config file write failures. Exec is
+	// reserved for chmod/setup step failures (currently inlined; kept for
+	// RUNBOOK completeness). Selftest fires when `bzmux --selftest` exits
+	// non-zero at deploy time (prevents shipping a live-bitten agent).
+	CodeMuxWrite      Code = "install.mux_write"
+	CodeMuxExec       Code = "install.mux_exec"
+	CodeMuxSelftest   Code = "install.mux_selftest"
+	CodeEnvWrite      Code = "provision.env_write"
+	CodePrelaunchKill Code = "launch.prelaunch_kill"
 	// CodeStaleAgent fires when a previous buzz-acp is still alive after
 	// the prelaunch kill's bounded wait. Launching over it would be worse
 	// than failing: launch.sh refuses to relaunch while one is alive, and
@@ -129,6 +139,7 @@ var AllCodes = []Code{
 	CodePATReset, CodeSandboxAuth, CodeInstallScript, CodeInstallWrite, CodeInstallExec,
 	CodeAdapterScript, CodeAdapterWrite, CodeAdapterExec, CodeRuntimeVerify, CodeClaudeInference, CodeCodexInference,
 	CodeExtraBinScript, CodeExtraBinWrite, CodeExtraBinExec,
+	CodeMuxWrite, CodeMuxExec, CodeMuxSelftest,
 	CodeEnvWrite, CodePrelaunchKill, CodeStaleAgent, CodeLaunchWrite, CodeLaunchExec,
 	CodeVerifySSH, CodeVerifyUnparseable, CodeVerifyProcessDead, CodeVerifyRelayDenied, CodeVerifyNotReady,
 	CodeAutostopConfig,
@@ -175,6 +186,9 @@ var remedies = map[Code]string{
 	CodeExtraBinScript: "the extra-binaries install script could not be rendered — a `provider_config.extra_binaries` entry is malformed or two entries share the same `bin`; fix the payload and redeploy",
 	CodeExtraBinWrite:  "check sandbox SSH reachability with `databricks sandbox ssh <id> -- true`",
 	CodeExtraBinExec:   "read the install output above: a sha256 mismatch means the pinned URL served different bytes than `provider_config.extra_binaries[].sha256` (do NOT retry — re-pin the sha256 or the URL); a fetch failure means the sandbox lost egress to the download host",
+	CodeMuxWrite:       "check sandbox SSH reachability with `databricks sandbox ssh <id> -- true`; the MCP multiplexer binary or config could not be written to the sandbox",
+	CodeMuxExec:        "check sandbox SSH reachability and that $HOME/.buzz-backend/bin is writable; re-running the deploy usually fixes a transient permission failure",
+	CodeMuxSelftest:    "the MCP multiplexer failed its deploy-time self-test — check each entry in `provider_config.mcp_servers` is a valid, installed MCP command on the sandbox; run `databricks sandbox ssh <id> -- $HOME/.buzz-backend/bin/bzmux --selftest` for the full error",
 	CodeEnvWrite:       "check sandbox SSH reachability and that $HOME is writable in the sandbox",
 	CodePrelaunchKill:  "check sandbox SSH reachability with `databricks sandbox ssh <id> -- true`",
 	CodeStaleAgent:     "a previous buzz-acp was still shutting down and did not exit — run `status <sandbox-id>` to confirm, then `stop <sandbox-id>` followed by a redeploy; if it persists the old process is wedged and the sandbox needs a restart",

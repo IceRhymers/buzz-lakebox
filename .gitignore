@@ -3,6 +3,7 @@ node_modules/
 .scratch/
 dist/
 /buzz-backend-databricks-lakebox
+/bzmux
 
 # oh-my-claudecode session state
 .omc/

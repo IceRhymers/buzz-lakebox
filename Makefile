@@ -10,10 +10,20 @@ LDFLAGS := -X $(MODULE)/internal/version.Version=$(VERSION) -X $(MODULE)/interna
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build install symlink test vet lint fmt-check check clean
+.DELETE_ON_ERROR:
+
+.PHONY: help build install symlink bzmux test vet lint fmt-check check clean
 
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z_-]+:.*##/ {printf "  %-8s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+
+# Regenerates the committed bzmux linux/amd64 artifact and its source hash.
+# Run after changing any cmd/bzmux or internal/muxcfg source so that
+# go:embed picks up the updated binary and the staleness test stays green.
+bzmux: ## Regenerate internal/muxbin/bzmux.linux-amd64 and bzmux.srchash after bzmux source changes
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -ldflags='-s -w' \
+		-o internal/muxbin/bzmux.linux-amd64 ./cmd/bzmux
+	$(GO) run ./internal/muxbin/srchash > internal/muxbin/bzmux.srchash
 
 build: ## Build the provider binary into the repo root
 	$(GO) build -ldflags '$(LDFLAGS)' -o $(BINARY) $(CMD)
